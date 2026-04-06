@@ -151,7 +151,7 @@ verifying key. Returns valid/invalid.
 
 The FRI verification algorithm:
 1. Deserialize proof (Merkle roots, query responses, coefficients)
-2. Recompute Fiat-Shamir challenges via SHA256 hash chain
+2. Recompute Fiat-Shamir challenges via Poseidon2 hash chain
 3. For each of ~30 queries across ~20 FRI rounds:
    - Verify Merkle proof of queried position (SHA256 hashing)
    - Check the folding equation (Baby Bear field arithmetic)
@@ -160,7 +160,7 @@ The FRI verification algorithm:
 6. Verify public values and verifying key match
 
 **What already works in Rúnar**:
-- `SHA256` (single hash, used for FRI Merkle commitments)
+- Poseidon2 over Baby Bear (for FRI Merkle commitments — NOT SHA-256)
 - `Hash256` (double hash, used for Fiat-Shamir if needed)
 - Bounded `for` loops (unrolled — FRI rounds and queries are fixed)
 - `Substr` for byte extraction from proof data
@@ -230,10 +230,10 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
 2. **Verify Fiat-Shamir challenges**: Recompute all verifier challenges by hashing the transcript:
    ```
    For each layer i:
-     alpha_i = SHA256(transcript || "alpha" || i) mod p
-   Query indices = SHA256(transcript || "queries") mod domain_size
+     alpha_i = Poseidon2(transcript || layer_data) mod p
+   Query indices = Poseidon2(transcript || "queries") mod domain_size
    ```
-   SHA256 is used (not Keccak) because BSV has native OP_SHA256.
+   Poseidon2 over Baby Bear is used (SP1's hardcoded hash function).
 
 3. **Verify FRI folding**: For each query index q and each layer i:
    ```
@@ -250,26 +250,30 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
 4. **Verify Merkle authentication paths**: For each query, verify that the claimed evaluation is consistent with the committed Merkle root:
    ```
    For each layer i, query q:
-     leaf = SHA256(response[q])
-     Verify MerklePath(leaf, merkle_root_i, authentication_path)
+     leaf = Poseidon2Compress(response[q])
+     Verify Poseidon2MerklePath(leaf, merkle_root_i, authentication_path)
    ```
+   All Merkle trees use Poseidon2 compression (NOT SHA-256).
 
 5. **Verify final layer**: The final FRI layer is a constant polynomial. Verify it equals the claimed value.
 
-**Operation counts** (estimated per query, 32 queries):
-| Operation | Count per query | Total (32 queries) | Measured script per op |
+**Operation counts** (estimated per query, 100 queries — confirmed by Gate 0b):
+| Operation | Count per query | Total (100 queries) | Measured script per op |
 |-----------|----------------|-------------------|----------------------|
-| Baby Bear mul | ~60 | ~1,920 | 9 bytes |
-| Baby Bear add | ~40 | ~1,280 | 9 bytes |
-| Baby Bear inv | ~4 | ~128 | 477 bytes |
-| SHA256 | ~20 | ~640 | native opcode |
-| Merkle verify | ~10 paths | ~320 paths | 482 bytes (depth 20) |
+| Baby Bear mul | ~60 | ~6,000 | 9 bytes |
+| Baby Bear add | ~40 | ~4,000 | 9 bytes |
+| Baby Bear inv | ~4 | ~400 | 477 bytes |
+| Poseidon2 compress | ~19 | ~1,900 | ~30-50KB (subroutine) |
+| Poseidon2 Merkle path | ~19 levels | ~1,900 levels | uses compress subroutine |
 
 **Script size estimate**: The full FRI verifier size depends on the
-number of FRI layers and queries (all unrolled). Given the measured
-primitive sizes above — especially the 9-byte add/mul and 482-byte
-Merkle proofs — the full verifier is expected to be well under the
-2 MB target.
+number of FRI layers, queries (all unrolled), and the Poseidon2
+permutation subroutine size. With 100 queries × ~19 Poseidon2
+compressions each = ~1,900 Poseidon2 calls, the Poseidon2
+permutation dominates script size. If the permutation compiles to
+~30-50KB as a subroutine, the total verifier is estimated at **1-5MB**.
+This is larger than the original SHA-256 estimate but within BSV's
+limits (4GB max script). Gate 0a Full must measure the actual size.
 
 **Measured regtest timing** (per-vector deploy + call, single-threaded):
 | Operation | Time per vector |
@@ -287,9 +291,11 @@ operations is sub-millisecond.
 
 ## New Primitives (Status)
 
-Three primitives were required for the FRI verifier. Two are now
-complete and validated; the third (cross-covenant output reference)
-is needed for the bridge covenant but not the FRI verifier.
+Four primitives are required for the FRI verifier and bridge covenant.
+Two are complete and validated (Baby Bear arithmetic, SHA-256 Merkle
+proofs). One (Poseidon2) is newly required based on Gate 0b findings.
+The fourth (cross-covenant output reference) is needed for the bridge
+covenant but not the FRI verifier.
 
 ### A. Baby Bear Field Arithmetic — COMPLETE
 
@@ -339,31 +345,12 @@ complete and tested: 829 base field vectors + 295 extension field
 vectors, all passing on BSV regtest. Extension field operations (degree-4
 over Baby Bear) compile to 509 bytes (ext4 mul) and 3.1 KB (ext4 inv).
 
-### B. Merkle Proof Verification — COMPLETE
+### B. Merkle Proof Verification — COMPLETE (SHA-256 variant)
 
 Verify a leaf's inclusion in a SHA256 Merkle tree given an
 authentication path. This is used by:
-- The **FRI verifier** (~30 times per proof, SHA256 trees)
 - The **bridge covenant** (withdrawal inclusion, SHA256 tree)
-
-The algorithm is a loop:
-
-```
-current = leaf
-for each (sibling, direction) in proof:
-    if direction == left:
-        current = SHA256(sibling || current)
-    else:
-        current = SHA256(current || sibling)
-assert(current == root)
-```
-
-Rúnar already has bounded for loops (unrolled), SHA256, Cat, and
-conditionals. This can be implemented as:
-- A **contract-level pattern** using existing primitives (larger script,
-  loop unrolled to max depth)
-- Or a **built-in function** that the codegen emits as an optimized
-  opcode sequence (smaller script)
+- BSVM-specific data bindings (NOT for FRI — see Poseidon2 below)
 
 The built-in approach was implemented. **Measured**: 72 valid inclusion
 proofs and 38 rejection proofs, all passing on BSV regtest. Locking
@@ -376,16 +363,68 @@ bridge covenant verifies inclusion using a simple SHA256 Merkle proof —
 ~3 opcodes per level, 16 levels = ~50 opcodes. This is trivial.
 
 **For FRI verification**: FRI query responses are verified against
-SHA256 Merkle commitments (~20 levels per query, ~30 queries). The
-contract-level loop pattern works, unrolled to 20 iterations per
-verification.
+**Poseidon2** Merkle commitments (NOT SHA-256). See section D below.
+The SHA-256 Merkle primitive is NOT used for FRI.
 
 **No Keccak-256 in Script**: The bridge does NOT verify Ethereum MPT
 proofs in Script. The STARK proof covers the full EVM execution
 including all Keccak-256 MPT operations. The bridge only verifies
 withdrawal inclusion in a SHA256 Merkle tree built by the SP1 guest
-and committed as a STARK public value. All Script-level hashing uses
-SHA256 (native OP_SHA256).
+and committed as a STARK public value.
+
+### D. Poseidon2 over Baby Bear — REQUIRED (Gate 0b confirmed)
+
+SP1 hardcodes BabyBearPoseidon2 as its STARK configuration. All FRI
+Merkle commitments and Fiat-Shamir challenge derivation use the
+Poseidon2 permutation over Baby Bear field elements. There is no
+SHA256 alternative in SP1.
+
+The FRI verifier needs:
+
+```go
+// In runar-go DSL
+p2 := runar.Poseidon2BabyBear()
+p2.Permute(state [16]BabyBear) [16]BabyBear
+p2.Compress(left [8]BabyBear, right [8]BabyBear) [8]BabyBear
+```
+
+**Poseidon2 parameters** (from Plonky3/SP1):
+- Width: 16 Baby Bear elements
+- Rate: 8, Capacity: 8
+- Sbox: x^7 (degree 7)
+- External rounds: 8 (4 initial + 4 final)
+- Internal rounds: 13
+- Digest: first 8 elements of the output state (32 bytes)
+- Compression: write both 8-element inputs into the 16-element state
+  (left into positions 0-7, right into positions 8-15), apply the full
+  permutation, take the first 8 elements as the output digest
+- Round constants: from Plonky3's `p3-poseidon2` crate, specific to
+  Baby Bear with these parameters
+
+**Implementation in Bitcoin Script**: The Poseidon2 permutation is
+purely algebraic — it uses only Baby Bear field multiplications and
+additions (already proven on BSV). Each external round: matrix multiply
+(MDS) + sbox (x^7) on all 16 elements + constant addition. Each
+internal round: matrix multiply (diagonal) + sbox on element 0 only +
+constant addition.
+
+**Script size estimate**: ~30-50KB for the permutation subroutine.
+Each FRI query requires ~19 Poseidon2 calls (one per Merkle tree
+level). With 100 FRI queries, that's ~1,900 Poseidon2 calls total.
+The permutation code is a subroutine (called repeatedly, not
+duplicated), but the data flow (pushing 16 inputs, calling the
+subroutine, reading 8 outputs) adds overhead per call.
+
+**Test vectors**: MUST be generated from Plonky3's `p3-poseidon2`
+crate with SP1's exact Baby Bear parameters before implementing the
+Rúnar codegen module. At minimum:
+- 100+ permutation vectors (random inputs → expected outputs)
+- 50+ compression vectors (two 8-element digests → compressed digest)
+- Verify against a reference Poseidon2 implementation
+
+**Gate 0a dependency**: The Poseidon2 codegen module MUST be complete
+and tested before the FRI verifier can be assembled. This is the
+FIRST implementation target for Gate 0a Full.
 
 ### C. Cross-Covenant Output Reference
 
@@ -439,7 +478,7 @@ full state covenant contract (`bsvm/pkg/covenant/contracts/rollup.runar.go`):
 | Primitive | Status | Details |
 |---|---|---|
 | Baby Bear field multiplication (`OP_MUL` with 31-bit operands) | **CONFIRMED** | `bbFieldMul(a, b)` produces correct results on-chain |
-| SHA-256 Merkle proof verification (depth 20) | **CONFIRMED** | ~300 opcodes unrolled, matches FRI query depth |
+| SHA-256 Merkle proof verification (depth 20) | **CONFIRMED** | ~300 opcodes unrolled, used for bridge (NOT FRI — FRI uses Poseidon2) |
 | hash256 batch data binding (`OP_HASH256`) | **CONFIRMED** | 165 KB proof blob hashed on-chain |
 | ByteString comparisons (`OP_EQUAL`) | **CONFIRMED** | 32-byte hash comparisons work correctly |
 | Public values extraction (`substr` at spec offsets) | **CONFIRMED** | 272-byte blob parsed on-chain |
@@ -489,13 +528,21 @@ verifies the FRI protocol on-chain.
 
 **Prerequisites**: The FRI verifier depends on primitives already
 confirmed working on BSV (see Gate 0a Primitive Validation above),
-plus any additional hash functions SP1 requires:
+plus the Poseidon2 hash function:
 - Baby Bear field arithmetic (confirmed)
-- SHA-256 Merkle proof verification (confirmed)
-- Poseidon2 permutation — **RESOLVED: NOT NEEDED**. Poseidon2 is
-  SP1-internal only (used within the arithmetization). The on-chain FRI
-  verifier uses SHA256 for Merkle commitments (SP1's HashSha256 option).
-  No Poseidon2 implementation in Script is required.
+- SHA-256 Merkle proof verification (confirmed — used for BSVM-specific
+  bindings, NOT for FRI)
+- Poseidon2 permutation over Baby Bear — **REQUIRED**. SP1 hardcodes
+  BabyBearPoseidon2 as its STARK configuration. All FRI Merkle
+  commitments and Fiat-Shamir challenge derivation use Poseidon2.
+  There is no SHA256 alternative in SP1. The Rúnar FRI verifier MUST
+  implement the full Poseidon2 permutation in Bitcoin Script using
+  Baby Bear field arithmetic (multiplications, additions, constant
+  additions — no bitwise operations). Parameters: width=16, rate=8,
+  capacity=8, sbox_degree=7, external_rounds=8, internal_rounds=13.
+  Round constants from Plonky3's p3-poseidon2 crate. Estimated script
+  size: 30-50KB for the permutation subroutine. Generate test vectors
+  from Plonky3 with SP1's exact parameters before implementing.
 
 **Implementation steps**:
 
@@ -656,8 +703,10 @@ These are NOT built-in Bitcoin opcodes — they are Rúnar DSL abstractions that
 | BSV block height | **Exists** — `ExtractLocktime` |
 | Multi-output | **Exists** — `AddOutput` |
 | P2PKH construction | **Exists** — manual via `Hash160` + `Cat` |
-| Baby Bear field arithmetic | **NEW** — codegen module needed |
-| SHA256 Merkle proof verification | **NEW** — loop pattern (trivial with existing primitives) |
+| Baby Bear field arithmetic | **COMPLETE** — codegen module, 1,326 test vectors |
+| SHA256 Merkle proof verification | **COMPLETE** — for bridge/BSVM bindings (NOT FRI) |
+| Poseidon2 over Baby Bear | **NEW — REQUIRED** — for FRI Merkle commitments + Fiat-Shamir |
+| Poseidon2 Merkle proof verification | **NEW — REQUIRED** — for FRI query verification |
 | Cross-covenant output read | **NEW** — calling convention + pattern |
-| SP1 FRI verifier | **NEW** — the main deliverable |
+| SP1 FRI verifier (with Poseidon2) | **NEW** — the main deliverable |
 | Keccak-256 / Ethereum MPT in Script | **NOT NEEDED** — STARK proof covers it |

@@ -96,31 +96,39 @@ Key SP1 source files for documenting the layout:
 
 ### SP1 FRI Parameters
 
-These parameters are extracted from SP1 v4.1.1 source and are
-compile-time constants in the Rúnar FRI verifier. Document exact
-values during Gate 0b step 3.
+These parameters are extracted from SP1 v4.1.2 source and confirmed
+via Gate 0b proof inspection. They are compile-time constants in the
+Rúnar FRI verifier.
 
 ```
 Field:              Baby Bear (p = 2013265921)
-Extension field:    degree-4 over Baby Bear
-Hash function:      Poseidon2 (width=16, rate=8, internal rounds=13,
-                    external rounds=8, sbox degree=7)
-                    NOTE: If SP1 uses Poseidon2 (not SHA256) for FRI
-                    commitments, Rúnar needs a Poseidon2 codegen module.
-                    If this is infeasible, evaluate SP1's SHA256-based
-                    proof mode or STARK-to-SNARK wrapping.
+Extension field:    degree-4 over Baby Bear (BinomialExtensionField)
+Hash function:      Poseidon2 over Baby Bear (width=16, rate=8,
+                    capacity=8, sbox degree=7, 8 external rounds,
+                    13 internal rounds). SP1 hardcodes
+                    BabyBearPoseidon2 as its STARK configuration.
+                    There is NO SHA256 alternative in SP1.
 FRI blowup factor:  2 (log_blowup = 1)
 FRI folding factor: 2 (halve domain each round)
-FRI queries:        100
+FRI queries:        100 (core proof), 50 (compressed proof)
 FRI rounds:         log2(trace_length) - log2(final_poly_degree)
+                    (19 rounds observed for minimal guest)
 Proof of work bits: 16
-Security level:     >= 100 bits
+Security level:     ~116 bits conjectured
 ```
 
-**CRITICAL**: If SP1 v4.1.1 uses Poseidon2 as the FRI hash function
-(not SHA256), this affects the Rúnar verifier significantly. SHA256 is
-native to BSV (`OP_SHA256`); Poseidon2 would need a custom codegen
-module. Verify the hash function as the FIRST step of Gate 0b.
+**CONFIRMED (Gate 0b)**: SP1 uses Poseidon2 (not SHA256) for ALL
+FRI Merkle commitments and Fiat-Shamir challenge derivation. The
+Rúnar FRI verifier MUST implement the Poseidon2 permutation in
+Bitcoin Script using Baby Bear field arithmetic. Poseidon2 is an
+algebraic hash — it operates entirely on Baby Bear field elements
+using multiplications and additions. No bitwise operations. This is
+feasible with the Baby Bear arithmetic primitives already proven on
+BSV, but increases verifier script size relative to native OP_SHA256.
+
+BSV's native OP_HASH256 (SHA-256) is still used for BSVM-specific
+bindings (batchDataHash, hashOutputs verification, withdrawal
+Merkle trees), but NOT for STARK proof verification.
 
 ---
 
@@ -808,33 +816,44 @@ The covenant extracts these values at the fixed offsets shown above. Any change 
 
 ## Component 3: STARK Verifier in BSV Covenant (Rúnar)
 
+**Hash function: Poseidon2, not SHA-256.** SP1 exclusively uses
+Poseidon2 over the Baby Bear field for all internal STARK operations
+(FRI Merkle commitments, Fiat-Shamir challenges). BSV's native
+OP_HASH256 (SHA-256) is NOT used for STARK verification. The Rúnar
+FRI verifier must implement the full Poseidon2 permutation in
+Bitcoin Script using Baby Bear field arithmetic. This is the primary
+contributor to verifier script size.
+
 The covenant's locking script verifies the SP1 STARK proof. SP1 uses
 FRI (Fast Reed-Solomon Interactive Oracle Proofs) for its STARK system.
 The FRI verification algorithm requires:
 
-- Hash operations (for Merkle tree commitments in FRI)
-- Field arithmetic (additions, multiplications, inversions over a prime field)
+- Poseidon2 hash operations (for FRI Merkle tree commitments — SP1
+  uses Poseidon2 over Baby Bear, not SHA-256)
+- Field arithmetic (additions, multiplications, inversions over Baby Bear)
 - Polynomial evaluation checks
 
-All of these are available in BSV Script via Rúnar. No elliptic curve
-operations are required for STARK verification — this is purely hash-based
-and arithmetic-based. This is simpler and cheaper than the Bulletproofs/
-Groth16 verifiers considered in earlier spec versions.
+No elliptic curve operations are required for STARK verification —
+this is purely algebraic-hash-based and arithmetic-based.
 
 ### SP1 Proof Format
 
-SP1 proofs have a well-defined structure:
+SP1 proofs have a well-defined structure (confirmed via Gate 0b):
 
 ```
-SP1 STARK Proof:
-  - FRI commitments (Merkle roots): N × 32 bytes
-  - FRI query responses: Q queries × D layers × field elements
+SP1 STARK Proof (compressed):
+  - FRI commitments (Poseidon2 Merkle roots): each is [BabyBear; 8]
+    (8 field elements = 32 bytes per commitment)
+  - FRI query responses: 100 queries × ~19 layers × field elements
+    with Poseidon2 Merkle authentication paths
   - Public values: committed outputs from the guest program
   - Auxiliary data: permutation challenges, opening values
+  - Proof-of-work witness: Baby Bear field element
 ```
 
-Typical proof size: 50-200KB (depending on circuit size and security
-parameter). On BSV, this goes in the unlocking script of the covenant-
+Compressed proof size: ~1.3 MB (constant, independent of program
+complexity). Core proof size: ~1.8 MB (scales linearly with cycles).
+On BSV, the proof data goes in the unlocking script of the covenant-
 advance transaction.
 
 ### Covenant Contract
@@ -1220,22 +1239,38 @@ FRI verification steps (all hash + arithmetic, no EC):
 ```
 
 All operations are:
-- `hash256` (SHA-256 double-hash, native BSV opcode)
-- Field arithmetic over the Baby Bear field (p = 2^31 - 2^27 + 1)
-  using BSV arithmetic opcodes (OP_ADD, OP_MUL, OP_MOD, etc.)
-- Merkle proof verification (repeated hashing)
+- Poseidon2 permutation over the Baby Bear field (for FRI Merkle
+  commitments and Fiat-Shamir challenges). SP1 uses Poseidon2 with
+  width=16, rate=8, capacity=8, sbox degree=7, 8 external rounds,
+  13 internal rounds. This is an algebraic hash — it operates
+  entirely on Baby Bear field elements using multiplications and
+  additions. No bitwise operations. The Rúnar implementation
+  compiles Poseidon2 to Baby Bear field arithmetic in Bitcoin Script.
+- Baby Bear field arithmetic (p = 2^31 - 2^27 + 1) for FRI folding
+  checks, polynomial evaluation, and DEEP-ALI composition. Uses BSV
+  arithmetic opcodes (OP_ADD, OP_MUL, OP_MOD).
+- SHA-256 double-hash (OP_HASH256) for BSVM-specific bindings ONLY:
+  batchDataHash verification and hashOutputs verification. These are
+  NOT part of the STARK proof verification — they are covenant-level
+  checks that bind the proof to the on-chain data.
 
 ### Script Size and Execution Cost Estimate
 
 FRI verification complexity:
-- Security parameter λ: 100 bits
-- Number of FRI queries: ~30 (for 100-bit security)
-- FRI rounds: ~20 (log of the trace length)
-- Per query: ~20 hash operations + ~50 field multiplications
-- Total: ~600 hashes + ~1,500 field multiplications + Merkle checks
+- Security parameter λ: ~116 bits conjectured
+- Number of FRI queries: 100 (core), 50 (compressed)
+- FRI rounds: ~19 (observed for minimal guest, depends on trace length)
+- Per query: ~19 Poseidon2 calls (Merkle path) + ~50 field multiplications
+- Poseidon2 permutation: ~30-50KB of compiled Script (subroutine)
+- Total estimated FRI verifier: 1-5MB (significantly larger than the
+  earlier SHA-256 estimate due to Poseidon2). Gate 0a must validate this.
+Estimated total per query: ~19 Poseidon2 compressions (Merkle path) +
+~50 Baby Bear ext4 multiplications (folding check) + ~5 inversions.
+With 100 queries: ~1,900 Poseidon2 calls + ~5,000 field muls + ~500 inversions.
 
-Estimated script size: **200KB - 2MB** depending on optimisation
-(inlining vs looping, precomputed tables).
+Estimated script size: **1-5MB** depending on Poseidon2 permutation
+size and whether subroutine calling conventions allow reuse. Gate 0a
+Full must measure the actual compiled script size.
 
 BSV limits: 4GB script, unlimited execution time for miners.
 

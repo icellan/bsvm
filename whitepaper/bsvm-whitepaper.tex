@@ -307,12 +307,14 @@ The covenant is written using R\'{u}nar's Go DSL and compiled to Bitcoin Script.
 The STARK verification algorithm (FRI protocol) requires:
 
 \begin{itemize}[nosep,leftmargin=1.5em]
-\item Hash operations (\texttt{OP\_HASH256}---double SHA-256, native to BSV).
+\item Poseidon2 permutation over the Baby Bear field (SP1's hash function for FRI Merkle commitments and Fiat-Shamir challenges). Poseidon2 is an algebraic hash---it operates entirely on field elements using multiplications and additions, making it implementable with BSV's arithmetic opcodes.
 \item Field arithmetic over the Baby Bear field ($p = 2^{31} - 2^{27} + 1$) using BSV's arithmetic opcodes.
-\item Merkle proof verification (repeated hashing).
+\item Poseidon2-based Merkle proof verification (repeated Poseidon2 compression).
 \end{itemize}
 
-No elliptic curve operations are required, in contrast to SNARK verifiers which need expensive pairing computations. All FRI building blocks have been implemented in R\'{u}nar and validated on BSV regtest against 1,326 Plonky3-generated test vectors. Measured locking script sizes are compact: Baby Bear field addition and multiplication compile to 9~bytes each, field inversion to 477~bytes, a depth-20 SHA-256 Merkle proof to 482~bytes, and a full FRI colinearity check (the core folding equation over the Baby Bear quartic extension field) to 1,742~bytes. These results confirm feasibility well within BSV's Script constraints.
+\noindent Note: BSV's native \texttt{OP\_HASH256} (double SHA-256) is used for BSVM-specific data bindings (batch data hash verification, hashOutputs introspection, withdrawal Merkle trees) but \emph{not} for STARK proof verification. SP1 exclusively uses Poseidon2 over Baby Bear for all internal STARK operations.
+
+No elliptic curve operations are required, in contrast to SNARK verifiers which need expensive pairing computations. All FRI building blocks have been implemented in R\'{u}nar and validated on BSV regtest against 1,326 Plonky3-generated test vectors. Measured locking script sizes are compact: Baby Bear field addition and multiplication compile to 9~bytes each, field inversion to 477~bytes, and a full FRI colinearity check (the core folding equation over the Baby Bear quartic extension field) to 1,742~bytes. The Poseidon2 permutation subroutine is estimated at 30--50\,KB of compiled Script; Gate~0a will validate the full assembled verifier size.
 
 \subsection{Batch Data Binding}
 

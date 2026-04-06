@@ -151,8 +151,10 @@ SP1 is for proof. If they disagree, it is a critical bug.
 All Bitcoin Script in covenant contracts is compiled via runar-go, imported
 as a Go library. Covenant contracts are in pkg/covenant/contracts/ and use
 the Rúnar Go DSL. The covenant has NO sequencer signature check — only
-SP1 STARK verification via a Rúnar-compiled FRI verifier using SHA256
-and Baby Bear field arithmetic (p = 2^31 - 2^27 + 1).
+SP1 STARK verification via a Rúnar-compiled FRI verifier using Poseidon2
+and Baby Bear field arithmetic (p = 2^31 - 2^27 + 1). SP1 uses
+Poseidon2 (an algebraic hash over Baby Bear) for FRI Merkle commitments.
+BSV's native SHA-256 is used separately for BSVM data bindings only.
 
 ## Node Model
 
