@@ -159,7 +159,7 @@ The core data structure is a chain of BSV transactions, each spending the previo
 \end{tikzpicture}
 \end{center}
 
-\noindent Each UTXO$_i$ carries the state root $\sigma_i$ and block number $i$ in its locking script. The locking script is a R\'{u}nar-compiled covenant that verifies a STARK proof before allowing the spend. BSV's unlimited unconfirmed chain depth allows hundreds or thousands of covenant advances between BSV blocks. When a block is mined, the entire chain is confirmed atomically.
+\noindent Each UTXO$_i$ carries the full state tuple in its locking script: the EVM state root $r_i$, block number $i$, chain ID, withdrawal Merkle root, cumulative deposit counter, and bridge nonce (for withdrawal replay protection). The state root $r_i$ is the Merkle Patricia Trie root of the EVM world state; the remaining fields track bridge commitments and shard identity. The locking script is a R\'{u}nar-compiled covenant that verifies a STARK proof before allowing the spend. BSV's unlimited unconfirmed chain depth allows hundreds or thousands of covenant advances between BSV blocks. When a block is mined, the entire chain is confirmed atomically.
 
 \subsection{Transaction Flow}
 
@@ -416,6 +416,8 @@ To claim BSV, the user (or any relayer) constructs a BSV transaction spending th
 \item A Merkle proof that the withdrawal event exists under the committed withdrawal root.
 \end{enumerate}
 
+Each withdrawal claim must reference a specific bridge sub-covenant UTXO and increment a sequential \emph{withdrawal nonce} stored in that sub-covenant's state. Because the sub-covenant UTXO can only be spent once (the UTXO invariant), and the successor output encodes the incremented nonce, the same withdrawal cannot be claimed twice. Cross-sub-covenant replay is prevented by binding each withdrawal event to a specific sub-covenant index at the L2 contract level; the sub-covenant script verifies this index match.
+
 The bridge covenant creates a withdrawal output with an \texttt{OP\_CHECKSEQUENCEVERIFY} (CSV) timelock enforcing tiered confirmation delays:
 
 \begin{table}[h]
@@ -477,7 +479,7 @@ Batch data is published in the OP\_RETURN output of every covenant-advance trans
 
 \subsection{Censorship Resistance}
 
-The multi-node architecture provides first-order censorship resistance: if one node refuses to include a transaction, the user can submit it to another node. The forced-inclusion inbox provides second-order resistance: even if all nodes collude, the user can submit directly to BSV via the inbox covenant, and the state covenant enforces inclusion.
+The multi-node architecture provides first-order censorship resistance: if one node refuses to include a transaction, the user can submit it to another node. The forced-inclusion inbox provides second-order resistance: even if all nodes collude, the user can submit directly to BSV via the inbox covenant, and the state covenant enforces inclusion within a configurable deadline of $\delta$ advances (typically $\delta \in [5, 50]$, fixed at shard genesis). If an inbox transaction is older than $\delta$ advances, the covenant rejects any advance that does not include it.
 
 \subsection{Bridge Security}
 
@@ -531,7 +533,7 @@ Stable L1 fees & \checkmark & -- & -- \\
 
 BSVM demonstrates that BSV's unique properties---unbounded block size, stable low fees, unlimited unconfirmed chain depth, and expressive Script---make it an ideal settlement layer for a validity-proven EVM L2. The covenant UTXO chain provides a natural state commitment mechanism that eliminates the need for a centralized sequencer. The SP1 zkVM enables full EVM execution proofs without custom circuit engineering. And BSV's fee structure makes the economics dramatically better than any Ethereum-based L2: per-transaction L1 costs of $\approx$\$0.00005 with 12$\times$ prover margins at 1~gwei gas price.
 
-The system provides security properties that match or exceed existing L2s: validity proofs (no 7-day challenge period), no privileged sequencer key (proof is the sole authorization), multi-node liveness (no single point of failure), configurable governance (from fully trustless to multisig-governed), and a forced-inclusion inbox (censorship resistance). The FRI verifier---the critical on-chain component that validates STARK proofs in Bitcoin Script---has been prototyped via R\'{u}nar and validated on BSV regtest, confirming the feasibility of on-chain proof verification within BSV's Script constraints. The trust assumptions for normal operation reduce to the soundness of the STARK proof system and the correctness of the R\'{u}nar-compiled verifier, both of which are amenable to formal verification and multi-implementation conformance testing.
+The system provides security properties that match or exceed existing L2s: validity proofs (no 7-day challenge period), no privileged sequencer key (proof is the sole authorization), multi-node liveness (no single point of failure), configurable governance (from fully trustless to multisig-governed), and a forced-inclusion inbox (censorship resistance). The FRI verifier---the critical on-chain component that validates STARK proofs in Bitcoin Script---has been prototyped via R\'{u}nar and validated on BSV regtest, confirming the feasibility of on-chain proof verification within BSV's Script constraints. The verifier must be designed to verify all valid proofs within Script resource limits uniformly; if resource costs vary by proof structure, only a subset of valid transitions may be admissible on-chain, which does not compromise safety but may constrain reachable states. The trust assumptions for normal operation reduce to the soundness of the STARK proof system and the correctness of the R\'{u}nar-compiled verifier, both of which are amenable to formal verification and multi-implementation conformance testing.
 
 BSVM opens a new design space: general-purpose smart contract execution with validity proofs on a UTXO blockchain. We believe this combination---EVM compatibility, STARK validity proofs, BSV data availability, and covenant-enforced state---represents a compelling alternative to the Ethereum-centric L2 landscape.
 
