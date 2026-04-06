@@ -1,0 +1,628 @@
+\documentclass[11pt,twocolumn]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+% Using default Computer Modern fonts
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,fit}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+  pdftitle={BSVM: A Validity-Proven EVM Layer 2 on Bitcoin SV via Covenant UTXO Chains and STARK Proofs},
+  pdfauthor={Siggi Oskarsson},
+  pdfsubject={Ethereum Virtual Machine Layer 2 on Bitcoin SV with STARK validity proofs},
+  pdfkeywords={EVM, Layer 2, Bitcoin SV, STARK, zero-knowledge proofs, covenant, UTXO, zkVM, SP1, rollup},
+  pdfcreator={LaTeX with hyperref},
+  pdfproducer={BSVM Project},
+  bookmarks=true,
+  bookmarksnumbered=true
+}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  xleftmargin=1em,
+  framexleftmargin=0.5em,
+  numbers=none,
+  columns=flexible
+}
+
+\title{\textbf{BSVM: A Validity-Proven EVM Layer~2 on Bitcoin~SV\\via Covenant UTXO Chains and STARK Proofs}}
+
+\author{
+Siggi \'{O}skarsson \\
+\textit{BSV Association} \\
+\texttt{siggi.oskarsson@bsvassociation.org}
+}
+
+\date{April 2026}
+
+\begin{document}
+
+\twocolumn[
+\begin{@twocolumnfalse}
+\maketitle
+\begin{abstract}
+We present BSVM, a Layer~2 Ethereum Virtual Machine that runs on Bitcoin~SV (BSV) as its settlement and data availability layer. BSVM achieves full EVM bytecode compatibility while anchoring every state transition to BSV through a novel \emph{covenant UTXO chain} architecture. Each L2 state advance is a BSV transaction that spends a covenant-locked UTXO and creates a new one, forming a chain of state commitments enforced by Bitcoin Script. State transition correctness is guaranteed by STARK validity proofs generated via the SP1 zero-knowledge virtual machine, which proves the execution of a Rust EVM interpreter (revm) compiled to RISC-V. The covenant verifies the STARK proof on-chain using a FRI verifier compiled to Bitcoin Script via the R\'{u}nar multi-language Bitcoin Script compiler. The system requires no privileged sequencer key---the proof alone authorizes state advances, meaning anyone with a valid proof can advance the chain. BSVM supports an ecosystem of independent EVM instances (\emph{shards}), each with its own covenant chain and node network. At a BSV fee rate of 100~sat/KB, a 128-transaction batch costs approximately 21,600~satoshis to post on-chain ($\approx$\$0.0065), yielding a per-transaction L1 cost of 169~satoshis ($\approx$\$0.00005). We describe the architecture, proof pipeline, fee model, bridge design, and security properties in full.
+\end{abstract}
+\vspace{1em}
+\end{@twocolumnfalse}
+]
+
+% ─────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+The Ethereum Virtual Machine (EVM) has emerged as the dominant smart contract execution environment, with over \$100B in total value locked across EVM-compatible chains as of 2025~\cite{l2beat}. However, Ethereum's Layer~1 gas costs remain prohibitive for many applications, driving demand for Layer~2 (L2) solutions that execute transactions off-chain while inheriting L1 security guarantees.
+
+Existing L2 architectures---optimistic rollups~\cite{arbitrum,optimism} and zero-knowledge rollups~\cite{zksync,scroll,polygon_zkevm}---all build on Ethereum as their L1. This creates a dependency on Ethereum's limited throughput and volatile fee market. When Ethereum L1 gas prices spike, L2 posting costs increase proportionally, as L2s must compete for Ethereum block space to publish batch data and proofs.
+
+We observe that the ideal L1 for an EVM L2 has three properties: (1)~large or unbounded data capacity for cheap batch posting, (2)~stable and predictable fees, and (3)~a UTXO model amenable to covenant-based state locking. Bitcoin~SV (BSV)~\cite{bsv_scaling} satisfies all three. BSV allows unbounded transaction and block sizes, charges a stable fee rate of approximately 100~satoshis per kilobyte, and supports advanced Bitcoin Script operations including introspection opcodes that enable covenant contracts~\cite{runar}.
+
+BSVM leverages these properties to build an EVM L2 that is:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item \textbf{Fully EVM-compatible}: Existing Solidity contracts, MetaMask, ethers.js, Hardhat, and Foundry work without modification.
+\item \textbf{Validity-proven}: Every state transition is proven correct by a STARK proof covering full EVM execution---every opcode, every state access, every balance transfer.
+\item \textbf{Sequencer-free}: No privileged key can advance the state. The STARK proof is the sole authorization. Anyone with a valid proof can advance the covenant.
+\item \textbf{Extremely cheap}: At 100~sat/KB, a 128-transaction batch costs $\approx$21,600~sats ($\approx$\$0.0065) on L1, yielding per-transaction costs of $\approx$\$0.00005.
+\end{itemize}
+
+The remainder of this paper is organized as follows. Section~\ref{sec:background} reviews relevant background. Section~\ref{sec:architecture} presents the overall system architecture. Section~\ref{sec:evm} describes the EVM extraction and execution engine. Section~\ref{sec:proofs} details the validity proof pipeline. Section~\ref{sec:covenant} describes the covenant contract and on-chain verification. Section~\ref{sec:fees} analyzes the fee model and prover economics. Section~\ref{sec:bridge} presents the bridge design. Section~\ref{sec:security} provides a security analysis. Section~\ref{sec:related} discusses related work, and Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────
+\section{Background}
+\label{sec:background}
+
+\subsection{The Ethereum Virtual Machine}
+
+The EVM is a stack-based, 256-bit word-size virtual machine that executes smart contract bytecode~\cite{wood_ethereum}. It operates over a world state organized as a Merkle Patricia Trie (MPT)~\cite{wood_ethereum}, where each account's storage is itself a trie. The EVM's gas metering system ensures execution terminates and provides a fee mechanism. Modern EVM implementations support the full hardfork history from Frontier through Prague, including EIP-1559 fee markets~\cite{eip1559}, EIP-2929 access lists~\cite{eip2929}, and EIP-1153 transient storage~\cite{eip1153}.
+
+\subsection{Bitcoin SV and Unbounded Blocks}
+
+Bitcoin~SV restores the original Bitcoin protocol~\cite{nakamoto} with no artificial limits on transaction or block size~\cite{bsv_scaling}. Key properties relevant to BSVM:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item \textbf{Unbounded OP\_RETURN}: Transactions can carry arbitrary data payloads, enabling cheap L2 data availability.
+\item \textbf{Unlimited unconfirmed chain depth}: BSV allows arbitrarily long chains of unconfirmed transactions, each spending the output of the previous. BTC limits this to $\approx$25 transactions.
+\item \textbf{Stable fees}: BSV maintains a fee rate of approximately 100~sat/KB, independent of network demand.
+\item \textbf{Script expressiveness}: BSV's Script supports arithmetic, hashing, and introspection opcodes (e.g., OP\_PUSH\_TX for sighash preimage access) that enable covenant contracts.
+\end{itemize}
+
+\subsection{Covenant Contracts}
+
+A \emph{covenant} is a Bitcoin locking script that constrains how the output may be spent, including constraints on the spending transaction's outputs~\cite{moser_covenants}. Using OP\_PUSH\_TX (which provides the sighash preimage to Script), a covenant can inspect the spending transaction's outputs and enforce that specific output scripts and values are maintained. This enables \emph{stateful UTXO chains}: a UTXO is spent and recreated with updated state data, forming a deterministic chain of state transitions anchored in BSV's blockchain.
+
+\subsection{STARK Proofs}
+
+Scalable Transparent Arguments of Knowledge (STARKs)~\cite{ben_sasson_stark} are proof systems based on hash functions and polynomial commitments via the FRI protocol~\cite{ben_sasson_fri}. Unlike SNARKs~\cite{groth16}, STARKs require no trusted setup and are conjectured post-quantum secure. STARK verification involves checking polynomial evaluations against Merkle commitments---operations that decompose into hash computations and field arithmetic, making them amenable to verification in resource-constrained environments such as Bitcoin Script.
+
+\subsection{Zero-Knowledge Virtual Machines}
+
+A zero-knowledge virtual machine (zkVM) proves the correct execution of arbitrary programs. SP1~\cite{sp1} is a STARK-based zkVM that proves RISC-V program execution. Programs are compiled from Rust (or any LLVM-compiled language) to RISC-V ELF binaries. SP1 includes \emph{precompiles}---optimized circuits for common operations such as keccak256 and secp256k1---that reduce proving cost by 5--10$\times$ compared to naive RISC-V execution~\cite{sp1}. SP1 is audited by four firms and secures over \$1B in total value locked across production systems~\cite{sp1}.
+
+\subsection{The R\'{u}nar Compiler}
+
+R\'{u}nar~\cite{runar} is a multi-language Bitcoin Script compiler with independent implementations in Go, TypeScript, Rust, and Python that produce byte-identical output via an Administrative Normal Form (ANF) intermediate representation. R\'{u}nar provides a domain-specific language for writing covenant contracts that compile to Bitcoin Script. The multi-implementation conformance property---all compilers producing identical output for the same contract---provides formal correctness assurance that is critical for a covenant guarding L2 state.
+
+% ─────────────────────────────────────────────
+\section{System Architecture}
+\label{sec:architecture}
+
+\subsection{Overview}
+
+BSVM is an ecosystem of independent EVM instances (\emph{shards}), each running as a BSV overlay network. Each shard consists of:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item A \textbf{covenant UTXO chain} on BSV: a sequence of BSV transactions, each spending the previous covenant UTXO, forming the canonical state commitment chain.
+\item A \textbf{node network}: multiple nodes that replicate state via peer-to-peer gossip, execute EVM transactions deterministically, and race to generate STARK proofs and advance the covenant.
+\item A \textbf{bridge covenant}: one or more BSV UTXOs that hold locked BSV backing the shard's native token (wBSV).
+\end{enumerate}
+
+There is no centralized sequencer. BSV is the consensus layer---whichever node successfully spends the covenant UTXO first determines the canonical state for that batch. Other nodes accept the winner's ordering by replaying the batch data from BSV.
+
+\subsection{Multi-Shard Model}
+
+Shards are sovereign and independent. A DeFi project launches its own shard with its own chain ID, contract deployments, and covenant chain. An identity project launches a separate shard. Cross-shard interaction is asynchronous bridging---lock on one shard, mint on another---analogous to bridging between Ethereum and Arbitrum. Within a shard, full Ethereum-style atomic composability (cross-contract calls) is supported.
+
+\subsection{Covenant UTXO Chain}
+
+The core data structure is a chain of BSV transactions, each spending the previous covenant output:
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.6cm,
+  box/.style={draw, rounded corners, minimum width=2cm, minimum height=0.8cm, font=\footnotesize, align=center},
+  arr/.style={-{Stealth[length=5pt]}, thick}
+]
+\node[box] (u0) {UTXO$_0$\\$\sigma_0$};
+\node[box, right=of u0] (u1) {UTXO$_1$\\$\sigma_1$};
+\node[box, right=of u1] (u2) {UTXO$_2$\\$\sigma_2$};
+\node[right=0.4cm of u2, font=\footnotesize] (dots) {$\cdots$};
+\draw[arr] (u0) -- (u1);
+\draw[arr] (u1) -- (u2);
+\draw[arr] (u2) -- (dots);
+\end{tikzpicture}
+\end{center}
+
+\noindent Each UTXO$_i$ carries the state root $\sigma_i$ and block number $i$ in its locking script. The locking script is a R\'{u}nar-compiled covenant that verifies a STARK proof before allowing the spend. BSV's unlimited unconfirmed chain depth allows hundreds or thousands of covenant advances between BSV blocks. When a block is mined, the entire chain is confirmed atomically.
+
+\subsection{Transaction Flow}
+
+A user submits a signed EVM transaction via \texttt{eth\_sendRawTransaction} (standard Ethereum RPC). The overlay node:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item Validates the transaction (signature, nonce, gas, balance).
+\item Executes it through the Go EVM engine (sub-millisecond).
+\item Returns the receipt immediately.
+\item Batches the transaction with up to 127 others.
+\item Generates a STARK proof of the batch via SP1.
+\item Builds a BSV transaction spending the covenant UTXO, with the proof in the unlocking script and batch data in an OP\_RETURN output.
+\item Broadcasts the BSV transaction.
+\end{enumerate}
+
+The user receives a receipt in milliseconds. The STARK proof follows in seconds. The BSV finality follows in minutes.
+
+\subsection{Multi-Node Operation}
+
+All nodes in a shard execute the same transactions deterministically. When multiple nodes race to advance the covenant:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item Only one transaction can spend the covenant UTXO. BSV miners accept whichever propagated first.
+\item The losing node detects the competing spend, extracts the winner's batch data from the OP\_RETURN output, replays it to verify the state root, and continues from the winner's tip.
+\item No leader election or consensus protocol is needed. BSV resolves conflicts via its existing double-spend resolution.
+\end{itemize}
+
+This model provides liveness without a single point of failure: if one node goes offline, others continue advancing the covenant.
+
+% ─────────────────────────────────────────────
+\section{EVM Execution Engine}
+\label{sec:evm}
+
+\subsection{Geth Extraction}
+
+BSVM extracts the EVM interpreter from go-ethereum~\cite{geth} (v1.15.x, post-Prague, pre-EOF). The extraction copies \texttt{core/vm/} (opcodes, interpreter, gas tables, precompiles) into a standalone Go package with zero geth imports. All geth-specific types (\texttt{common.Address}, \texttt{common.Hash}, etc.) are replaced with BSVM equivalents.
+
+The extracted EVM must pass 100\% of the Ethereum Foundation's \texttt{VMTests} and \texttt{GeneralStateTests}~\cite{ethereum_tests}. This is the correctness oracle---any EVM implementation that passes these tests produces identical state roots for identical inputs.
+
+\subsection{StateDB Interface}
+
+The \texttt{StateDB} interface~\cite{wood_ethereum} is the critical decoupling seam between the EVM and the state backend. It provides:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item Account management (create, exist, empty).
+\item Balance operations (get, add, subtract).
+\item Nonce management.
+\item Code storage and retrieval.
+\item Storage reads and writes.
+\item Transient storage (EIP-1153).
+\item Access list tracking (EIP-2929).
+\item Snapshot and revert (for call frame isolation).
+\item Log accumulation.
+\end{itemize}
+
+The concrete implementation backs this interface with an Ethereum-compatible Merkle Patricia Trie over LevelDB, producing state roots that are bit-for-bit identical to any compliant Ethereum implementation.
+
+\subsection{Denomination}
+
+The L2's native gas token is wBSV (wrapped BSV), which functions identically to ETH on Ethereum---it is what \texttt{msg.value} transfers and what gas fees are paid in. The denomination is: $1\;\text{wBSV} = 1\;\text{BSV} = 10^{18}\;\text{L2 wei}$. Thus $1\;\text{satoshi} = 10^{10}\;\text{L2 wei}$. This 18-decimal representation ensures full compatibility with Ethereum tooling (MetaMask, ethers.js) which assumes 18-decimal native tokens.
+
+% ─────────────────────────────────────────────
+\section{Validity Proof Pipeline}
+\label{sec:proofs}
+
+\subsection{Dual-EVM Architecture}
+
+BSVM runs two EVM implementations that must produce identical results:
+
+\begin{description}[nosep,leftmargin=0em]
+\item[Go EVM (geth extraction)] runs inside the overlay node for fast execution. It processes transactions in sub-millisecond time and returns receipts immediately.
+\item[Rust EVM (revm inside SP1)] runs inside the SP1 zkVM to generate the STARK proof. It processes the same transactions against the same pre-state and produces the same post-state root.
+\end{description}
+
+Both EVMs pass the Ethereum test suite, guaranteeing agreement on every input. The Go EVM is for user-facing speed; the Rust EVM inside SP1 is for cryptographic proof.
+
+\subsection{SP1 Guest Program}
+
+The SP1 guest program is a Rust program ($\approx$2,000 lines) compiled to RISC-V that:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item Reads the pre-state root, serialized state, and transaction batch as inputs.
+\item Loads the state into \texttt{revm}~\cite{revm}.
+\item Verifies the pre-state root matches.
+\item Executes each transaction through \texttt{revm}.
+\item Computes the post-state root.
+\item Commits public outputs: pre-state root, post-state root, receipts hash, gas used, batch data hash, chain ID, and withdrawal root.
+\end{enumerate}
+
+SP1 proves that this RISC-V program executed correctly on the given inputs and produced the committed outputs. The proof covers \emph{every} EVM opcode executed by \texttt{revm}---every \texttt{ADD}, \texttt{SLOAD}, \texttt{CALL}, balance transfer, and gas deduction. A malicious prover cannot forge state because the STARK proof covers the entire RISC-V execution trace.
+
+\subsection{Proof Properties}
+
+The STARK proof guarantees:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item \textbf{Execution correctness}: Every opcode executed correctly.
+\item \textbf{State consistency}: The post-state root is the correct result of applying the transactions to the pre-state.
+\item \textbf{Transaction integrity}: The transactions proven are exactly the transactions in the committed batch data hash.
+\item \textbf{Chain binding}: The committed chain ID matches the shard, preventing cross-shard proof replay.
+\item \textbf{Data availability binding}: The committed batch data hash matches the on-chain OP\_RETURN data, verified by the covenant via \texttt{OP\_HASH256}.
+\end{enumerate}
+
+\subsection{Proving Performance}
+
+Table~\ref{tab:proving} shows estimated proving times for different batch compositions.
+
+\begin{table}[h]
+\centering
+\caption{SP1 proving time estimates by batch composition}
+\label{tab:proving}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Batch} & \textbf{Cycles} & \textbf{GPU Time} \\
+\midrule
+128 simple transfers & $\sim$60M & $\sim$5s \\
+128 ERC-20 transfers & $\sim$100M & $\sim$8s \\
+128 Uniswap swaps & $\sim$300M & $\sim$15s \\
+Full Ethereum block & $\sim$500M & $\sim$15s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Since execution runs ahead of proving (the Go EVM returns receipts immediately), the proving latency does not affect user-perceived speed.
+
+% ─────────────────────────────────────────────
+\section{Covenant Contract and On-Chain Verification}
+\label{sec:covenant}
+
+\subsection{Covenant Design}
+
+The covenant is written using R\'{u}nar's Go DSL and compiled to Bitcoin Script. It enforces four properties:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item \textbf{Valid STARK proof}: The FRI-based STARK proof verifies correctly.
+\item \textbf{Block number increment}: The new block number is exactly the previous plus one.
+\item \textbf{State continuity}: The proof's committed pre-state root matches the covenant's current state root.
+\item \textbf{Data availability}: The transaction's outputs match the expected structure (covenant output + OP\_RETURN batch data), verified via \texttt{hashOutputs} from the sighash preimage.
+\end{enumerate}
+
+\noindent Crucially, there is \emph{no signature check}. The proof is the sole authorization. The covenant also includes an \texttt{emergencyUpgrade} method requiring a governance multisig (e.g., 3-of-5), which can upgrade the covenant script but cannot advance state or access bridge funds.
+
+\subsection{FRI Verification in Bitcoin Script}
+
+The STARK verification algorithm (FRI protocol) requires:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item Hash operations (\texttt{OP\_HASH256}---double SHA-256, native to BSV).
+\item Field arithmetic over the Baby Bear field ($p = 2^{31} - 2^{27} + 1$) using BSV's arithmetic opcodes.
+\item Merkle proof verification (repeated hashing).
+\end{itemize}
+
+No elliptic curve operations are required, in contrast to SNARK verifiers which need expensive pairing computations. A prototype FRI verifier has been compiled via R\'{u}nar and validated on BSV regtest, confirming feasibility within BSV's Script constraints (script size, stack depth, and execution time are all well within limits).
+
+\subsection{Batch Data Binding}
+
+A critical security property is that the batch data published in the OP\_RETURN must be the same data the STARK proof covers. The covenant enforces this via two checks:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item The SP1 guest commits $h = \texttt{hash256}(\text{batchData})$ as a public value.
+\item The covenant computes $\texttt{OP\_HASH256}(\text{batchData})$ and verifies it equals $h$.
+\item The covenant extracts \texttt{hashOutputs} from the sighash preimage (via OP\_PUSH\_TX) and verifies the transaction's actual outputs match the expected covenant output + OP\_RETURN output.
+\end{enumerate}
+
+This closes the data availability gap: a malicious prover cannot publish garbage batch data alongside a valid proof, because the proof commits to the batch hash and the covenant independently verifies it.
+
+% ─────────────────────────────────────────────
+\section{Fee Model and Prover Economics}
+\label{sec:fees}
+
+\subsection{User-Facing Fees}
+
+The EVM layer is 100\% Ethereum-compatible. Users pay gas in wBSV from their L2 balance via the standard EVM gas mechanism. \texttt{eth\_gasPrice} returns a gwei value. MetaMask handles everything. Users never interact with BSV directly after the initial bridge deposit. There is no BSV-specific gas logic in the EVM.
+
+\subsection{Prover Revenue and Cost}
+
+The prover sets their L2 address as the block's \texttt{Coinbase}. Gas fees from all transactions are credited to the coinbase address via the EVM's standard fee mechanism. This is identical to how Ethereum validators earn fees.
+
+The prover's cost is the BSV mining fee for the covenant-advance transaction. Table~\ref{tab:costs} shows the BSV transaction composition at the target batch size of 128~transactions.
+
+\begin{table}[h]
+\centering
+\caption{BSV covenant-advance transaction size (128-tx batch)}
+\label{tab:costs}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Component} & \textbf{Size} \\
+\midrule
+SP1 STARK proof & $\sim$165 KB \\
+Batch data (128 txs, uncompressed) & $\sim$20 KB \\
+Covenant locking script + state & $\sim$30 KB \\
+Transaction overhead & $\sim$1 KB \\
+\midrule
+\textbf{Total} & \textbf{$\sim$216 KB} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 100~sat/KB: $\sim$21,600~sats per batch ($\approx$\$0.0065 at \$30/BSV). Per EVM transaction: $\sim$169~sats ($\approx$\$0.00005).
+
+\subsection{Profitability Analysis}
+
+Table~\ref{tab:profit} shows prover profitability at two gas price points.
+
+\begin{table}[h]
+\centering
+\caption{Prover profitability per 128-tx batch}
+\label{tab:profit}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Gas price} & \textbf{Revenue} & \textbf{L1 cost} & \textbf{Margin} \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{128 simple transfers (21K gas each)}} \\
+1 gwei & 268,800 sats & 21,600 sats & 12$\times$ \\
+0.1 gwei & 26,880 sats & 21,600 sats & 1.2$\times$ \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{128 Uniswap swaps (150K gas each)}} \\
+1 gwei & 1,920,000 sats & 21,600 sats & 89$\times$ \\
+0.1 gwei & 192,000 sats & 21,600 sats & 8.9$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The break-even gas price for 128 simple transfers is $\approx$0.08~gwei---roughly 60$\times$ cheaper than Ethereum mainnet. Even at 0.1~gwei (cheaper than any existing L2), the prover is profitable.
+
+\subsection{Adaptive Batching}
+
+The overlay node uses adaptive batching: accumulate transactions up to 128, then flush. If the flush timeout (2~seconds) expires before reaching 128, flush what has accumulated (if above a minimum profitability threshold). This balances proving latency against economics:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item At 100~tx/sec: batch fills in $\sim$1.3~seconds (optimal economics).
+\item At 10~tx/sec: batch flushes at timeout with $\sim$20~txs (still profitable at 1~gwei).
+\item At 1~tx/sec: batch flushes with $\sim$2~txs (marginal; prover may wait).
+\end{itemize}
+
+STARK proof size grows logarithmically with batch size, so the marginal L1 cost of adding transactions to a batch is dominated by the linear growth of batch data, not the proof.
+
+% ─────────────────────────────────────────────
+\section{Bridge Design}
+\label{sec:bridge}
+
+\subsection{Deposit Flow}
+
+A user deposits BSV by sending a BSV transaction to the shard's bridge covenant address with an OP\_RETURN containing the shard ID and their L2 address. After 6~BSV confirmations, the overlay node credits the corresponding wBSV balance on L2 via a system transaction. The conversion is $1\;\text{satoshi} = 10^{10}\;\text{L2 wei}$.
+
+\subsection{Withdrawal Flow}
+
+A user calls the bridge contract's \texttt{withdraw()} function on L2, specifying their BSV address and sending wBSV as \texttt{msg.value}. The wBSV is burned. The withdrawal event is included in the batch's \emph{withdrawal root} (a Merkle root of all withdrawal events in the batch), which is committed as a STARK public value.
+
+To claim BSV, the user (or any relayer) constructs a BSV transaction spending the bridge sub-covenant UTXO, providing:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item A reference to the state covenant advance containing the withdrawal.
+\item A Merkle proof that the withdrawal event exists under the committed withdrawal root.
+\end{enumerate}
+
+The bridge covenant creates a withdrawal output with an \texttt{OP\_CHECKSEQUENCEVERIFY} (CSV) timelock enforcing tiered confirmation delays:
+
+\begin{table}[h]
+\centering
+\caption{Withdrawal confirmation tiers}
+\label{tab:tiers}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Amount} & \textbf{BSV blocks} & \textbf{$\approx$ Time} \\
+\midrule
+$\leq$ 10 BSV & 6 & $\sim$1 hour \\
+$\leq$ 100 BSV & 20 & $\sim$3 hours \\
+$>$ 100 BSV & 100 & $\sim$17 hours \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Bridge Security}
+
+Three defense layers protect locked BSV:
+
+\begin{description}[nosep,leftmargin=0em]
+\item[Sharded bridge UTXOs.] Deposits are split across multiple bridge sub-covenant UTXOs, each holding at most 100~BSV. A bug in one sub-covenant exposes at most 100~BSV.
+\item[Guardian freeze.] A governance multisig (e.g., 3-of-5) can freeze large withdrawals during the CSV delay. Guardians cannot steal funds---they can only delay.
+\item[Rate limiting.] The L2 bridge contract enforces a maximum withdrawal rate of 10\% of total deposits per period. This limits the damage from any exploit to 10\% of TVL per day.
+\end{description}
+
+Since the system uses validity proofs (not optimistic proofs), there is no 7-day challenge period. The CSV delay is purely for operational safety, not for fraud dispute resolution.
+
+\subsection{Censorship Resistance}
+
+A forced-inclusion inbox covenant on BSV allows users to bypass shard nodes entirely. Anyone can submit an EVM transaction to the inbox by creating a BSV transaction spending the inbox covenant UTXO. The state covenant enforces that inbox transactions older than a configurable number of advances must be included, or the covenant rejects the advance.
+
+% ─────────────────────────────────────────────
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Threat Model}
+
+We consider adversaries who may:
+
+\begin{enumerate}[nosep,leftmargin=1.5em]
+\item Control one or more shard nodes.
+\item Attempt to forge proofs or submit invalid state transitions.
+\item Attempt to steal bridge funds.
+\item Attempt to censor transactions.
+\item Exploit bugs in the covenant script or STARK verifier.
+\end{enumerate}
+
+\subsection{State Transition Integrity}
+
+The STARK proof guarantees computational integrity: the proof is sound under standard cryptographic assumptions (collision-resistant hash functions). A forged proof that passes FRI verification would constitute a break of the hash function. Additionally, SP1 has been audited by four independent firms~\cite{sp1}.
+
+The covenant verifies the proof on-chain via R\'{u}nar-compiled FRI verification. The correctness of the R\'{u}nar compiler is assured by multi-implementation conformance: the Go, Rust, TypeScript, and Python compilers all produce byte-identical Script output. A shared compiler bug across four independent implementations is extremely unlikely.
+
+\subsection{Data Availability}
+
+Batch data is published in the OP\_RETURN output of every covenant-advance transaction. The STARK proof commits to the hash of the batch data, and the covenant independently verifies this hash on-chain. This guarantees that the data needed to replay and verify the state transition is permanently available on BSV.
+
+\subsection{Censorship Resistance}
+
+The multi-node architecture provides first-order censorship resistance: if one node refuses to include a transaction, the user can submit it to another node. The forced-inclusion inbox provides second-order resistance: even if all nodes collude, the user can submit directly to BSV via the inbox covenant, and the state covenant enforces inclusion.
+
+\subsection{Bridge Security}
+
+The bridge covenant only releases BSV when presented with a valid STARK proof (state transition correctness) and a Merkle proof (withdrawal event inclusion). The tiered CSV delays, guardian freeze capability, sharded UTXOs, and rate limiting provide defense-in-depth against covenant script bugs.
+
+\subsection{Shard Governance}
+
+The governance model is configurable per-shard at genesis. Three modes are supported: \texttt{none} (fully trustless---no freeze, no upgrade, proof is the sole authority), \texttt{single\_key} (one key can freeze/upgrade), and \texttt{multisig} (M-of-N keys required). Governance keys can \emph{freeze} the shard (blocking \texttt{advanceState}), \emph{upgrade} the covenant script (only while frozen), and \emph{unfreeze} to resume. They \emph{cannot} advance state, access bridge funds, or operate on an active shard (must freeze first). The governance mode is published in the genesis OP\_RETURN and queryable via the \texttt{bsv\_shardInfo} RPC method, allowing users to evaluate the trust model before depositing.
+
+\subsection{Recovery from Covenant Bugs}
+
+For shards with governance enabled (\texttt{single\_key} or \texttt{multisig}), a bug in the FRI verifier can be recovered from: the governance keys freeze the shard, upgrade the covenant to a fixed version, and unfreeze. For fully trustless shards (\texttt{none}), there is no recovery path from a verifier bug---the shard is permanently compromised. This trade-off is by design: maximum trustlessness in exchange for zero recoverability. Shard creators choose based on their risk tolerance and the maturity of the covenant code.
+
+\subsection{Comparison with Existing L2 Security}
+
+\begin{table}[h]
+\centering
+\caption{Security property comparison}
+\label{tab:security}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Property} & \textbf{BSVM} & \textbf{Arb.} & \textbf{zkSync} \\
+\midrule
+Validity proof & \checkmark & -- & \checkmark \\
+No sequencer key & \checkmark & -- & -- \\
+Multi-node & \checkmark & -- & -- \\
+L1 escape hatch & \checkmark & \checkmark & \checkmark \\
+No challenge period & \checkmark & -- & \checkmark \\
+Stable L1 fees & \checkmark & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Optimistic rollups.} Arbitrum~\cite{arbitrum} and Optimism~\cite{optimism} execute transactions off-chain and publish state roots to Ethereum L1. Correctness is enforced via a 7-day fraud proof window during which any party can challenge an incorrect state root. BSVM eliminates this delay by using validity proofs.
+
+\textbf{ZK rollups.} zkSync Era~\cite{zksync}, Scroll~\cite{scroll}, Polygon zkEVM~\cite{polygon_zkevm}, and Linea~\cite{linea} build custom zkEVM circuits that prove EVM execution correctness. These are multi-year, multi-million-dollar engineering efforts requiring specialized circuit designers. BSVM avoids custom circuit development by using the SP1 general-purpose zkVM~\cite{sp1} to prove execution of an existing Rust EVM implementation (\texttt{revm}~\cite{revm}).
+
+\textbf{zkVM-based rollups.} OP Succinct~\cite{op_succinct} uses SP1 to transform Optimism into a ZK rollup with minimal code changes. This validates the approach of using a general-purpose zkVM rather than a custom circuit. BSVM extends this approach to BSV as the L1, eliminating dependence on Ethereum's fee market and block space constraints.
+
+\textbf{Bitcoin L2s.} Several projects explore Layer~2 solutions on Bitcoin. BitVM~\cite{bitvm} proposes a fraud proof system for Bitcoin using hash locks and program decomposition. Stacks~\cite{stacks} runs smart contracts on Bitcoin via a separate consensus mechanism. RGB~\cite{rgb} implements client-side validated smart contracts. None of these provide full EVM compatibility or STARK validity proofs. BSVM is, to our knowledge, the first validity-proven EVM L2 on any Bitcoin variant.
+
+\textbf{EVM extraction.} Prior work on extracting the EVM from geth includes \texttt{go-evm}~\cite{go_evm} (based on geth 1.8) and \texttt{Kdag-K/evm}~\cite{kdag_evm} (consensus-agnostic EVM). BSVM builds on these approaches with a modern extraction targeting post-Prague geth, including EIP-1559, EIP-4844 precompile stubs, and full \texttt{GeneralStateTests} compliance.
+
+% ─────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+BSVM demonstrates that BSV's unique properties---unbounded block size, stable low fees, unlimited unconfirmed chain depth, and expressive Script---make it an ideal settlement layer for a validity-proven EVM L2. The covenant UTXO chain provides a natural state commitment mechanism that eliminates the need for a centralized sequencer. The SP1 zkVM enables full EVM execution proofs without custom circuit engineering. And BSV's fee structure makes the economics dramatically better than any Ethereum-based L2: per-transaction L1 costs of $\approx$\$0.00005 with 12$\times$ prover margins at 1~gwei gas price.
+
+The system provides security properties that match or exceed existing L2s: validity proofs (no 7-day challenge period), no privileged sequencer key (proof is the sole authorization), multi-node liveness (no single point of failure), configurable governance (from fully trustless to multisig-governed), and a forced-inclusion inbox (censorship resistance). The FRI verifier---the critical on-chain component that validates STARK proofs in Bitcoin Script---has been prototyped via R\'{u}nar and validated on BSV regtest, confirming the feasibility of on-chain proof verification within BSV's Script constraints. The trust assumptions for normal operation reduce to the soundness of the STARK proof system and the correctness of the R\'{u}nar-compiled verifier, both of which are amenable to formal verification and multi-implementation conformance testing.
+
+BSVM opens a new design space: general-purpose smart contract execution with validity proofs on a UTXO blockchain. We believe this combination---EVM compatibility, STARK validity proofs, BSV data availability, and covenant-enforced state---represents a compelling alternative to the Ethereum-centric L2 landscape.
+
+% ─────────────────────────────────────────────
+
+\begin{thebibliography}{30}
+
+\bibitem{nakamoto}
+S. Nakamoto, ``Bitcoin: A peer-to-peer electronic cash system,'' 2008. [Online]. Available: \url{https://bitcoin.org/bitcoin.pdf}
+
+\bibitem{wood_ethereum}
+G. Wood, ``Ethereum: A secure decentralised generalised transaction ledger,'' \textit{Ethereum Project Yellow Paper}, 2014. [Online]. Available: \url{https://ethereum.github.io/yellowpaper/paper.pdf}
+
+\bibitem{l2beat}
+L2BEAT, ``Layer 2 scaling solutions,'' 2025. [Online]. Available: \url{https://l2beat.com/}
+
+\bibitem{arbitrum}
+H. Kalodner, S. Goldfeder, X. Chen, S. M. Weinberg, and E. W. Felten, ``Arbitrum: Scalable, private smart contracts,'' in \textit{Proc. USENIX Security}, 2018, pp. 1353--1370.
+
+\bibitem{optimism}
+Optimism Foundation, ``OP Stack specification,'' 2024. [Online]. Available: \url{https://specs.optimism.io/protocol/overview.html}
+
+\bibitem{zksync}
+Matter Labs, ``zkSync Era: A ZK rollup for scaling Ethereum,'' 2023. [Online]. Available: \url{https://docs.zksync.io/}
+
+\bibitem{scroll}
+Scroll Foundation, ``Scroll: Native zkEVM Layer 2 for Ethereum,'' 2023. [Online]. Available: \url{https://docs.scroll.io/en/technology/}
+
+\bibitem{polygon_zkevm}
+Polygon Labs, ``Polygon zkEVM: Zero-knowledge EVM-equivalent rollup,'' 2023. [Online]. Available: \url{https://docs.polygon.technology/tools/zkevm/}
+
+\bibitem{linea}
+Consensys, ``Linea: A developer-ready zk-rollup,'' 2023. [Online]. Available: \url{https://linea.build/}
+
+\bibitem{eip1559}
+V. Buterin, E. Conner, R. Dudley, M. Slipper, I. Norden, and A. Bakhta, ``EIP-1559: Fee market change for ETH 1.0 chain,'' 2019. [Online]. Available: \url{https://eips.ethereum.org/EIPS/eip-1559}
+
+\bibitem{eip2929}
+V. Buterin and M. Swende, ``EIP-2929: Gas cost increases for state access opcodes,'' 2020. [Online]. Available: \url{https://eips.ethereum.org/EIPS/eip-2929}
+
+\bibitem{eip1153}
+A. Beregszaszi and M. Swende, ``EIP-1153: Transient storage opcodes,'' 2022. [Online]. Available: \url{https://eips.ethereum.org/EIPS/eip-1153}
+
+\bibitem{bsv_scaling}
+BSV Association, ``Bitcoin SV: Unbounded scaling for enterprise blockchain,'' 2020. [Online]. Available: \url{https://www.bsvblockchain.org/}
+
+\bibitem{runar}
+S. \'{O}skarsson, ``R\'{u}nar: A multi-language Bitcoin Script compiler with ANF intermediate representation,'' 2025. [Online]. Available: \url{https://runar.build}
+
+\bibitem{moser_covenants}
+M. M\"{o}ser, I. Eyal, and E. G. Sirer, ``Bitcoin covenants,'' in \textit{Proc. Financial Cryptography and Data Security (FC)}, 2016, pp. 126--141.
+
+\bibitem{ben_sasson_stark}
+E. Ben-Sasson, I. Bentov, Y. Horesh, and M. Riabzev, ``Scalable, transparent, and post-quantum secure computational integrity,'' \textit{IACR Cryptology ePrint Archive}, Report 2018/046, 2018.
+
+\bibitem{ben_sasson_fri}
+E. Ben-Sasson, I. Bentov, Y. Horesh, and M. Riabzev, ``Fast Reed-Solomon interactive oracle proofs of proximity,'' in \textit{Proc. ICALP}, vol. 107, 2018, pp. 14:1--14:17.
+
+\bibitem{groth16}
+J. Groth, ``On the size of pairing-based non-interactive arguments,'' in \textit{Proc. EUROCRYPT}, 2016, pp. 305--326.
+
+\bibitem{sp1}
+Succinct Labs, ``SP1: A zero-knowledge virtual machine,'' 2024. [Online]. Available: \url{https://github.com/succinctlabs/sp1}
+
+\bibitem{revm}
+Paradigm, ``revm: Rust Ethereum Virtual Machine,'' 2023. [Online]. Available: \url{https://github.com/bluealloy/revm}
+
+\bibitem{geth}
+Ethereum Foundation, ``go-ethereum: Official Go implementation of the Ethereum protocol,'' 2013--2025. [Online]. Available: \url{https://github.com/ethereum/go-ethereum}
+
+\bibitem{ethereum_tests}
+Ethereum Foundation, ``Ethereum tests: Common tests for all Ethereum implementations,'' 2015--2025. [Online]. Available: \url{https://github.com/ethereum/tests}
+
+\bibitem{bitvm}
+R. Linus, ``BitVM: Compute anything on Bitcoin,'' 2023. [Online]. Available: \url{https://bitvm.org/bitvm.pdf}
+
+\bibitem{stacks}
+Hiro PBC, ``Stacks: A Bitcoin layer for smart contracts,'' 2021. [Online]. Available: \url{https://www.stacks.co/}
+
+\bibitem{rgb}
+LNP/BP Standards Association, ``RGB protocol specification,'' 2023. [Online]. Available: \url{https://rgb.tech/}
+
+\bibitem{op_succinct}
+Succinct Labs, ``OP Succinct: Full validity proving for the OP Stack,'' 2024. [Online]. Available: \url{https://github.com/succinctlabs/op-succinct}
+
+\bibitem{go_evm}
+B. Duan, ``go-evm: Standalone EVM extraction,'' 2019. [Online]. Available: \url{https://github.com/duanbing/go-evm}
+
+\bibitem{kdag_evm}
+Kdag-K, ``evm: Consensus-agnostic EVM,'' 2020. [Online]. Available: \url{https://github.com/Kdag-K/evm}
+
+\end{thebibliography}
+
+\end{document}
