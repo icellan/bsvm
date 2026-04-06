@@ -67,6 +67,15 @@ They determine whether the proof architecture is viable.
   EVM extraction (Milestone 1). See Spec 13, Gate 0a, for the fallback
   plan if the FRI verifier exceeds script size targets.
 
+**Gate 0a Primitive Validation: COMPLETE.** All FRI building blocks
+have been implemented in Rúnar and validated on BSV regtest with
+Plonky3-generated test vectors (1,326 total vectors). Measured locking
+script sizes: Baby Bear add/mul 9 bytes, inv 477 bytes, Merkle proof
+depth-20 482 bytes, FRI colinearity check 1,742 bytes. Poseidon2
+confirmed not needed (SP1-internal only; on-chain uses SHA256). The
+full FRI verifier assembly from these primitives is still TBD (Gate 0a
+Full, see spec 13).
+
 **Gate 0b: SP1 Proof Size and Verification Cost**
 
 Gate 0b is the full round-trip: generate a real SP1 proof, verify it

@@ -36,3 +36,7 @@ else
 fi
 
 echo "Built: whitepaper/$PDF"
+
+# Clean up LaTeX build artifacts
+rm -f "${TEX%.tex}.aux" "${TEX%.tex}.fdb_latexmk" "${TEX%.tex}.fls" \
+      "${TEX%.tex}.log" "${TEX%.tex}.out"
