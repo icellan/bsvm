@@ -725,32 +725,23 @@ func TestSnapshotDepthLimit1024(t *testing.T) {
 	}
 }
 
-// TestSnapshotDepthBeyond1024 verifies that the 1025th snapshot panics
-// because the journal enforces a maxSnapshotDepth of 1024.
+// TestSnapshotDepthBeyond1024 verifies that more than 1024 snapshots can
+// be created. Geth does not enforce a snapshot depth limit — the EVM call
+// depth (1024) is the natural guard, but snapshots accumulate from test
+// runners and precompiles too. The journal must accept >1024.
 func TestSnapshotDepthBeyond1024(t *testing.T) {
 	sdb := newTestStateDB(t)
 	addr := types.HexToAddress("0xbbbb")
 	sdb.CreateAccount(addr)
 
-	// Create exactly 1024 snapshots (the maximum).
-	for i := 0; i < 1024; i++ {
+	// Create 1500 snapshots — must not panic.
+	for i := 0; i < 1500; i++ {
 		sdb.Snapshot()
 		sdb.AddBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
 	}
 
-	// The 1025th snapshot must panic.
-	panicked := false
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				panicked = true
-			}
-		}()
-		sdb.Snapshot()
-	}()
-
-	if !panicked {
-		t.Fatal("expected panic when exceeding snapshot depth limit of 1024")
+	if sdb.GetBalance(addr).Uint64() != 1500 {
+		t.Fatalf("expected balance 1500, got %s", sdb.GetBalance(addr))
 	}
 }
 

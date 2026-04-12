@@ -17,12 +17,6 @@ import (
 	"github.com/icellan/bsvm/pkg/types"
 )
 
-// maxSnapshotDepth is the maximum number of active snapshots allowed.
-// The EVM call depth of 1024 is the primary guard, but the StateDB
-// enforces this independently as a defence-in-depth invariant.
-const maxSnapshotDepth = 1024
-
-
 type revision struct {
 	id           int
 	journalIndex int
@@ -70,13 +64,11 @@ func (j *journal) reset() {
 }
 
 // snapshot returns an identifier for the current revision of the state.
-// It panics if the number of active snapshots reaches maxSnapshotDepth
-// (1024). The EVM call depth limit is the primary guard, but the StateDB
-// enforces this independently as a defence-in-depth invariant.
+// No depth limit is imposed — geth does not limit snapshot depth, and
+// the EVM call depth limit (1024) is the correct guard at a different
+// layer. Snapshots accumulate across all calls in a transaction (not
+// just nested ones), so the count can exceed the call depth limit.
 func (j *journal) snapshot() int {
-	if len(j.validRevisions) >= maxSnapshotDepth {
-		panic("journal: snapshot depth limit reached (1024)")
-	}
 	id := j.nextRevisionID
 	j.nextRevisionID++
 	j.validRevisions = append(j.validRevisions, revision{id, j.length()})
