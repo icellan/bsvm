@@ -24,6 +24,9 @@ type ChainConfig struct {
 	CancunTime          *uint64  `json:"cancunTime,omitempty"`
 	PragueTime          *uint64  `json:"pragueTime,omitempty"`
 	FusakaTime          *uint64  `json:"fusakaTime,omitempty"`
+	// BSVM enables BSVM-specific features (BSV stub precompiles at 0x80-0x82).
+	// Set by DefaultL2Config. Not set for ethereum/tests chain configs.
+	BSVM bool `json:"bsvm,omitempty"`
 }
 
 // DefaultL2Config returns a ChainConfig with all hardforks enabled from genesis.
@@ -45,6 +48,7 @@ func DefaultL2Config(chainID int64) *ChainConfig {
 		ShanghaiTime:        &zero,
 		CancunTime:          &zero,
 		PragueTime:          &zero,
+		BSVM:                true,
 	}
 }
 
@@ -155,6 +159,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsCancun:         c.IsCancun(num, timestamp),
 		IsPrague:         c.IsPrague(num, timestamp),
 		IsFusaka:         c.IsFusakaActive(num, timestamp),
+		IsBSVM:           c.BSVM,
 	}
 }
 
@@ -166,6 +171,10 @@ type Rules struct {
 	IsBerlin, IsLondon                                      bool
 	IsMerge                                                 bool
 	IsShanghai, IsCancun, IsPrague, IsFusaka                 bool
+	// IsBSVM enables BSVM-specific features: BSV stub precompiles at
+	// 0x80-0x82. Set automatically for chains using DefaultL2Config.
+	// Not set when running ethereum/tests (where 0x80 is a regular address).
+	IsBSVM bool
 }
 
 // Config specifies configuration options for the EVM.

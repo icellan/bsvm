@@ -79,13 +79,17 @@ func precompileMap(rules Rules) map[types.Address]PrecompiledContract {
 	// these must be present so that calls to 0x80-0x82 revert rather than
 	// silently succeeding with empty return data.
 	//
+	// Only registered when IsBSVM is true (production L2 shards). Not
+	// registered during ethereum/tests where 0x80 is used as a regular
+	// address by test fixtures (e.g. stStackTests/underflowTest).
+	//
 	// These addresses are NOT included in ActivePrecompiles() to avoid
-	// affecting EIP-2929 access-list warming in ethereum/tests. They are
-	// registered in the execution map only so the EVM recognises them as
-	// precompiles during CALL.
-	m[types.BytesToAddress([]byte{0x80})] = &stubBSVPrecompile{} // BSV_VERIFY_TX
-	m[types.BytesToAddress([]byte{0x81})] = &stubBSVPrecompile{} // BSV_VERIFY_SCRIPT
-	m[types.BytesToAddress([]byte{0x82})] = &stubBSVPrecompile{} // BSV_BLOCK_HASH
+	// affecting EIP-2929 access-list warming.
+	if rules.IsBSVM {
+		m[types.BytesToAddress([]byte{0x80})] = &stubBSVPrecompile{} // BSV_VERIFY_TX
+		m[types.BytesToAddress([]byte{0x81})] = &stubBSVPrecompile{} // BSV_VERIFY_SCRIPT
+		m[types.BytesToAddress([]byte{0x82})] = &stubBSVPrecompile{} // BSV_BLOCK_HASH
+	}
 	return m
 }
 
