@@ -19,3 +19,8 @@ tests/sp1/guest_evm.elf
 # ethereum/tests is a separately-cloned git repo (not a submodule)
 test/evmtest/testdata/
 
+# Internal planning notes (not for repo)
+RUNAR-DELIVERABLES.md
+RUNAR-GROTH16-DELIVERABLES.md
+BSVM-INTEGRATION-TESTS-PROMPT.md
+
