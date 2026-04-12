@@ -1,4 +1,4 @@
-# BSVM: Ethereum Virtual Machine Layer 2 on Bitcoin SV
+# BSVM: Ethereum Virtual Machine Layer 2 on BSV
 
 ## Project Name
 `bsvm` — A standalone, embeddable EVM execution engine with BSV as the data availability and settlement layer.

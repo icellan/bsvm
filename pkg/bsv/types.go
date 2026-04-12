@@ -1,4 +1,4 @@
-// Package bsv provides Bitcoin SV primitive types and utilities used
+// Package bsv provides BSV primitive types and utilities used
 // across the BSVM project. This includes BSV transaction types,
 // script builders, and address encoding.
 package bsv

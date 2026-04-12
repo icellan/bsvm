@@ -1,7 +1,7 @@
 # CLAUDE.md — Instructions for Claude Code
 
 ## Project
-BSVM: An Ethereum Virtual Machine Layer 2 running on Bitcoin SV.
+BSVM: An Ethereum Virtual Machine Layer 2 running on BSV.
 
 ## Specification
 Read ALL files in the `spec/` directory before beginning any implementation work. The specs are numbered 00-13 and should be read in order. Each spec defines interfaces, types, and acceptance criteria for its phase. Specs 10-13 are authoritative — where they conflict with specs 00-09, specs 10-13 win.

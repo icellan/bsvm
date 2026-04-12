@@ -21,10 +21,10 @@
   linkcolor=blue!60!black,
   citecolor=blue!60!black,
   urlcolor=blue!60!black,
-  pdftitle={BSVM: A Validity-Proven EVM Layer 2 on Bitcoin SV via Covenant UTXO Chains and STARK Proofs},
+  pdftitle={BSVM: A Validity-Proven EVM Layer 2 on BSV via Covenant UTXO Chains and STARK Proofs},
   pdfauthor={Siggi Oskarsson},
-  pdfsubject={Ethereum Virtual Machine Layer 2 on Bitcoin SV with STARK validity proofs},
-  pdfkeywords={EVM, Layer 2, Bitcoin SV, STARK, zero-knowledge proofs, covenant, UTXO, zkVM, SP1, rollup},
+  pdfsubject={Ethereum Virtual Machine Layer 2 on BSV with STARK validity proofs},
+  pdfkeywords={EVM, Layer 2, BSV, STARK, zero-knowledge proofs, covenant, UTXO, zkVM, SP1, rollup},
   pdfcreator={LaTeX with hyperref},
   pdfproducer={BSVM Project},
   bookmarks=true,
@@ -92,7 +92,7 @@ The remainder of this paper is organized as follows. Section~\ref{sec:background
 
 The EVM is a stack-based, 256-bit word-size virtual machine that executes smart contract bytecode~\cite{wood_ethereum}. It operates over a world state organized as a Merkle Patricia Trie (MPT)~\cite{wood_ethereum}, where each account's storage is itself a trie. The EVM's gas metering system ensures execution terminates and provides a fee mechanism. Modern EVM implementations support the full hardfork history from Frontier through Prague, including EIP-1559 fee markets~\cite{eip1559}, EIP-2929 access lists~\cite{eip2929}, and EIP-1153 transient storage~\cite{eip1153}.
 
-\subsection{Bitcoin SV and Unbounded Blocks}
+\subsection{BSV and Unbounded Blocks}
 
 Bitcoin~SV restores the original Bitcoin protocol~\cite{nakamoto} with no artificial limits on transaction or block size~\cite{bsv_scaling}. Key properties relevant to BSVM:
 
@@ -580,7 +580,7 @@ V. Buterin and M. Swende, ``EIP-2929: Gas cost increases for state access opcode
 A. Beregszaszi and M. Swende, ``EIP-1153: Transient storage opcodes,'' 2022. [Online]. Available: \url{https://eips.ethereum.org/EIPS/eip-1153}
 
 \bibitem{bsv_scaling}
-BSV Association, ``Bitcoin SV: Unbounded scaling for enterprise blockchain,'' 2020. [Online]. Available: \url{https://www.bsvblockchain.org/}
+BSV Association, ``BSV: Unbounded scaling for enterprise blockchain,'' 2020. [Online]. Available: \url{https://www.bsvblockchain.org/}
 
 \bibitem{runar}
 S. \'{O}skarsson, ``R\'{u}nar: A multi-language Bitcoin Script compiler with ANF intermediate representation,'' 2025. [Online]. Available: \url{https://runar.build}
