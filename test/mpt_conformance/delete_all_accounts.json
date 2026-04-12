@@ -1,0 +1,20 @@
+[
+  {
+    "name": "insert then delete returns to empty root",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "deadbeef"},
+      {"action": "delete", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": ""}
+    ],
+    "expectedRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+  },
+  {
+    "name": "insert two keys then delete both returns to empty root",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "aa"},
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000002", "value": "bb"},
+      {"action": "delete", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": ""},
+      {"action": "delete", "key": "0000000000000000000000000000000000000000000000000000000000000002", "value": ""}
+    ],
+    "expectedRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+  }
+]

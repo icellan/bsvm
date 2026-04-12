@@ -1,0 +1,28 @@
+[
+  {
+    "name": "put-delete-put sequence is deterministic",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "aa"},
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000002", "value": "bb"},
+      {"action": "delete", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": ""},
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000003", "value": "cc"}
+    ],
+    "expectedRoot": ""
+  },
+  {
+    "name": "overwrite produces same root as direct write",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "aabb"},
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "ccdd"}
+    ],
+    "expectedRoot": ""
+  },
+  {
+    "name": "delete nonexistent key is no-op",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "aa"},
+      {"action": "delete", "key": "0000000000000000000000000000000000000000000000000000000000000099", "value": ""}
+    ],
+    "expectedRoot": ""
+  }
+]

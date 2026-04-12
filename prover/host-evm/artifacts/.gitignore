@@ -1,0 +1,4 @@
+# SP1 proof artifacts are generated, not committed
+*.bin
+*.elf
+*.hex

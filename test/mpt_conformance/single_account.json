@@ -1,0 +1,23 @@
+[
+  {
+    "name": "single key-value insert produces deterministic root",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "deadbeef"}
+    ],
+    "expectedRoot": ""
+  },
+  {
+    "name": "different key produces different root",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000002", "value": "deadbeef"}
+    ],
+    "expectedRoot": ""
+  },
+  {
+    "name": "different value produces different root",
+    "operations": [
+      {"action": "put", "key": "0000000000000000000000000000000000000000000000000000000000000001", "value": "cafebabe"}
+    ],
+    "expectedRoot": ""
+  }
+]

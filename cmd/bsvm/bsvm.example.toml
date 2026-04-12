@@ -1,0 +1,53 @@
+datadir = "./data"
+genesis = ""
+log_level = "info"
+log_format = "text"
+
+[shard]
+chain_id = 8453111
+genesis_covenant_txid = ""
+genesis_covenant_vout = 0
+covenant_sats = 10000
+
+[overlay]
+coinbase = "0x0000000000000000000000000000000000000000"
+block_gas_limit = 30000000
+batch_size = 128
+max_batch_flush_delay = "2s"
+min_gas_price = "1000000000"
+max_speculative_depth = 16
+
+[rpc]
+http_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+cors_origins = ["*"]
+
+[prover]
+mode = "mock"
+workers = 1
+
+[network]
+listen_addr = "/ip4/0.0.0.0/tcp/9945"
+bootstrap_peers = []
+max_peers = 50
+
+[bsv]
+node_url = ""
+arc_url = ""
+network = "mainnet"
+fee_wallet_key = ""
+confirmations = 6
+
+[bridge]
+min_deposit_satoshis = 10000
+min_withdrawal_satoshis = 10000
+bsv_confirmations = 6
+
+[database]
+engine = "leveldb"
+cache_mb = 256
+
+[governance]
+mode = "none"
+keys = []
+threshold = 0

@@ -1,1 +1,21 @@
 .idea/
+
+# Compiled binaries
+/bsvm
+/evm-cli
+
+# Local data
+/genesis.json
+
+# Large SP1 proof artifacts (regenerable; only keep small Groth16 fixtures)
+prover/host/artifacts/*.bin
+prover/host/artifacts/*.elf
+prover/host-evm/artifacts/*.bin
+prover/host-evm/artifacts/*.elf
+tests/sp1/core_proof.bin
+tests/sp1/compressed_proof.bin
+tests/sp1/guest_evm.elf
+
+# ethereum/tests is a separately-cloned git repo (not a submodule)
+test/evmtest/testdata/
+
