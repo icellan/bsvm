@@ -48,6 +48,12 @@ type stateObject struct {
 	dirtyStorage   Storage // Storage entries that have been modified within the current transaction
 	pendingStorage Storage // Storage entries that have been modified within the current block
 
+	// storageTrie is the cached storage trie after updateStorageTrie runs. It
+	// retains the dirty (uncommitted) trie nodes so that commitStorageTrie can
+	// commit them to the database without re-opening the trie at a root hash
+	// whose nodes have not yet been flushed to disk.
+	storageTrie *mpt.SecureTrie
+
 	// Flag whether the account was marked as self-destructed. The self-destructed
 	// account is still accessible in the scope of same transaction.
 	selfDestructed bool
@@ -235,40 +241,58 @@ func (s *stateObject) updateStorageTrie(trieDB *mpt.Database) error {
 	}
 	// Update the account's storage root.
 	s.data.Root = storageTrie.Hash()
+	// Cache the trie so commitStorageTrie can commit its dirty nodes to disk
+	// without having to re-open the trie at a root whose nodes don't yet exist
+	// in the database.
+	s.storageTrie = storageTrie
 	return nil
 }
 
 // commitStorageTrie commits the storage trie to the database.
+//
+// If updateStorageTrie was called earlier (e.g. via IntermediateRoot), the
+// modified trie is cached in s.storageTrie and its nodes exist only in
+// memory — not yet on disk. In that case we reuse the cached trie directly
+// and skip re-applying the already-processed pending changes, so we never
+// attempt to open a trie at a root hash whose nodes are not yet in the DB.
 func (s *stateObject) commitStorageTrie(trieDB *mpt.Database) error {
-	if len(s.pendingStorage) == 0 {
-		return nil
-	}
-	storageTrie, err := mpt.NewSecureTrie(s.data.Root, trieDB)
-	if err != nil {
-		return err
-	}
-	// Write pending changes.
-	for key, value := range s.pendingStorage {
-		// Skip noop changes
-		if value == s.originStorage[key] {
-			continue
+	var storageTrie *mpt.SecureTrie
+
+	if s.storageTrie != nil {
+		// updateStorageTrie already applied pending changes; reuse its trie.
+		storageTrie = s.storageTrie
+		s.storageTrie = nil
+	} else {
+		// updateStorageTrie was not called. Open the trie from disk and apply
+		// the pending changes now.
+		if len(s.pendingStorage) == 0 {
+			return nil
 		}
-		if value == (types.Hash{}) {
-			if err := storageTrie.Delete(key.Bytes()); err != nil {
-				return err
-			}
-		} else {
-			trimmed := bytes.TrimLeft(value.Bytes(), "\x00")
-			enc, err := rlp.EncodeToBytes(trimmed)
-			if err != nil {
-				return err
-			}
-			if err := storageTrie.Update(key.Bytes(), enc); err != nil {
-				return err
-			}
+		var err error
+		storageTrie, err = mpt.NewSecureTrie(s.data.Root, trieDB)
+		if err != nil {
+			return err
 		}
-		// Overwrite the clean value of storage slots
-		s.originStorage[key] = value
+		for key, value := range s.pendingStorage {
+			if value == s.originStorage[key] {
+				continue
+			}
+			if value == (types.Hash{}) {
+				if err := storageTrie.Delete(key.Bytes()); err != nil {
+					return err
+				}
+			} else {
+				trimmed := bytes.TrimLeft(value.Bytes(), "\x00")
+				enc, err := rlp.EncodeToBytes(trimmed)
+				if err != nil {
+					return err
+				}
+				if err := storageTrie.Update(key.Bytes(), enc); err != nil {
+					return err
+				}
+			}
+			s.originStorage[key] = value
+		}
 	}
 	s.pendingStorage = make(Storage)
 
