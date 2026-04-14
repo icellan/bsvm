@@ -85,6 +85,11 @@ type ExpectedResults struct {
 
 // ProveOutput is the result of a successful proving operation.
 type ProveOutput struct {
+	// Mode identifies which on-chain verification path the produced proof
+	// targets (Basefold / Groth16-generic / Groth16-witness). Populated by
+	// the SP1Prover from Config.ProofMode; not part of the Rust host bridge
+	// JSON envelope.
+	Mode ProofMode `json:"-"`
 	// Proof is the raw SP1 STARK proof bytes.
 	Proof []byte `json:"proof"`
 	// PublicValues is the 272-byte committed public outputs.
@@ -145,8 +150,8 @@ func (p *SP1Prover) proveLocal(ctx context.Context, input *ProveInput) (*ProveOu
 		"--elf", p.config.GuestELFPath,
 		"--prove",
 	}
-	if p.config.ProofMode != "" {
-		args = append(args, "--proof-mode", p.config.ProofMode)
+	if p.config.SP1ProofMode != "" {
+		args = append(args, "--proof-mode", p.config.SP1ProofMode)
 	}
 
 	cmd := exec.CommandContext(ctx, p.config.HostBridgeBinary, args...)
@@ -165,6 +170,7 @@ func (p *SP1Prover) proveLocal(ctx context.Context, input *ProveInput) (*ProveOu
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
 		return nil, fmt.Errorf("parsing prover output: %w", err)
 	}
+	output.Mode = p.config.ProofMode
 
 	return &output, nil
 }
@@ -217,6 +223,7 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 	mockProof := []byte("MOCK_SP1_PROOF")
 
 	return &ProveOutput{
+		Mode:         p.config.ProofMode,
 		Proof:        mockProof,
 		PublicValues: publicValues,
 		VKHash:       vkHash,

@@ -216,8 +216,8 @@ func TestStateExportSerializationEdgeCases(t *testing.T) {
 // without requiring the SP1 prover binary.
 func TestMockProver(t *testing.T) {
 	prover := NewSP1Prover(Config{
-		Mode:      ProverMock,
-		ProofMode: "compressed",
+		Mode:         ProverMock,
+		SP1ProofMode: "compressed",
 	})
 
 	preStateRoot := types.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

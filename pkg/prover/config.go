@@ -1,8 +1,15 @@
 package prover
 
-import "time"
+import (
+	"time"
 
-// ProverMode determines how proofs are generated.
+	"github.com/icellan/bsvm/pkg/proofmode"
+)
+
+// ProverMode determines how proofs are generated (who computes the proof).
+// This is orthogonal to ProofMode: ProverMode picks the execution backend
+// (local subprocess / network / mock), while ProofMode picks the
+// verification math (Basefold / Groth16-generic / Groth16-witness).
 type ProverMode int
 
 const (
@@ -28,10 +35,27 @@ func (m ProverMode) String() string {
 	}
 }
 
+// ProofMode is re-exported from pkg/proofmode so callers that already
+// import pkg/prover can refer to the enum without an extra import. The
+// enum identifies which on-chain verification path a proof is for.
+type ProofMode = proofmode.ProofMode
+
+// Re-exported ProofMode constants.
+const (
+	ProofModeBasefold       = proofmode.Basefold
+	ProofModeGroth16Generic = proofmode.Groth16Generic
+	ProofModeGroth16Witness = proofmode.Groth16Witness
+)
+
 // Config holds the SP1 prover configuration.
 type Config struct {
 	// Mode determines how proofs are generated (local, network, or mock).
 	Mode ProverMode
+
+	// ProofMode determines which on-chain verification path the produced
+	// proofs target (Basefold, Groth16-generic, Groth16-witness). This is
+	// orthogonal to Mode: Mode picks the backend, ProofMode picks the math.
+	ProofMode ProofMode
 
 	// HostBridgeBinary is the path to the bsvm-host-bridge Rust binary
 	// that translates between JSON and SP1's bincode format.
@@ -46,15 +70,19 @@ type Config struct {
 	// Timeout is the maximum proving time before the prover aborts.
 	Timeout time.Duration
 
-	// ProofMode specifies the SP1 proof type: "compressed", "core", or "groth16".
-	ProofMode string
+	// SP1ProofMode specifies the SP1 proof envelope format ("compressed",
+	// "core", or "groth16") that is passed to the host bridge. This is
+	// distinct from ProofMode: SP1ProofMode picks the proof encoding,
+	// ProofMode picks the on-chain verification contract.
+	SP1ProofMode string
 }
 
 // DefaultConfig returns a Config suitable for local development and testing.
 func DefaultConfig() Config {
 	return Config{
-		Mode:      ProverMock,
-		Timeout:   10 * time.Minute,
-		ProofMode: "compressed",
+		Mode:         ProverMock,
+		ProofMode:    ProofModeBasefold,
+		Timeout:      10 * time.Minute,
+		SP1ProofMode: "compressed",
 	}
 }

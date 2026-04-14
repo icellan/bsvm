@@ -180,8 +180,8 @@ func TestRoundTripMockSimpleTransfer(t *testing.T) {
 
 	// Step 7: Prove with mock prover.
 	prover := NewSP1Prover(Config{
-		Mode:      ProverMock,
-		ProofMode: "compressed",
+		Mode:         ProverMock,
+		SP1ProofMode: "compressed",
 	})
 
 	output, err := prover.Prove(context.Background(), proveInput)
