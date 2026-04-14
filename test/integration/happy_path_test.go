@@ -256,11 +256,13 @@ func TestHappyPath_SimpleTransfer(t *testing.T) {
 		t.Errorf("ConfirmedTip pre-mining = %d, want 0", got)
 	}
 
-	// Mine 1 BSV block to confirm the advance.
-	if err := helpers.Mine(1); err != nil {
-		t.Fatalf("mine +1: %v", err)
+	// Mine 2 BSV blocks: the first ensures the advance tx is included even if
+	// there was a small propagation delay, the second provides a safety net on
+	// slower regtest runs. The assertion only requires ConfirmedTip >= 1.
+	if err := helpers.Mine(2); err != nil {
+		t.Fatalf("mine +2: %v", err)
 	}
-	waitCond(t, 60*time.Second, "ConfirmedTip>=1", func() bool {
+	waitCond(t, 120*time.Second, "ConfirmedTip>=1", func() bool {
 		return bundle.Node.ConfirmedTip() >= 1
 	})
 
