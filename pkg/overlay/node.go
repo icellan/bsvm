@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
@@ -38,8 +39,9 @@ type OverlayNode struct {
 	circuitBreaker *CircuitBreaker
 	raceDetector   *RaceDetector
 	inboxMonitor   *InboxMonitor
-	signer         types.Signer
-	followerMode   bool
+	signer              types.Signer
+	followerMode        bool
+	confirmationWatcher *ConfirmationWatcher
 
 	// Chain tips track the progress of the L2 chain.
 	executionTip uint64 // latest executed L2 block
@@ -178,6 +180,14 @@ func (n *OverlayNode) SetConfirmedTip(blockNum uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.confirmedTip = blockNum
+}
+
+// SetFinalizedTip updates the finalized tip. Called when a BSV transaction
+// receives at least 6 confirmations.
+func (n *OverlayNode) SetFinalizedTip(blockNum uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.finalizedTip = blockNum
 }
 
 // SubmitTransaction validates and adds a transaction to the batcher.
@@ -338,7 +348,39 @@ func (n *OverlayNode) ReplayBatchData(batchData []byte) error {
 	return err
 }
 
+// StartConfirmationWatcher creates a ConfirmationWatcher bound to the given
+// broadcast client and starts its polling loop in a background goroutine.
+// Subsequent successful broadcasts in ProcessBatch will be tracked by this
+// watcher. Calling StartConfirmationWatcher more than once replaces the
+// previous watcher after stopping it.
+func (n *OverlayNode) StartConfirmationWatcher(client covenant.BroadcastClient, interval time.Duration) {
+	n.mu.Lock()
+	old := n.confirmationWatcher
+	n.mu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
+	watcher := NewConfirmationWatcher(n, client, interval)
+	n.mu.Lock()
+	n.confirmationWatcher = watcher
+	n.mu.Unlock()
+	watcher.Start()
+}
+
+// ConfirmationWatcherRef returns the attached confirmation watcher, or nil.
+func (n *OverlayNode) ConfirmationWatcherRef() *ConfirmationWatcher {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.confirmationWatcher
+}
+
 // Stop gracefully stops the overlay node and its components.
 func (n *OverlayNode) Stop() {
 	n.batcher.Stop()
+	n.mu.Lock()
+	watcher := n.confirmationWatcher
+	n.mu.Unlock()
+	if watcher != nil {
+		watcher.Stop()
+	}
 }

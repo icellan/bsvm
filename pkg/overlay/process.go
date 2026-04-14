@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/prover"
 	"github.com/icellan/bsvm/pkg/rlp"
 	"github.com/icellan/bsvm/pkg/state"
@@ -197,6 +198,58 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		}
 	}
 
+	// Build the canonical batch encoding now so it can be passed to both
+	// the broadcast client and the TxCache entry. DepositHorizon comes
+	// from the inbox monitor if one is configured.
+	var depositHorizon uint64
+	if n.inboxMonitor != nil {
+		depositHorizon = uint64(n.inboxMonitor.AdvancesSinceDrain())
+	}
+	canonicalBatch := &block.BatchData{
+		Version:        block.BatchVersion,
+		Timestamp:      l2Block.Time(),
+		Coinbase:       n.config.Coinbase,
+		ParentHash:     parentHeader.Hash(),
+		Transactions:   rlpTxs,
+		DepositHorizon: depositHorizon,
+	}
+	encodedBatch, encodeErr := block.EncodeBatchData(canonicalBatch)
+	if encodeErr != nil {
+		slog.Warn("batch encoding failed", "error", encodeErr)
+		encodedBatch = nil
+		for _, rlpTx := range rlpTxs {
+			encodedBatch = append(encodedBatch, rlpTx...)
+		}
+	}
+
+	// 6.5. Broadcast the advance to the BSV covenant if a proof was produced.
+	// Failure here is non-fatal: the block still commits locally and the
+	// race detector / next advance will reconcile.
+	var broadcastResult *covenant.BroadcastResult
+	if proveOutput != nil && n.covenantMgr != nil && n.covenantMgr.BroadcastClient() != nil {
+		newCovState := n.covenantMgr.CurrentState()
+		newCovState.BlockNumber = l2Block.NumberU64()
+		newCovState.StateRoot = postStateRoot
+		advanceProof, apErr := buildAdvanceProofForOutput(proveOutput, encodedBatch)
+		if apErr != nil {
+			slog.Warn("advance proof construction failed", "block", l2Block.NumberU64(), "error", apErr)
+		} else {
+			result, bcErr := n.covenantMgr.BroadcastAdvance(
+				context.Background(),
+				newCovState,
+				advanceProof,
+			)
+			if bcErr != nil {
+				slog.Warn("covenant broadcast failed", "block", l2Block.NumberU64(), "error", bcErr)
+			} else {
+				broadcastResult = result
+				if n.confirmationWatcher != nil {
+					n.confirmationWatcher.Track(l2Block.NumberU64(), result.TxID)
+				}
+			}
+		}
+	}
+
 	// 7. Commit state and write block + receipts to ChainDB.
 	committedRoot, commitErr := n.stateDB.Commit(true)
 	if commitErr != nil {
@@ -227,33 +280,19 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		n.inboxMonitor.RecordAdvance()
 	}
 
-	// 9. Add to TxCache. Encode batch data in canonical BSVM\x02 format
-	// for OP_RETURN embedding.
-	canonicalBatch := &block.BatchData{
-		Version:        block.BatchVersion,
-		Timestamp:      l2Block.Time(),
-		Coinbase:       n.config.Coinbase,
-		ParentHash:     parentHeader.Hash(),
-		Transactions:   rlpTxs,
-		DepositHorizon: uint64(n.inboxMonitor.AdvancesSinceDrain()),
-	}
-	encodedBatch, encodeErr := block.EncodeBatchData(canonicalBatch)
-	if encodeErr != nil {
-		slog.Warn("batch encoding failed", "error", encodeErr)
-		// Fall back to raw concatenated RLP.
-		encodedBatch = nil
-		for _, rlpTx := range rlpTxs {
-			encodedBatch = append(encodedBatch, rlpTx...)
-		}
-	}
-
-	n.txCache.Append(&CachedTx{
+	// 9. Add to TxCache. encodedBatch was built before the broadcast step.
+	cacheEntry := &CachedTx{
 		L2BlockNum:  l2Block.NumberU64(),
 		StateRoot:   postStateRoot,
 		BatchData:   encodedBatch,
 		ProveOutput: proveOutput,
 		BroadcastAt: time.Now(),
-	})
+	}
+	if broadcastResult != nil {
+		cacheEntry.BroadcastTxID = broadcastResult.TxID
+		cacheEntry.BroadcastAt = broadcastResult.BroadcastAt
+	}
+	n.txCache.Append(cacheEntry)
 
 	// Emit event for subscribers.
 	if n.eventFeed != nil {

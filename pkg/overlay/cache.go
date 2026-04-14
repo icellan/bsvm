@@ -21,6 +21,9 @@ type CachedTx struct {
 	// ProveOutput is the SP1 proof output, or nil if proving is still
 	// in progress.
 	ProveOutput *prover.ProveOutput
+	// BroadcastTxID is the BSV txid of the covenant advance broadcast
+	// for this block. Zero if broadcast has not yet completed.
+	BroadcastTxID types.Hash
 	// BroadcastAt is the time this advance was broadcast to BSV.
 	BroadcastAt time.Time
 	// Confirmed is true when the corresponding BSV transaction has been
