@@ -4,8 +4,22 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"math/big"
+	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// bsvmTestSP1VKPath returns the absolute path to the Gate 0b SP1 Groth16
+// vk.json fixture shipped in tests/sp1/. Used by Mode 3 compile tests.
+func bsvmTestSP1VKPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "tests", "sp1", "sp1_groth16_vk.json")
+}
 
 // ---------------------------------------------------------------------------
 // TestCompiledCovenant_VKHash
@@ -65,24 +79,26 @@ func TestCompiledCovenant_ScriptHash(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildConstructorArgs
+// TestBuildBasefoldConstructorArgs
 // ---------------------------------------------------------------------------
 
-// TestBuildConstructorArgs verifies that buildConstructorArgs produces the
-// correct ConstructorArgs map for the Rúnar compiler.
-func TestBuildConstructorArgs(t *testing.T) {
+// TestBuildBasefoldConstructorArgs verifies that buildBasefoldConstructorArgs
+// produces the expected ConstructorArgs map for the Rúnar compiler. The
+// Basefold variant has no mode-specific readonly properties, only the shared
+// ones (vkHash, chainId, governance).
+func TestBuildBasefoldConstructorArgs(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	vkHash := sha256.Sum256(vk)
 
-	args := buildConstructorArgs(vk, 42, GovernanceConfig{
+	args := buildBasefoldConstructorArgs(vk, 42, GovernanceConfig{
 		Mode: GovernanceNone,
-	}, VerifyBasefold, nil)
+	})
 
-	// verifyingKeyHash: hex of SHA256(vk)
-	if got, ok := args["verifyingKeyHash"].(string); !ok {
-		t.Error("verifyingKeyHash should be a string")
+	// sP1VerifyingKeyHash: hex of SHA256(vk)
+	if got, ok := args["sP1VerifyingKeyHash"].(string); !ok {
+		t.Error("sP1VerifyingKeyHash should be a string")
 	} else if got != hex.EncodeToString(vkHash[:]) {
-		t.Errorf("verifyingKeyHash mismatch:\n  got  %s\n  want %s", got, hex.EncodeToString(vkHash[:]))
+		t.Errorf("sP1VerifyingKeyHash mismatch:\n  got  %s\n  want %s", got, hex.EncodeToString(vkHash[:]))
 	}
 
 	// chainId: float64(42)
@@ -97,13 +113,6 @@ func TestBuildConstructorArgs(t *testing.T) {
 		t.Error("governanceMode should be a float64")
 	} else if got != 0.0 {
 		t.Errorf("governanceMode = %v, want 0", got)
-	}
-
-	// verificationMode: Groth16 -> contract value 1
-	if got, ok := args["verificationMode"].(float64); !ok {
-		t.Error("verificationMode should be a float64")
-	} else if got != 0.0 {
-		t.Errorf("verificationMode = %v, want 0 (Basefold in contract)", got)
 	}
 
 	// governanceKey: empty 33-byte placeholder for GovernanceNone
@@ -128,18 +137,28 @@ func TestBuildConstructorArgs(t *testing.T) {
 	} else if got != 0.0 {
 		t.Errorf("governanceThreshold = %v, want 0", got)
 	}
+
+	// Basefold variant should NOT include any Groth16 VK args.
+	groth16Keys := []string{
+		"alphaG1", "betaG2X0", "iC0", "iC5",
+	}
+	for _, k := range groth16Keys {
+		if _, ok := args[k]; ok {
+			t.Errorf("basefold args should not include Groth16 VK key %q", k)
+		}
+	}
 }
 
-// TestBuildConstructorArgs_SingleKey verifies constructor args for
+// TestBuildBasefoldConstructorArgs_SingleKey verifies constructor args for
 // single-key governance mode.
-func TestBuildConstructorArgs_SingleKey(t *testing.T) {
+func TestBuildBasefoldConstructorArgs_SingleKey(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	key := testKey(1)
 
-	args := buildConstructorArgs(vk, 100, GovernanceConfig{
+	args := buildBasefoldConstructorArgs(vk, 100, GovernanceConfig{
 		Mode: GovernanceSingleKey,
 		Keys: [][]byte{key},
-	}, VerifyBasefold, nil)
+	})
 
 	// governanceMode: float64(1) for GovernanceSingleKey
 	if got := args["governanceMode"].(float64); got != 1.0 {
@@ -150,24 +169,19 @@ func TestBuildConstructorArgs_SingleKey(t *testing.T) {
 	if got := args["governanceKey"].(string); got != hex.EncodeToString(key) {
 		t.Errorf("governanceKey mismatch:\n  got  %s\n  want %s", got, hex.EncodeToString(key))
 	}
-
-	// verificationMode: Basefold -> contract value 0
-	if got := args["verificationMode"].(float64); got != 0.0 {
-		t.Errorf("verificationMode = %v, want 0 (Basefold in contract)", got)
-	}
 }
 
-// TestBuildConstructorArgs_MultiSig verifies constructor args for
+// TestBuildBasefoldConstructorArgs_MultiSig verifies constructor args for
 // multi-sig governance mode.
-func TestBuildConstructorArgs_MultiSig(t *testing.T) {
+func TestBuildBasefoldConstructorArgs_MultiSig(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	keys := [][]byte{testKey(1), testKey(2), testKey(3)}
 
-	args := buildConstructorArgs(vk, 200, GovernanceConfig{
+	args := buildBasefoldConstructorArgs(vk, 200, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
 		Keys:      keys,
 		Threshold: 2,
-	}, VerifyBasefold, nil)
+	})
 
 	// governanceMode: float64(2)
 	if got := args["governanceMode"].(float64); got != 2.0 {
@@ -192,52 +206,130 @@ func TestBuildConstructorArgs_MultiSig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestVerificationModeToContract
+// TestBuildGroth16ConstructorArgs
 // ---------------------------------------------------------------------------
 
-// TestVerificationModeToContract verifies the mapping between our Go enum
-// and the contract's convention.
-func TestVerificationModeToContract(t *testing.T) {
-	// Our VerifyGroth16 (0) -> contract 1
-	if got := verificationModeToContract(VerifyGroth16); got != 1.0 {
-		t.Errorf("VerifyGroth16 -> contract %v, want 1", got)
+// TestBuildGroth16ConstructorArgs verifies that the Groth16 constructor-args
+// builder populates all 19 VK components in addition to the shared fields.
+func TestBuildGroth16ConstructorArgs(t *testing.T) {
+	vk := []byte("test-verifying-key-32bytes-long!")
+	g16 := &Groth16VK{
+		AlphaG1: bytes.Repeat([]byte{0xaa}, 64),
+		BetaG2: [4][]byte{
+			bytes.Repeat([]byte{0x01}, 32),
+			bytes.Repeat([]byte{0x02}, 32),
+			bytes.Repeat([]byte{0x03}, 32),
+			bytes.Repeat([]byte{0x04}, 32),
+		},
+		GammaG2: [4][]byte{
+			bytes.Repeat([]byte{0x05}, 32),
+			bytes.Repeat([]byte{0x06}, 32),
+			bytes.Repeat([]byte{0x07}, 32),
+			bytes.Repeat([]byte{0x08}, 32),
+		},
+		DeltaG2: [4][]byte{
+			bytes.Repeat([]byte{0x09}, 32),
+			bytes.Repeat([]byte{0x0a}, 32),
+			bytes.Repeat([]byte{0x0b}, 32),
+			bytes.Repeat([]byte{0x0c}, 32),
+		},
+		IC0: bytes.Repeat([]byte{0x10}, 64),
+		IC1: bytes.Repeat([]byte{0x11}, 64),
+		IC2: bytes.Repeat([]byte{0x12}, 64),
+		IC3: bytes.Repeat([]byte{0x13}, 64),
+		IC4: bytes.Repeat([]byte{0x14}, 64),
+		IC5: bytes.Repeat([]byte{0x15}, 64),
 	}
 
-	// Our VerifyBasefold (1) -> contract 0
-	if got := verificationModeToContract(VerifyBasefold); got != 0.0 {
-		t.Errorf("VerifyBasefold -> contract %v, want 0", got)
+	args := buildGroth16ConstructorArgs(vk, 42, GovernanceConfig{Mode: GovernanceNone}, g16)
+
+	// Shared fields are still present.
+	if _, ok := args["sP1VerifyingKeyHash"]; !ok {
+		t.Error("groth16 args should include sP1VerifyingKeyHash")
+	}
+	if _, ok := args["chainId"]; !ok {
+		t.Error("groth16 args should include chainId")
+	}
+
+	// G1 points (alphaG1, iC0..iC5) are ByteString and go through as
+	// hex strings.
+	expectedHex := map[string]string{
+		"alphaG1": hex.EncodeToString(g16.AlphaG1),
+		"iC0":     hex.EncodeToString(g16.IC0),
+		"iC1":     hex.EncodeToString(g16.IC1),
+		"iC2":     hex.EncodeToString(g16.IC2),
+		"iC3":     hex.EncodeToString(g16.IC3),
+		"iC4":     hex.EncodeToString(g16.IC4),
+		"iC5":     hex.EncodeToString(g16.IC5),
+	}
+	for k, want := range expectedHex {
+		got, ok := args[k].(string)
+		if !ok {
+			t.Errorf("groth16 args missing key %q (or wrong string type)", k)
+			continue
+		}
+		if got != want {
+			t.Errorf("groth16 args[%q] mismatch:\n  got  %s\n  want %s", k, got, want)
+		}
+	}
+
+	// G2 Fp coordinates (betaG2*, gammaG2*, deltaG2*) are runar.Bigint
+	// and MUST be passed as *big.Int so the compiler emits them as
+	// Bitcoin Script number pushes (LE sign-magnitude) rather than raw
+	// 32-byte BE blobs.
+	expectedBig := map[string]*big.Int{
+		"betaG2X0":  new(big.Int).SetBytes(g16.BetaG2[0]),
+		"betaG2X1":  new(big.Int).SetBytes(g16.BetaG2[1]),
+		"betaG2Y0":  new(big.Int).SetBytes(g16.BetaG2[2]),
+		"betaG2Y1":  new(big.Int).SetBytes(g16.BetaG2[3]),
+		"gammaG2X0": new(big.Int).SetBytes(g16.GammaG2[0]),
+		"gammaG2X1": new(big.Int).SetBytes(g16.GammaG2[1]),
+		"gammaG2Y0": new(big.Int).SetBytes(g16.GammaG2[2]),
+		"gammaG2Y1": new(big.Int).SetBytes(g16.GammaG2[3]),
+		"deltaG2X0": new(big.Int).SetBytes(g16.DeltaG2[0]),
+		"deltaG2X1": new(big.Int).SetBytes(g16.DeltaG2[1]),
+		"deltaG2Y0": new(big.Int).SetBytes(g16.DeltaG2[2]),
+		"deltaG2Y1": new(big.Int).SetBytes(g16.DeltaG2[3]),
+	}
+	for k, want := range expectedBig {
+		got, ok := args[k].(*big.Int)
+		if !ok {
+			t.Errorf("groth16 args[%q] should be *big.Int, got %T", k, args[k])
+			continue
+		}
+		if got.Cmp(want) != 0 {
+			t.Errorf("groth16 args[%q] mismatch:\n  got  %s\n  want %s", k, got.String(), want.String())
+		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileWithDifferentParams
+// TestCompileBasefoldRollup_DifferentParams
 // ---------------------------------------------------------------------------
 
-// TestCompileWithDifferentParams compiles the covenant with two different
-// chain IDs and verifies the resulting scripts differ.
-func TestCompileWithDifferentParams(t *testing.T) {
+// TestCompileBasefoldRollup_DifferentParams compiles the Basefold covenant
+// with two different chain IDs and verifies the resulting scripts differ.
+func TestCompileBasefoldRollup_DifferentParams(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
 
 	vk := []byte("test-sp1-verifying-key-for-compilation")
 
-	compiled1, err := CompileCovenant(vk, 1001, GovernanceConfig{Mode: GovernanceNone}, VerifyBasefold, nil)
+	compiled1, err := CompileBasefoldRollup(vk, 1001, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileCovenant with chainID=1001 failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup chainID=1001 failed: %v", err)
 	}
 
-	compiled2, err := CompileCovenant(vk, 2002, GovernanceConfig{Mode: GovernanceNone}, VerifyBasefold, nil)
+	compiled2, err := CompileBasefoldRollup(vk, 2002, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileCovenant with chainID=2002 failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup chainID=2002 failed: %v", err)
 	}
 
-	// Scripts should differ because chain ID is baked in.
 	if bytes.Equal(compiled1.LockingScript, compiled2.LockingScript) {
 		t.Error("scripts with different chain IDs should differ")
 	}
 
-	// Both should have non-empty scripts.
 	if len(compiled1.LockingScript) == 0 {
 		t.Error("compiled1 locking script should not be empty")
 	}
@@ -245,22 +337,25 @@ func TestCompileWithDifferentParams(t *testing.T) {
 		t.Error("compiled2 locking script should not be empty")
 	}
 
-	// Chain IDs should be correctly recorded.
 	if compiled1.ChainID != 1001 {
 		t.Errorf("compiled1.ChainID = %d, want 1001", compiled1.ChainID)
 	}
 	if compiled2.ChainID != 2002 {
 		t.Errorf("compiled2.ChainID = %d, want 2002", compiled2.ChainID)
 	}
+	if compiled1.Mode != VerifyBasefold {
+		t.Errorf("compiled1.Mode = %s, want basefold", compiled1.Mode)
+	}
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileWithVerifyingKey
+// TestCompileBasefoldRollup_WithVerifyingKey
 // ---------------------------------------------------------------------------
 
-// TestCompileWithVerifyingKey compiles the covenant with a verifying key
-// and verifies the VK hash is embedded in the compiled artifact.
-func TestCompileWithVerifyingKey(t *testing.T) {
+// TestCompileBasefoldRollup_WithVerifyingKey compiles the Basefold covenant
+// with a verifying key and verifies the VK hash is embedded in the compiled
+// artifact.
+func TestCompileBasefoldRollup_WithVerifyingKey(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
@@ -268,27 +363,23 @@ func TestCompileWithVerifyingKey(t *testing.T) {
 	vk := []byte("unique-sp1-verifying-key-bytes-for-test")
 	vkHash := sha256.Sum256(vk)
 
-	compiled, err := CompileCovenant(vk, 42, GovernanceConfig{Mode: GovernanceNone}, VerifyBasefold, nil)
+	compiled, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileCovenant failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup failed: %v", err)
 	}
 
-	// The SP1VerifyingKeyHash should match SHA256 of the VK.
 	if compiled.SP1VerifyingKeyHash != vkHash {
 		t.Errorf("VK hash mismatch:\n  got  %x\n  want %x", compiled.SP1VerifyingKeyHash, vkHash)
 	}
 
-	// The VK hash should appear in the compiled locking script (as a
-	// baked-in constant from the constructor args).
 	if !bytes.Contains(compiled.LockingScript, vkHash[:]) {
 		t.Error("locking script should contain the VK hash as a baked-in constant")
 	}
 
-	// Compile with a different VK and verify the script differs.
 	vk2 := []byte("different-sp1-verifying-key-bytes!!!!!!")
-	compiled2, err := CompileCovenant(vk2, 42, GovernanceConfig{Mode: GovernanceNone}, VerifyBasefold, nil)
+	compiled2, err := CompileBasefoldRollup(vk2, 42, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileCovenant with different VK failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup with different VK failed: %v", err)
 	}
 
 	if bytes.Equal(compiled.LockingScript, compiled2.LockingScript) {
@@ -297,47 +388,40 @@ func TestCompileWithVerifyingKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileWithGovernanceModes
+// TestCompileBasefoldRollup_GovernanceModes
 // ---------------------------------------------------------------------------
 
-// TestCompileWithGovernanceModes compiles the covenant with different
-// governance modes and verifies the resulting scripts differ.
-func TestCompileWithGovernanceModes(t *testing.T) {
+// TestCompileBasefoldRollup_GovernanceModes compiles the Basefold covenant
+// with different governance modes and verifies the resulting scripts differ.
+func TestCompileBasefoldRollup_GovernanceModes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
 
 	vk := []byte("test-sp1-verifying-key-for-governance")
 
-	// GovernanceNone
-	compiledNone, err := CompileCovenant(vk, 42, GovernanceConfig{
-		Mode: GovernanceNone,
-	}, VerifyBasefold, nil)
+	compiledNone, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileCovenant with GovernanceNone failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup GovernanceNone failed: %v", err)
 	}
 
-	// GovernanceSingleKey
-	compiledSingle, err := CompileCovenant(vk, 42, GovernanceConfig{
+	compiledSingle, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{
 		Mode: GovernanceSingleKey,
 		Keys: [][]byte{testKey(1)},
-	}, VerifyBasefold, nil)
+	})
 	if err != nil {
-		t.Fatalf("CompileCovenant with GovernanceSingleKey failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup GovernanceSingleKey failed: %v", err)
 	}
 
-	// GovernanceMultiSig
-	compiledMulti, err := CompileCovenant(vk, 42, GovernanceConfig{
+	compiledMulti, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
 		Keys:      [][]byte{testKey(1), testKey(2), testKey(3)},
 		Threshold: 2,
-	}, VerifyBasefold, nil)
+	})
 	if err != nil {
-		t.Fatalf("CompileCovenant with GovernanceMultiSig failed: %v", err)
+		t.Fatalf("CompileBasefoldRollup GovernanceMultiSig failed: %v", err)
 	}
 
-	// All three should produce different scripts because governance
-	// mode and keys are baked in as different constants.
 	if bytes.Equal(compiledNone.LockingScript, compiledSingle.LockingScript) {
 		t.Error("GovernanceNone and GovernanceSingleKey scripts should differ")
 	}
@@ -350,84 +434,106 @@ func TestCompileWithGovernanceModes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileParamsValidation
+// TestCompileRollupParamsValidation
 // ---------------------------------------------------------------------------
 
-// TestCompileParamsValidation verifies that invalid parameters produce errors.
-func TestCompileParamsValidation(t *testing.T) {
+// TestCompileRollupParamsValidation verifies that invalid parameters produce
+// errors for both the Basefold and Groth16 constructors.
+func TestCompileRollupParamsValidation(t *testing.T) {
 	validVK := []byte("valid-sp1-verifying-key-bytes!!!!!!")
 
 	tests := []struct {
 		name    string
-		vk      []byte
-		chainID uint64
-		gov     GovernanceConfig
-		mode    VerificationMode
+		run     func() error
 		wantErr string
 	}{
 		{
-			name:    "nil verifying key",
-			vk:      nil,
-			chainID: 42,
-			gov:     GovernanceConfig{Mode: GovernanceNone},
-			mode:    VerifyGroth16,
+			name: "basefold: nil verifying key",
+			run: func() error {
+				_, err := CompileBasefoldRollup(nil, 42, GovernanceConfig{Mode: GovernanceNone})
+				return err
+			},
 			wantErr: "sp1 verifying key must not be empty",
 		},
 		{
-			name:    "empty verifying key",
-			vk:      []byte{},
-			chainID: 42,
-			gov:     GovernanceConfig{Mode: GovernanceNone},
-			mode:    VerifyGroth16,
+			name: "basefold: empty verifying key",
+			run: func() error {
+				_, err := CompileBasefoldRollup([]byte{}, 42, GovernanceConfig{Mode: GovernanceNone})
+				return err
+			},
 			wantErr: "sp1 verifying key must not be empty",
 		},
 		{
-			name:    "zero chain ID",
-			vk:      validVK,
-			chainID: 0,
-			gov:     GovernanceConfig{Mode: GovernanceNone},
-			mode:    VerifyGroth16,
+			name: "basefold: zero chain ID",
+			run: func() error {
+				_, err := CompileBasefoldRollup(validVK, 0, GovernanceConfig{Mode: GovernanceNone})
+				return err
+			},
 			wantErr: "chain ID must not be zero",
 		},
 		{
-			name:    "invalid governance: single key with no keys",
-			vk:      validVK,
-			chainID: 42,
-			gov: GovernanceConfig{
-				Mode: GovernanceSingleKey,
-				Keys: nil,
+			name: "basefold: invalid governance (single key, no keys)",
+			run: func() error {
+				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+					Mode: GovernanceSingleKey,
+					Keys: nil,
+				})
+				return err
 			},
-			mode:    VerifyGroth16,
 			wantErr: "invalid governance config",
 		},
 		{
-			name:    "invalid governance: multisig with threshold 0",
-			vk:      validVK,
-			chainID: 42,
-			gov: GovernanceConfig{
-				Mode:      GovernanceMultiSig,
-				Keys:      [][]byte{testKey(1), testKey(2)},
-				Threshold: 0,
+			name: "basefold: invalid governance (multisig threshold 0)",
+			run: func() error {
+				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+					Mode:      GovernanceMultiSig,
+					Keys:      [][]byte{testKey(1), testKey(2)},
+					Threshold: 0,
+				})
+				return err
 			},
-			mode:    VerifyGroth16,
 			wantErr: "invalid governance config",
 		},
 		{
-			name:    "invalid governance: none with keys",
-			vk:      validVK,
-			chainID: 42,
-			gov: GovernanceConfig{
-				Mode: GovernanceNone,
-				Keys: [][]byte{testKey(1)},
+			name: "basefold: invalid governance (none with keys)",
+			run: func() error {
+				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+					Mode: GovernanceNone,
+					Keys: [][]byte{testKey(1)},
+				})
+				return err
 			},
-			mode:    VerifyGroth16,
 			wantErr: "invalid governance config",
+		},
+		{
+			name: "groth16: nil VK",
+			run: func() error {
+				_, err := CompileGroth16Rollup(validVK, 42, GovernanceConfig{Mode: GovernanceNone}, nil)
+				return err
+			},
+			wantErr: "groth16 VK must be provided",
+		},
+		{
+			name: "groth16: empty sp1 verifying key",
+			run: func() error {
+				_, err := CompileGroth16Rollup(nil, 42, GovernanceConfig{Mode: GovernanceNone}, &Groth16VK{})
+				return err
+			},
+			wantErr: "sp1 verifying key must not be empty",
+		},
+		{
+			name: "groth16: zero chain ID",
+			run: func() error {
+				_, err := CompileGroth16Rollup(validVK, 0, GovernanceConfig{Mode: GovernanceNone}, &Groth16VK{})
+				return err
+			},
+			wantErr: "chain ID must not be zero",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := CompileCovenant(tt.vk, tt.chainID, tt.gov, tt.mode, nil)
+			err := tt.run()
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
 			}
@@ -435,6 +541,117 @@ func TestCompileParamsValidation(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestBuildGroth16WAConstructorArgs
+// ---------------------------------------------------------------------------
+
+// TestBuildGroth16WAConstructorArgs verifies that the witness-assisted
+// Groth16 rollup constructor-args builder emits ONLY the shared readonly
+// fields (vkHash, chainId, governance). The BN254 VK is baked in at
+// compile time via CompileOptions.Groth16WAVKey — it must NOT appear as
+// ConstructorArgs, otherwise the Rúnar compiler would try to splice it
+// into the locking script a second time.
+func TestBuildGroth16WAConstructorArgs(t *testing.T) {
+	vk := []byte("test-verifying-key-32bytes-long!")
+	vkHash := sha256.Sum256(vk)
+
+	args := buildGroth16WAConstructorArgs(vk, 42, GovernanceConfig{
+		Mode: GovernanceNone,
+	})
+
+	if got, ok := args["sP1VerifyingKeyHash"].(string); !ok {
+		t.Error("sP1VerifyingKeyHash should be a string")
+	} else if got != hex.EncodeToString(vkHash[:]) {
+		t.Errorf("sP1VerifyingKeyHash mismatch:\n  got  %s\n  want %s", got, hex.EncodeToString(vkHash[:]))
+	}
+
+	if got, ok := args["chainId"].(float64); !ok {
+		t.Error("chainId should be a float64")
+	} else if got != 42.0 {
+		t.Errorf("chainId = %v, want 42", got)
+	}
+
+	// Groth16WA args MUST NOT include any Groth16 VK key — Mode 3 bakes
+	// the VK via CompileOptions.Groth16WAVKey, not as readonly args.
+	groth16Keys := []string{
+		"alphaG1", "betaG2X0", "iC0", "iC5",
+		"gammaG2Y0", "deltaG2X1",
+	}
+	for _, k := range groth16Keys {
+		if _, ok := args[k]; ok {
+			t.Errorf("groth16WA args should not include Groth16 VK key %q", k)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestCompileGroth16WARollup_Basic
+// ---------------------------------------------------------------------------
+
+// TestCompileGroth16WARollup_Basic compiles the Mode 3 contract with the
+// Gate 0b SP1 fixture VK and verifies the resulting locking script is
+// a) non-empty, b) in the expected size range (50-900 KB), and c) carries
+// the expected Mode / ChainID metadata.
+func TestCompileGroth16WARollup_Basic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Mode 3 compilation test in short mode")
+	}
+	vkPath := bsvmTestSP1VKPath(t)
+	sp1VK := []byte("mode3-sp1-verifying-key-for-bsv-evm-binding")
+
+	compiled, err := CompileGroth16WARollup(sp1VK, 8453111, GovernanceConfig{Mode: GovernanceNone}, vkPath)
+	if err != nil {
+		t.Fatalf("CompileGroth16WARollup: %v", err)
+	}
+
+	if compiled.Mode != VerifyGroth16WA {
+		t.Errorf("compiled.Mode = %s, want groth16-wa", compiled.Mode)
+	}
+	if compiled.ChainID != 8453111 {
+		t.Errorf("compiled.ChainID = %d, want 8453111", compiled.ChainID)
+	}
+	if len(compiled.LockingScript) == 0 {
+		t.Fatal("compiled locking script is empty")
+	}
+
+	size := len(compiled.LockingScript)
+	const minSize = 50 * 1024        // 50 KB
+	const maxSize = 900 * 1024       // 900 KB (upper bound per the brief — 50-700 KB expected)
+	t.Logf("Mode 3 locking script: %d bytes (%.1f KB)", size, float64(size)/1024.0)
+	if size < minSize {
+		t.Errorf("locking script %d bytes is suspiciously small; expected > %d", size, minSize)
+	}
+	if size > maxSize {
+		t.Errorf("locking script %d bytes exceeds expected cap %d", size, maxSize)
+	}
+}
+
+// TestCompileGroth16WARollup_MissingVK verifies that omitting the vk.json
+// path produces an error rather than silently compiling a broken contract.
+func TestCompileGroth16WARollup_MissingVK(t *testing.T) {
+	sp1VK := []byte("mode3-sp1-verifying-key")
+	_, err := CompileGroth16WARollup(sp1VK, 42, GovernanceConfig{Mode: GovernanceNone}, "")
+	if err == nil {
+		t.Fatal("expected error for missing Groth16WA vk.json path")
+	}
+	if !containsSubstring(err.Error(), "vk.json path must be provided") {
+		t.Errorf("error %q does not mention missing vk.json", err.Error())
+	}
+}
+
+// TestCompileGroth16WARollup_BadVKPath verifies that a non-existent
+// vk.json path produces a clear error, not a compiler crash.
+func TestCompileGroth16WARollup_BadVKPath(t *testing.T) {
+	sp1VK := []byte("mode3-sp1-verifying-key")
+	_, err := CompileGroth16WARollup(sp1VK, 42, GovernanceConfig{Mode: GovernanceNone}, "/nonexistent/vk.json")
+	if err == nil {
+		t.Fatal("expected error for missing vk.json file")
+	}
+	if !containsSubstring(err.Error(), "not readable") {
+		t.Errorf("error %q does not mention readability", err.Error())
 	}
 }
 

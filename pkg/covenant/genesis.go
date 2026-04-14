@@ -19,9 +19,13 @@ type GenesisConfig struct {
 	SP1VerifyingKey  []byte
 	InitialStateRoot types.Hash
 	Governance       GovernanceConfig
-	Verification     VerificationMode // VerifyGroth16 (default) or VerifyBasefold
+	Verification     VerificationMode // VerifyGroth16 (default), VerifyBasefold, or VerifyGroth16WA
 	Groth16VK        *Groth16VK       // Required when Verification == VerifyGroth16
-	CovenantSats     uint64           // Default: DefaultCovenantSats (10000)
+	// Groth16WAVKPath is the absolute path to the SP1-format vk.json file
+	// baked into the witness-assisted Groth16 preamble. Required when
+	// Verification == VerifyGroth16WA.
+	Groth16WAVKPath string
+	CovenantSats    uint64 // Default: DefaultCovenantSats (10000)
 }
 
 // GenesisResult holds the output of PrepareGenesis. It contains the compiled
@@ -60,7 +64,18 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 		sats = DefaultCovenantSats
 	}
 
-	compiled, err := CompileCovenant(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Verification, config.Groth16VK)
+	var compiled *CompiledCovenant
+	var err error
+	switch config.Verification {
+	case VerifyBasefold:
+		compiled, err = CompileBasefoldRollup(config.SP1VerifyingKey, config.ChainID, config.Governance)
+	case VerifyGroth16:
+		compiled, err = CompileGroth16Rollup(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16VK)
+	case VerifyGroth16WA:
+		compiled, err = CompileGroth16WARollup(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16WAVKPath)
+	default:
+		return nil, fmt.Errorf("unknown verification mode %d", int(config.Verification))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("compiling covenant: %w", err)
 	}

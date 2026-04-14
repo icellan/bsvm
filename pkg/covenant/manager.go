@@ -53,16 +53,17 @@ type CovenantPersister interface {
 // construction and broadcast requires a BSV SDK (Milestone 5). It prepares
 // the data needed to build covenant-advance transactions.
 type CovenantManager struct {
-	covenant     *CompiledCovenant
-	genesisTxID  types.Hash
-	currentTxID  types.Hash
-	currentVout  uint32
-	currentSats  uint64
-	currentState CovenantState
-	chainID      uint64
-	verification VerificationMode
-	governance   GovernanceConfig
-	persister    CovenantPersister
+	covenant        *CompiledCovenant
+	genesisTxID     types.Hash
+	currentTxID     types.Hash
+	currentVout     uint32
+	currentSats     uint64
+	currentState    CovenantState
+	chainID         uint64
+	verification    VerificationMode
+	governance      GovernanceConfig
+	persister       CovenantPersister
+	broadcastClient BroadcastClient
 }
 
 // AdvanceData holds everything needed to build a covenant-advance BSV transaction.

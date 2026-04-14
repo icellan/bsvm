@@ -20,6 +20,14 @@ const (
 	// and larger script (1-5 MB estimated). Use when the BN254 trusted
 	// setup is unacceptable for the shard's threat model.
 	VerifyBasefold
+
+	// VerifyGroth16WA uses SP1's Groth16/BN254 wrapping combined with the
+	// witness-assisted Rúnar verifier. The SP1 VK is baked into a compile-
+	// time inlined verifier preamble; the prover supplies a BN254 witness
+	// bundle as spend-time stack pushes. Produces a small (~50-700 KB) and
+	// fast (~400 ms) on-chain verifier compared to the generic Groth16
+	// variant (~5.6 MB). This is the production target for Mode 3.
+	VerifyGroth16WA
 )
 
 // String returns a human-readable name for the verification mode.
@@ -29,6 +37,8 @@ func (m VerificationMode) String() string {
 		return "groth16"
 	case VerifyBasefold:
 		return "basefold"
+	case VerifyGroth16WA:
+		return "groth16-wa"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(m))
 	}
