@@ -8,9 +8,16 @@ import (
 	"fmt"
 )
 
-const bbPrime = 2013265921
+// kbP is the KoalaBear field prime used by the on-chain BasefoldRollup
+// verifier (runar.KbFieldMul). The old rollup.runar.go used BabyBear
+// (p = 2^31 - 2^27 + 1 = 2013265921); the new rollup_basefold.runar.go
+// uses KoalaBear (p = 2^31 - 2^24 + 1 = 2130706433).
+const kbP = 2_130_706_433
 
-func bbMul(a, b int64) int64 { return (a * b) % bbPrime }
+// kbMul multiplies two int64 values modulo the KoalaBear field prime.
+// Used by tests to build a valid proofFieldC = proofFieldA * proofFieldB
+// that the on-chain verifier will accept.
+func kbMul(a, b int64) int64 { return (a * b) % kbP }
 
 func hexSha256(h string) string {
 	data, _ := hex.DecodeString(h)
