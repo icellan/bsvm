@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,17 @@ import (
 	"github.com/icellan/bsvm/pkg/state"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// mockProofMarker is the sentinel value written by the mock prover
+// (pkg/prover/host.go). Production deployments refuse to wrap a proof
+// with this marker into a covenant advance; see OverlayConfig.RequireRealProof.
+var mockProofMarker = []byte("MOCK_SP1_PROOF")
+
+// isMockProof reports whether the given proof bytes are the mock prover's
+// placeholder sentinel.
+func isMockProof(proof []byte) bool {
+	return bytes.Equal(proof, mockProofMarker)
+}
 
 // ProcessResult holds the outcome of processing a batch of transactions.
 type ProcessResult struct {
@@ -106,7 +118,14 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	}
 
 	// 3. Execute via block.BlockExecutor.ProcessBatch.
-	timestamp := uint64(time.Now().Unix())
+	// Derive the block timestamp deterministically from parent + interval.
+	// Spec 11/12: every node (and the SP1 guest) must land on the same
+	// block hash, so the timestamp cannot come from wall-clock time.
+	interval := n.config.BlockInterval
+	if interval == 0 {
+		interval = 1
+	}
+	timestamp := parentHeader.Timestamp + interval
 	l2Block, receipts, err := n.executor.ProcessBatch(
 		parentHeader,
 		n.config.Coinbase,
@@ -224,6 +243,13 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		for _, rlpTx := range rlpTxs {
 			encodedBatch = append(encodedBatch, rlpTx...)
 		}
+	}
+
+	// Reject synthetic/mock proofs when the node is configured for
+	// production. A mock proof carries the "MOCK_SP1_PROOF" marker and
+	// must NEVER be wrapped into a covenant advance in a real deployment.
+	if n.config.RequireRealProof && proveOutput != nil && isMockProof(proveOutput.Proof) {
+		return nil, fmt.Errorf("production config: refusing to build covenant advance from mock SP1 proof")
 	}
 
 	// 6.5. Broadcast the advance to the BSV covenant if a proof was produced.

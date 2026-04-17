@@ -37,6 +37,31 @@ func (n *OverlayNode) CascadeRollback(winnerEvent *CovenantAdvanceEvent) error {
 		"winnerStateRoot", winnerEvent.PostStateRoot.Hex(),
 	)
 
+	// Defence-in-depth (spec 11): re-execute the winner's batch against a
+	// fresh state tree rooted at the parent and compare the resulting state
+	// root to the advertised root BEFORE we touch the node's live state. If
+	// the advance does not verify we refuse to accept it and feed the
+	// disagreement into the circuit breaker.
+	if !winnerEvent.IsOurs && n.executionVerifier != nil && len(winnerEvent.BatchData) > 0 {
+		if verr := n.executionVerifier.VerifyCovenantAdvance(winnerEvent); verr != nil {
+			slog.Error("refusing peer covenant advance: execution verification failed",
+				"block", winnerEvent.L2BlockNum,
+				"error", verr,
+			)
+			if n.circuitBreaker != nil {
+				tripped := n.circuitBreaker.RecordDisagreement(
+					winnerEvent.L2BlockNum,
+					types.Hash{},
+					winnerEvent.PostStateRoot,
+				)
+				if tripped {
+					n.EnterFollowerMode()
+				}
+			}
+			return fmt.Errorf("peer covenant advance failed verification: %w", verr)
+		}
+	}
+
 	// Decode the winner's batch to learn which transactions are in it.
 	winnerBatch, err := block.DecodeBatchData(winnerEvent.BatchData)
 	if err != nil {
@@ -77,8 +102,19 @@ func (n *OverlayNode) CascadeRollback(winnerEvent *CovenantAdvanceEvent) error {
 			"expected", winnerEvent.PostStateRoot.Hex(),
 			"got", winnerBlock.StateRoot().Hex(),
 		)
-		// This is a critical error -- the winner's batch does not produce
-		// the advertised state root. The node should investigate.
+		// This is a critical consensus-level disagreement. Feed it into
+		// the circuit breaker so repeated disagreements trip the node
+		// into follower mode.
+		if n.circuitBreaker != nil {
+			tripped := n.circuitBreaker.RecordDisagreement(
+				winnerEvent.L2BlockNum,
+				winnerBlock.StateRoot(),
+				winnerEvent.PostStateRoot,
+			)
+			if tripped {
+				n.EnterFollowerMode()
+			}
+		}
 		return fmt.Errorf("state root mismatch: expected %s, got %s",
 			winnerEvent.PostStateRoot.Hex(), winnerBlock.StateRoot().Hex())
 	}

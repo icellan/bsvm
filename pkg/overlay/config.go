@@ -55,6 +55,21 @@ type OverlayConfig struct {
 	// proving. Batches below this threshold may be delayed. Default: 0
 	// (prove everything).
 	MinProfitableBatchGas uint64
+
+	// BlockInterval is the number of seconds added to the parent block's
+	// timestamp to derive the current block's timestamp. Timestamps are
+	// fully determined by the chain head so the SP1 guest and every
+	// replaying node land on the same block hash. Spec 11/12 require this
+	// to be deterministic — NEVER derive the block timestamp from wall
+	// clock time. Default: 1 second.
+	BlockInterval uint64
+
+	// RequireRealProof, when true, causes ProcessBatch to refuse to wrap
+	// a mock/synthetic SP1 proof (Proof == "MOCK_SP1_PROOF") into a
+	// covenant advance. Defaults to false so the hermetic mock prover
+	// used across the test suite keeps working; production deployments
+	// MUST set this to true.
+	RequireRealProof bool
 }
 
 // DefaultOverlayConfig returns an OverlayConfig with sensible defaults.
@@ -69,5 +84,7 @@ func DefaultOverlayConfig() OverlayConfig {
 		TargetBatchSize:       128,
 		MinBatchSize:          1,
 		MinProfitableBatchGas: 0,
+		BlockInterval:         1,
+		RequireRealProof:      false,
 	}
 }
