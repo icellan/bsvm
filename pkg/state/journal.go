@@ -313,7 +313,7 @@ func (ch createContractChange) revert(s *StateDB) {
 }
 
 func (ch createContractChange) dirtied() *types.Address {
-	return nil
+	return &ch.account
 }
 
 func (ch createContractChange) copy() journalEntry {

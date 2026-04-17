@@ -4,9 +4,25 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"reflect"
 )
+
+// maxNestingDepth caps the number of nested list frames the decoder
+// will accept. A hostile payload can claim deeply nested lists to
+// drive unbounded memory allocation via reflect or recursion. 1024 is
+// the de-facto Ethereum limit (matches geth semantics) and is far
+// larger than any legitimate EVM structure.
+const maxNestingDepth = 1024
+
+// errDepthExceeded is returned when an RLP value nests deeper than
+// maxNestingDepth frames.
+var errDepthExceeded = fmt.Errorf("rlp: nesting depth exceeded")
+
+// errOversizedItem is returned when a length prefix claims more data
+// than fits in a Go int (or exceeds the remaining stream).
+var errOversizedItem = fmt.Errorf("rlp: value size exceeds available input")
 
 // Decoder is implemented by types that require custom RLP decoding.
 type Decoder interface {
@@ -133,7 +149,13 @@ func (s *Stream) peekByte() (byte, error) {
 
 // readSlice reads n bytes.
 func (s *Stream) readSlice(n int) ([]byte, error) {
-	if s.pos+n > len(s.data) {
+	// Guard against negative n (which can arise if a caller converts a
+	// uint64 size that overflows int). Reject any such claim before we
+	// reach make([]byte, n), which would panic.
+	if n < 0 {
+		return nil, errOversizedItem
+	}
+	if s.pos+n > len(s.data) || s.pos+n < s.pos {
 		return nil, io.ErrUnexpectedEOF
 	}
 	if len(s.stack) > 0 && s.pos+n > s.stack[len(s.stack)-1].end {
@@ -285,6 +307,12 @@ func (s *Stream) Raw() ([]byte, error) {
 // the list content. After reading all list elements, ListEnd must be
 // called.
 func (s *Stream) List() (uint64, error) {
+	// Cap list nesting before Kind() runs so a deeply-nested hostile
+	// payload cannot drive unbounded growth of s.stack or unbounded
+	// recursion through decodeSlice / decodeValue.
+	if len(s.stack) >= maxNestingDepth {
+		return 0, errDepthExceeded
+	}
 	kind, size, err := s.Kind()
 	if err != nil {
 		return 0, err
@@ -412,6 +440,13 @@ func (s *Stream) readBigEndianSize(lenOfLen int) (uint64, error) {
 	}
 	if size < 56 {
 		return 0, fmt.Errorf("rlp: non-canonical size for value < 56 bytes")
+	}
+	// Reject sizes that cannot fit in a Go int. Without this guard,
+	// callers that narrow via int(size) can wrap to a negative value
+	// and panic inside make([]byte, ...). This is a DoS vector on a
+	// 9-byte input: 0xbf followed by 0xff*8 claims 2^64-1 bytes.
+	if size > uint64(math.MaxInt) {
+		return 0, errOversizedItem
 	}
 	return size, nil
 }

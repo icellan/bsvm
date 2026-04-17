@@ -29,9 +29,10 @@ type memoryAccount struct {
 
 // memorySnapshot stores a complete snapshot of all accounts for revert.
 type memorySnapshot struct {
-	accounts map[types.Address]*memoryAccount
-	refund   uint64
-	logSize  int
+	accounts         map[types.Address]*memoryAccount
+	transientStorage transientStorage
+	refund           uint64
+	logSize          int
 }
 
 // MemoryStateDB is a simple in-memory StateDB for testing. It implements
@@ -320,9 +321,10 @@ func (m *MemoryStateDB) AddSlotToAccessList(addr types.Address, slot types.Hash)
 // Snapshot creates a snapshot and returns a revision id.
 func (m *MemoryStateDB) Snapshot() int {
 	snap := memorySnapshot{
-		accounts: m.deepCopyAccounts(),
-		refund:   m.refund,
-		logSize:  len(m.logs),
+		accounts:         m.deepCopyAccounts(),
+		transientStorage: m.transientStorage.Copy(),
+		refund:           m.refund,
+		logSize:          len(m.logs),
 	}
 	id := len(m.snapshots)
 	m.snapshots = append(m.snapshots, snap)
@@ -338,6 +340,7 @@ func (m *MemoryStateDB) RevertToSnapshot(revid int) {
 	}
 	snap := m.snapshots[revid]
 	m.accounts = snap.accounts
+	m.transientStorage = snap.transientStorage
 	m.refund = snap.refund
 	m.logs = m.logs[:snap.logSize]
 	m.snapshots = m.snapshots[:revid]
