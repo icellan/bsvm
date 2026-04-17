@@ -27,6 +27,10 @@ type ProcessResult struct {
 	// ProveOutput is the SP1 proof output, or nil if proving is
 	// asynchronous and has not yet completed.
 	ProveOutput *prover.ProveOutput
+	// BatchData is the canonical batch encoding (from block.EncodeBatchData)
+	// used by the prover and broadcast client. Exposed so callers like
+	// PlanAdvance can rebuild the AdvanceProof without re-encoding.
+	BatchData []byte
 }
 
 // ProcessBatch executes a batch of transactions through the Go EVM,
@@ -311,6 +315,7 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		Receipts:    receipts,
 		StateRoot:   postStateRoot,
 		ProveOutput: proveOutput,
+		BatchData:   encodedBatch,
 	}, nil
 }
 
