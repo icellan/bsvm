@@ -66,6 +66,7 @@ func NewRPCServer(
 	stateReader := NewStateReader(database, chainDB)
 
 	ethAPI := NewEthAPI(chainConfig, chainDB, stateReader, overlayNode)
+	ethAPI.SetGetLogsMaxRange(config.GetLogsMaxRange)
 	return &RPCServer{
 		config:   config,
 		ethAPI:   ethAPI,
@@ -90,6 +91,7 @@ func NewRPCServerWithConfig(
 	stateReader := NewStateReader(database, chainDB)
 
 	ethAPI := NewEthAPI(chainConfig, chainDB, stateReader, overlayNode)
+	ethAPI.SetGetLogsMaxRange(config.GetLogsMaxRange)
 	return &RPCServer{
 		config:   config,
 		ethAPI:   ethAPI,

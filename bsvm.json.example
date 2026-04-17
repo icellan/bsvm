@@ -12,7 +12,9 @@
   "rpc": {
     "http_addr": ":8545",
     "ws_addr": ":8546",
-    "cors_origins": ["*"]
+    "_comment_cors_origins": "List the exact origins your UI is served from. An empty array disables cross-origin requests. Use [\"*\"] ONLY for local development; it allows any website in the user's browser to hit this RPC.",
+    "cors_origins": [],
+    "get_logs_max_range": 1000
   },
   "prover": {
     "mode": "mock",

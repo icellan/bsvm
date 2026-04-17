@@ -74,7 +74,10 @@ func (wc *wsConn) startEventWriter() {
 }
 
 // enqueueEvent sends an event to the buffered channel. If the buffer is
-// full, it waits up to SlowConsumerTimeout before dropping the event.
+// full, it waits up to SlowConsumerTimeout before dropping the event AND
+// tearing down the connection. Per spec 05 (ws_slow_consumer_timeout), a
+// client that cannot keep up with its subscription traffic within the
+// configured window is considered dead and is dropped.
 func (wc *wsConn) enqueueEvent(v interface{}) bool {
 	select {
 	case wc.eventCh <- v:
@@ -91,7 +94,14 @@ func (wc *wsConn) enqueueEvent(v interface{}) bool {
 		case wc.eventCh <- v:
 			return true
 		case <-timer.C:
-			slog.Warn("dropping event for slow websocket consumer")
+			slog.Warn("dropping event for slow websocket consumer; closing connection")
+			// Drop the event AND evict the client. The manager removes
+			// the connection from its active-connection set so no further
+			// events are routed to a socket we are about to close.
+			if wc.manager != nil {
+				wc.manager.removeConn(wc)
+			}
+			wc.close()
 			return false
 		case <-wc.done:
 			return false
@@ -242,6 +252,14 @@ func (wm *WSManager) ActiveConnections() int {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 	return len(wm.conns)
+}
+
+// removeConn removes wc from the active-connection set if present. It is
+// safe to call multiple times and is idempotent with respect to wc.close().
+func (wm *WSManager) removeConn(wc *wsConn) {
+	wm.mu.Lock()
+	delete(wm.conns, wc)
+	wm.mu.Unlock()
 }
 
 // HandleWebSocket upgrades an HTTP connection to WebSocket and begins

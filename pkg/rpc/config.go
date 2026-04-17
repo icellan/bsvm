@@ -42,14 +42,24 @@ type RPCConfig struct {
 	// WSSlowConsumerTimeout is the maximum duration to wait when writing
 	// to a slow consumer before dropping the event.
 	WSSlowConsumerTimeout time.Duration `json:"ws_slow_consumer_timeout"`
+
+	// GetLogsMaxRange is the maximum inclusive block range allowed for a
+	// single eth_getLogs call (to - from + 1). Zero means unlimited, which
+	// is discouraged — DefaultRPCConfig seeds a conservative cap.
+	GetLogsMaxRange uint64 `json:"get_logs_max_range"`
 }
 
 // DefaultRPCConfig returns an RPCConfig with sensible defaults.
+//
+// CORSOrigins defaults to an empty slice: cross-origin access must be an
+// explicit opt-in decision by the operator. A wildcard ("*") origin is a
+// legitimate choice for local development but should never be a library
+// default.
 func DefaultRPCConfig() RPCConfig {
 	return RPCConfig{
 		HTTPAddr:                  "0.0.0.0:8545",
 		WSAddr:                    "0.0.0.0:8546",
-		CORSOrigins:               []string{"*"},
+		CORSOrigins:               []string{},
 		MaxConns:                  1000,
 		RequestsPerSecond:         100,
 		BurstSize:                 200,
@@ -57,5 +67,6 @@ func DefaultRPCConfig() RPCConfig {
 		WSMaxSubscriptionsPerConn: 100,
 		WSEventQueueDepth:         1000,
 		WSSlowConsumerTimeout:     30 * time.Second,
+		GetLogsMaxRange:           1000,
 	}
 }

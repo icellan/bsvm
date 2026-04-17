@@ -3,8 +3,10 @@ package rpc
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
+	"strconv"
 
 	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/block"
@@ -23,6 +25,9 @@ type EthAPI struct {
 	overlay     *overlay.OverlayNode
 	vmConfig    vm.Config
 	logIndex    *block.LogIndex
+	// getLogsMaxRange caps the inclusive block span a single GetLogs call
+	// may scan. Zero means unlimited (not recommended).
+	getLogsMaxRange uint64
 }
 
 // NewEthAPI creates a new EthAPI instance.
@@ -47,6 +52,13 @@ func NewEthAPI(
 // queries. If nil, GetLogs falls back to scanning all blocks.
 func (api *EthAPI) SetLogIndex(li *block.LogIndex) {
 	api.logIndex = li
+}
+
+// SetGetLogsMaxRange configures the maximum inclusive block span
+// (to - from + 1) a single eth_getLogs request may scan. Zero disables
+// the cap. Negative values are clamped to zero.
+func (api *EthAPI) SetGetLogsMaxRange(max uint64) {
+	api.getLogsMaxRange = max
 }
 
 // ChainId returns the chain ID as a hex string.
@@ -202,6 +214,15 @@ func (api *EthAPI) SendRawTransaction(encodedTx []byte) (string, error) {
 		return "", fmt.Errorf("invalid transaction: %w", err)
 	}
 
+	// EIP-155 / EIP-2930 / EIP-1559 replay protection: reject any
+	// transaction whose chainID does not match this shard before it
+	// reaches validation or the batcher. Pre-EIP-155 legacy transactions
+	// (v = 27 / 28) report chainID == 0 and are rejected here as well,
+	// since this shard enforces EIP-155 replay protection.
+	if err := api.assertChainID(tx); err != nil {
+		return "", err
+	}
+
 	if err := api.overlay.ValidateTransaction(tx); err != nil {
 		return "", err
 	}
@@ -211,6 +232,32 @@ func (api *EthAPI) SendRawTransaction(encodedTx []byte) (string, error) {
 	}
 
 	return tx.Hash().Hex(), nil
+}
+
+// assertChainID verifies that the transaction's chainID matches the shard's
+// chainID. Pre-EIP-155 legacy transactions (v = 27 or 28) have no chainID
+// and are rejected as replay-vulnerable.
+func (api *EthAPI) assertChainID(tx *types.Transaction) error {
+	want := api.chainConfig.ChainID
+	if want == nil || want.Sign() == 0 {
+		return nil
+	}
+	got := tx.ChainId()
+	if got == nil || got.Sign() == 0 {
+		// Legacy pre-EIP-155 transactions carry no replay protection and
+		// are disallowed on a shard with a configured chainID.
+		if tx.Type() == types.LegacyTxType {
+			v, _, _ := tx.RawSignatureValues()
+			if v != nil && (v.Cmp(big.NewInt(27)) == 0 || v.Cmp(big.NewInt(28)) == 0) {
+				return fmt.Errorf("invalid chain id: pre-EIP-155 transactions are not accepted (shard chainID %s)", want.String())
+			}
+		}
+		return fmt.Errorf("invalid chain id: have 0 want %s", want.String())
+	}
+	if got.Cmp(want) != 0 {
+		return fmt.Errorf("invalid chain id: have %s want %s", got.String(), want.String())
+	}
+	return nil
 }
 
 // decodeRawTransaction decodes an RLP-encoded signed transaction from the
@@ -479,12 +526,41 @@ func (api *EthAPI) GetLogs(filter FilterQuery) ([]*logResult, error) {
 		// Block range query.
 		tip := api.overlay.ExecutionTip()
 		if filter.FromBlock != nil {
+			if filter.FromBlock.Sign() < 0 {
+				return nil, fmt.Errorf("invalid block range: from block %s is negative", filter.FromBlock.String())
+			}
 			from = filter.FromBlock.Uint64()
 		}
-		if filter.ToBlock != nil {
-			to = filter.ToBlock.Uint64()
+		var requestedTo uint64
+		toExplicit := filter.ToBlock != nil
+		if toExplicit {
+			if filter.ToBlock.Sign() < 0 {
+				return nil, fmt.Errorf("invalid block range: to block %s is negative", filter.ToBlock.String())
+			}
+			requestedTo = filter.ToBlock.Uint64()
+			to = requestedTo
 		} else {
 			to = tip
+			requestedTo = tip
+		}
+		// Reject inverted ranges explicitly. Silently returning an empty
+		// slice hides client bugs and diverges from geth behaviour. The
+		// comparison uses the user-supplied `to` (before tip clamping) so
+		// that "from > tip" (a perfectly valid forward-looking range) is
+		// not misreported as inverted.
+		if toExplicit && filter.FromBlock != nil && from > requestedTo {
+			return nil, fmt.Errorf("invalid block range: from (%d) > to (%d)", from, requestedTo)
+		}
+		// Enforce the configured span cap against the user-requested
+		// range. Validating AFTER tip clamping would let a malicious
+		// client pass `to = 2^63-1` and silently have it reduced to the
+		// tip, defeating the cap. The cap is inclusive so from == to (a
+		// single-block query) always succeeds.
+		if api.getLogsMaxRange > 0 && requestedTo >= from {
+			span := requestedTo - from + 1
+			if span > api.getLogsMaxRange {
+				return nil, fmt.Errorf("block range too large: max %d blocks, got %d", api.getLogsMaxRange, span)
+			}
 		}
 		if to > tip {
 			to = tip
@@ -946,9 +1022,20 @@ func formatReceipt(receipt *types.Receipt, blockHash types.Hash, blockNumber uin
 }
 
 // EncodeInt64 returns a hex string with 0x prefix for a signed int64.
+//
+// Negative values are returned as a "-" prefixed hex string (e.g. -1 maps
+// to "-0x1"). In practice no Ethereum JSON-RPC field that flows through
+// this encoder is legitimately negative, so the caller is almost certainly
+// holding a bug — a warning is logged to surface it without returning the
+// ambiguous "0x0" that silently collides with the legitimate encoding of
+// zero.
 func EncodeInt64(v int64) string {
 	if v < 0 {
-		return "0x0"
+		slog.Warn("EncodeInt64 received negative value", "value", v)
+		// Use the absolute value for the hex payload to avoid relying on
+		// int64 two's-complement wraparound for math.MinInt64.
+		abs := uint64(-(v + 1)) + 1
+		return "-0x" + strconv.FormatUint(abs, 16)
 	}
 	return EncodeUint64(uint64(v))
 }
