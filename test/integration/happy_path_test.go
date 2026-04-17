@@ -561,3 +561,51 @@ func TestHappyPath_GasRefund(t *testing.T) {
 		t.Errorf("slot 0 after clear = %s, want zero", slot0.Hex())
 	}
 }
+
+// TestHappyPath_BridgeDeposit credits an L2 account via a deposit system
+// transaction (simulating a BSV bridge deposit) and verifies the balance
+// appears in the state. Then sends a normal transfer to prove the overlay
+// still works after the deposit.
+func TestHappyPath_BridgeDeposit(t *testing.T) {
+	bundle := happyPathSetup(t)
+
+	depositAddr := types.HexToAddress("0x00000000000000000000000000000000000000f1")
+	depositAmount := uint256.NewInt(500_000_000_000_000_000) // 0.5 ETH in wei
+
+	depositTx := &types.DepositTransaction{
+		SourceHash: types.BytesToHash([]byte("test-deposit-001")),
+		From:       types.HexToAddress("0x0000000000000000000000000000000000000000"),
+		To:         depositAddr,
+		Value:      depositAmount,
+		Gas:        0,
+		IsSystemTx: true,
+	}
+
+	if err := bundle.Node.SubmitDepositTx(depositTx); err != nil {
+		t.Fatalf("SubmitDepositTx: %v", err)
+	}
+
+	// Verify the deposited balance in the current state.
+	currentState := bundle.Node.StateDB()
+	balance := currentState.GetBalance(depositAddr)
+	if balance.Cmp(depositAmount) != 0 {
+		t.Errorf("deposit balance = %s, want %s", balance, depositAmount)
+	}
+
+	// Normal transfer still works after deposit.
+	recipient := types.HexToAddress("0x00000000000000000000000000000000000000f2")
+	tx := signTransfer(t, bundle, 0, recipient, uint256.NewInt(1_000))
+	result, err := bundle.Node.ProcessBatch([]*types.Transaction{tx})
+	if err != nil {
+		t.Fatalf("ProcessBatch after deposit: %v", err)
+	}
+	if result.Receipts[0].Status != 1 {
+		t.Errorf("transfer receipt status = %d, want 1", result.Receipts[0].Status)
+	}
+
+	// Deposited balance persists after batch.
+	sdb := stateAt(t, bundle, result.StateRoot)
+	if got := sdb.GetBalance(depositAddr); got.Cmp(depositAmount) != 0 {
+		t.Errorf("deposit balance after batch = %s, want %s", got, depositAmount)
+	}
+}
