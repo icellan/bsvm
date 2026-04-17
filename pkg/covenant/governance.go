@@ -1,6 +1,9 @@
 package covenant
 
-import "fmt"
+import (
+	"encoding/hex"
+	"fmt"
+)
 
 // VerificationMode determines how the covenant verifies SP1 proofs on-chain.
 type VerificationMode int
@@ -121,6 +124,17 @@ func (g *GovernanceConfig) Validate() error {
 			if err := validateCompressedPubKey(key); err != nil {
 				return fmt.Errorf("governance key %d invalid: %w", i, err)
 			}
+		}
+		// Duplicate keys would collapse an M-of-N multisig to effectively
+		// 1-of-N on-chain, because Rúnar's CheckMultiSig allows the same
+		// key to satisfy multiple signature slots. Reject any repeats.
+		seen := make(map[string]struct{}, len(g.Keys))
+		for i, key := range g.Keys {
+			k := hex.EncodeToString(key)
+			if _, dup := seen[k]; dup {
+				return fmt.Errorf("governance keys must be unique (duplicate key at index %d)", i)
+			}
+			seen[k] = struct{}{}
 		}
 
 	default:

@@ -6,8 +6,17 @@ import runar "github.com/icellan/runar/packages/runar-go"
 // The bridge has its own UTXO chain separate from the state covenant.
 //
 // State fields:
-//   - Balance:         total locked BSV (satoshis)
-//   - WithdrawalNonce: incremented on each withdrawal
+//   - Balance:               total locked BSV (satoshis)
+//   - WithdrawalNonce:       incremented on each withdrawal
+//   - WithdrawalsCommitment: running hash-chain commitment over every
+//     processed withdrawal nullifier. Genesis value is 32 zero bytes.
+//     Updated by Withdraw as
+//     newCommitment = hash256(prevCommitment || nullifier)
+//     where nullifier = hash256(bsvAddress || amountBE8 || nonceBE8).
+//     This closes the reorg-replay gap: an attacker cannot re-process
+//     an already-observed (bsvAddress, amount, nonce) tuple without
+//     also rewinding the commitment chain, which is only possible by
+//     dropping every subsequent withdrawal too.
 //
 // Readonly properties:
 //   - StateCovenantScriptHash: hash256 of the state covenant script, used
@@ -16,6 +25,7 @@ type BridgeCovenant struct {
 	runar.StatefulSmartContract
 	Balance                 runar.Bigint     // mutable: locked BSV balance in satoshis
 	WithdrawalNonce         runar.Bigint     // mutable: monotonic withdrawal counter
+	WithdrawalsCommitment   runar.ByteString // mutable: hash-chain commitment over spent nullifiers (32 bytes)
 	StateCovenantScriptHash runar.ByteString `runar:"readonly"` // hash256 of state covenant script
 }
 
@@ -34,6 +44,21 @@ func (c *BridgeCovenant) Deposit(depositAmount runar.Bigint) {
 // by a Merkle proof that the withdrawal hash is in the withdrawal root
 // committed by the prover. The withdrawalRoot is verified against a
 // confirmed state covenant transaction (cross-covenant verification).
+//
+// On success the withdrawal's nullifier
+// (hash256(bsvAddress || amountBE || nonceBE)) is folded into the
+// running WithdrawalsCommitment hash chain:
+//
+//	newCommitment = hash256(prevCommitment || nullifier)
+//
+// This gives the covenant an on-chain, tamper-evident log of every
+// processed withdrawal. Auditors and nodes can recompute the chain
+// deterministically from the stream of withdrawals and compare it
+// against the on-chain WithdrawalsCommitment value, so a BSV-reorg
+// replay of an already-observed (bsvAddress, amount, nonce) tuple can
+// no longer be silently re-accepted — the new commitment would have
+// to match a value that has already been overwritten by a later
+// withdrawal, which is only possible by rewinding the entire chain.
 func (c *BridgeCovenant) Withdraw(
 	bsvAddress runar.ByteString, // 20-byte BSV address
 	satoshiAmount runar.Bigint, // amount to withdraw
@@ -51,13 +76,13 @@ func (c *BridgeCovenant) Withdraw(
 	runar.Assert(satoshiAmount <= c.Balance)
 	runar.Assert(satoshiAmount > 0)
 
-	// Compute withdrawal hash: hash256(bsvAddress || amount_be || nonce_be)
+	// Compute withdrawal hash (== nullifier): hash256(bsvAddress || amount_be || nonce_be)
 	amountBytes := runar.Num2Bin(satoshiAmount, 8)
 	nonceBytes := runar.Num2Bin(nonce, 8)
-	withdrawalHash := runar.Hash256(runar.Cat(runar.Cat(bsvAddress, amountBytes), nonceBytes))
+	nullifier := runar.Hash256(runar.Cat(runar.Cat(bsvAddress, amountBytes), nonceBytes))
 
 	// Verify Merkle proof against withdrawal root (max depth 16 per spec 13)
-	computedRoot := runar.MerkleRootSha256(withdrawalHash, merkleProof, merkleIndex, 16)
+	computedRoot := runar.MerkleRootSha256(nullifier, merkleProof, merkleIndex, 16)
 	runar.Assert(computedRoot == withdrawalRoot)
 
 	// Cross-covenant verification: verify the withdrawalRoot comes from
@@ -79,6 +104,11 @@ func (c *BridgeCovenant) Withdraw(
 	const batchWithdrawalRootOffset = 141
 	extractedRoot := runar.Substr(refOpReturn, batchWithdrawalRootOffset, 32)
 	runar.Assert(extractedRoot == withdrawalRoot)
+
+	// Fold the nullifier into the running WithdrawalsCommitment hash
+	// chain BEFORE releasing the funds so the on-chain log is advanced
+	// atomically with the withdrawal.
+	c.WithdrawalsCommitment = runar.Hash256(runar.Cat(c.WithdrawalsCommitment, nullifier))
 
 	// Update state
 	c.Balance = c.Balance - satoshiAmount

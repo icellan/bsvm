@@ -10,6 +10,17 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestBridgeState_EncodeDecode_RoundTrip(t *testing.T) {
+	// mkCommitment makes a distinctive 32-byte commitment so the
+	// encode/decode round-trip would fail visibly if the field were
+	// dropped or the offset were miscomputed.
+	mkCommitment := func(seed byte) [32]byte {
+		var out [32]byte
+		for i := range out {
+			out[i] = seed + byte(i)
+		}
+		return out
+	}
+
 	tests := []struct {
 		name  string
 		state BridgeState
@@ -24,22 +35,25 @@ func TestBridgeState_EncodeDecode_RoundTrip(t *testing.T) {
 		{
 			name: "typical state",
 			state: BridgeState{
-				Balance:         1_000_000,
-				WithdrawalNonce: 42,
+				Balance:               1_000_000,
+				WithdrawalNonce:       42,
+				WithdrawalsCommitment: mkCommitment(0x11),
 			},
 		},
 		{
 			name: "large balance",
 			state: BridgeState{
-				Balance:         21_000_000 * 100_000_000, // 21M BSV in satoshis
-				WithdrawalNonce: 999_999,
+				Balance:               21_000_000 * 100_000_000, // 21M BSV in satoshis
+				WithdrawalNonce:       999_999,
+				WithdrawalsCommitment: mkCommitment(0x22),
 			},
 		},
 		{
 			name: "high nonce",
 			state: BridgeState{
-				Balance:         1,
-				WithdrawalNonce: 1_000_000_000,
+				Balance:               1,
+				WithdrawalNonce:       1_000_000_000,
+				WithdrawalsCommitment: mkCommitment(0x33),
 			},
 		},
 	}
@@ -62,6 +76,10 @@ func TestBridgeState_EncodeDecode_RoundTrip(t *testing.T) {
 			if decoded.WithdrawalNonce != tt.state.WithdrawalNonce {
 				t.Errorf("withdrawal nonce mismatch: got %d, want %d", decoded.WithdrawalNonce, tt.state.WithdrawalNonce)
 			}
+			if decoded.WithdrawalsCommitment != tt.state.WithdrawalsCommitment {
+				t.Errorf("withdrawals commitment mismatch: got %x, want %x",
+					decoded.WithdrawalsCommitment, tt.state.WithdrawalsCommitment)
+			}
 		})
 	}
 }
@@ -77,6 +95,10 @@ func TestBridgeState_EmptyState(t *testing.T) {
 	}
 	if s.WithdrawalNonce != 0 {
 		t.Errorf("expected zero nonce, got %d", s.WithdrawalNonce)
+	}
+	var zero [32]byte
+	if s.WithdrawalsCommitment != zero {
+		t.Errorf("expected zero commitment, got %x", s.WithdrawalsCommitment)
 	}
 }
 
@@ -126,9 +148,14 @@ func TestBridgeState_Decode_WrongSize(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBridgeState_MaxValues(t *testing.T) {
+	var allOnes [32]byte
+	for i := range allOnes {
+		allOnes[i] = 0xff
+	}
 	s := BridgeState{
-		Balance:         math.MaxUint64,
-		WithdrawalNonce: math.MaxUint64,
+		Balance:               math.MaxUint64,
+		WithdrawalNonce:       math.MaxUint64,
+		WithdrawalsCommitment: allOnes,
 	}
 	encoded := s.Encode()
 	if len(encoded) != bridgeStateEncodedSize {
@@ -145,5 +172,8 @@ func TestBridgeState_MaxValues(t *testing.T) {
 	}
 	if decoded.WithdrawalNonce != math.MaxUint64 {
 		t.Errorf("nonce mismatch: got %d, want %d", decoded.WithdrawalNonce, uint64(math.MaxUint64))
+	}
+	if decoded.WithdrawalsCommitment != allOnes {
+		t.Errorf("commitment mismatch: got %x, want %x", decoded.WithdrawalsCommitment, allOnes)
 	}
 }
