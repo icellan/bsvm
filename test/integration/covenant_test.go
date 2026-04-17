@@ -108,3 +108,34 @@ func TestCovenant_SatoshiPreservation(t *testing.T) {
 	}
 	t.Logf("satoshis preserved at %d across %d advances", deploySats, numAdvances)
 }
+
+// TestCovenant_DoubleFreezeRejected verifies that calling freezeSingleKey
+// on an already-frozen shard is rejected. The contract checks
+// Assert(c.Frozen == 0) which fails if already frozen.
+func TestCovenant_DoubleFreezeRejected(t *testing.T) {
+	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
+	// First freeze — succeeds.
+	_, _, err := contract.Call("freezeSingleKey", []interface{}{nil}, provider, signer, nil)
+	if err != nil {
+		t.Fatalf("first freeze: %v", err)
+	}
+	// Second freeze — should be rejected (already frozen).
+	_, _, err = contract.Call("freezeSingleKey", []interface{}{nil}, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for double freeze")
+	}
+	t.Logf("correctly rejected double freeze: %v", err)
+}
+
+// TestCovenant_DoubleUnfreezeRejected verifies that calling
+// unfreezeSingleKey on an already-active (unfrozen) shard is rejected.
+// The contract checks Assert(c.Frozen == 1) which fails if already active.
+func TestCovenant_DoubleUnfreezeRejected(t *testing.T) {
+	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
+	// Shard starts active (Frozen = 0). Unfreeze should fail immediately.
+	_, _, err := contract.Call("unfreezeSingleKey", []interface{}{nil}, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for unfreeze on active shard")
+	}
+	t.Logf("correctly rejected unfreeze on active shard: %v", err)
+}
