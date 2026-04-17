@@ -69,6 +69,11 @@ type Config struct {
 	// RunarBroadcastClient is bound to. Defaults to ProofModeBasefold so
 	// existing tests that only set the three seed fields keep working.
 	ProofMode covenant.ProofMode
+	// NoBroadcast skips wiring the broadcast client into the covenant
+	// manager. ProcessBatch still executes and proves but does not
+	// broadcast the advance to BSV. Used by PlanAdvance to extract
+	// contract call args without touching the covenant UTXO.
+	NoBroadcast bool
 }
 
 // Build wires a memory-backed overlay node with a mock prover, initialises
@@ -161,17 +166,20 @@ func Build(cfg Config) (*Bundle, error) {
 		return nil, fmt.Errorf("NewOverlayNode: %w", err)
 	}
 
-	client, err := covenant.NewRunarBroadcastClient(covenant.RunarBroadcastClientOpts{
-		Contract: cfg.Contract,
-		Provider: cfg.Provider,
-		Signer:   cfg.Signer,
-		ChainID:  cfg.ChainID,
-		Mode:     cfg.ProofMode,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("NewRunarBroadcastClient: %w", err)
+	var client *covenant.RunarBroadcastClient
+	if !cfg.NoBroadcast {
+		client, err = covenant.NewRunarBroadcastClient(covenant.RunarBroadcastClientOpts{
+			Contract: cfg.Contract,
+			Provider: cfg.Provider,
+			Signer:   cfg.Signer,
+			ChainID:  cfg.ChainID,
+			Mode:     cfg.ProofMode,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("NewRunarBroadcastClient: %w", err)
+		}
+		covenantMgr.SetBroadcastClient(client)
 	}
-	covenantMgr.SetBroadcastClient(client)
 
 	return &Bundle{
 		Node:     node,
@@ -246,4 +254,68 @@ func ParseHexTxID(s string) (types.Hash, error) {
 	var h types.Hash
 	copy(h[:], b)
 	return h, nil
+}
+
+// PlannedAdvance holds the contract call arguments that ProcessBatch would
+// have broadcast, extracted from a no-broadcast overlay run. Tests use it
+// to tamper individual args and verify on-chain rejection.
+type PlannedAdvance struct {
+	// Result is the full ProcessResult from the overlay run.
+	Result *overlay.ProcessResult
+	// Proof is the mode-specific AdvanceProof built from the prover output.
+	Proof covenant.AdvanceProof
+	// Args is the positional argument slice for contract.Call("advanceState", ...).
+	Args []interface{}
+	// CallOpts holds the Groth16 WA witness bundle (non-nil for Mode 3 only).
+	CallOpts *runar.CallOptions
+}
+
+// PlanAdvance executes a batch through the overlay (including proving) and
+// extracts the contract call args that would have been broadcast, WITHOUT
+// actually broadcasting to BSV. The overlay state advances (execution tip
+// moves forward, state is committed) but the covenant UTXO is untouched.
+//
+// Callers must have built the bundle with NoBroadcast: true.
+func (b *Bundle) PlanAdvance(txs []*types.Transaction) (*PlannedAdvance, error) {
+	result, err := b.Node.ProcessBatch(txs)
+	if err != nil {
+		return nil, fmt.Errorf("ProcessBatch: %w", err)
+	}
+	if result.ProveOutput == nil {
+		return nil, fmt.Errorf("no proof output — is the mock prover configured?")
+	}
+	if result.BatchData == nil {
+		return nil, fmt.Errorf("no batch data in ProcessResult")
+	}
+
+	proof, err := overlay.BuildAdvanceProofForOutput(result.ProveOutput, result.BatchData)
+	if err != nil {
+		return nil, fmt.Errorf("BuildAdvanceProofForOutput: %w", err)
+	}
+
+	req := covenant.BroadcastRequest{
+		NewState: covenant.CovenantState{
+			StateRoot:   result.StateRoot,
+			BlockNumber: result.Block.NumberU64(),
+		},
+		Proof: proof,
+	}
+	args, err := proof.ContractCallArgs(req)
+	if err != nil {
+		return nil, fmt.Errorf("ContractCallArgs: %w", err)
+	}
+
+	var callOpts *runar.CallOptions
+	if waProof, ok := proof.(*covenant.Groth16WitnessProof); ok && waProof.Witness != nil {
+		callOpts = &runar.CallOptions{
+			Groth16WAWitness: waProof.Witness,
+		}
+	}
+
+	return &PlannedAdvance{
+		Result:   result,
+		Proof:    proof,
+		Args:     args,
+		CallOpts: callOpts,
+	}, nil
 }
