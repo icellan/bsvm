@@ -308,6 +308,38 @@ func TestRollupBasefold_RejectWrongChainID(t *testing.T) {
 	t.Logf("correctly rejected: %v", err)
 }
 
+// TestRollupBasefold_RejectWrongPostStateRoot verifies that an advance
+// whose newStateRoot arg disagrees with the public values post-state root
+// (PV[32:64]) is rejected on-chain.
+func TestRollupBasefold_RejectWrongPostStateRoot(t *testing.T) {
+	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
+	z32 := hexZeros32()
+	args := buildBasefoldAdvanceArgs(z32, 1)
+	// Swap newStateRoot (arg 0) so it no longer matches PV[32:64].
+	args[0] = "ff" + args[0].(string)[2:]
+	_, _, err := contract.Call("advanceState", args, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for wrong post-state root")
+	}
+	t.Logf("correctly rejected: %v", err)
+}
+
+// TestRollupBasefold_RejectBadBatchData verifies that replacing the batch
+// data with a different blob (so hash256(batchData) ≠ PV[104:136]) is
+// rejected on-chain.
+func TestRollupBasefold_RejectBadBatchData(t *testing.T) {
+	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
+	z32 := hexZeros32()
+	args := buildBasefoldAdvanceArgs(z32, 1)
+	// Replace batchData (arg 3) with a blob that has a different hash.
+	args[3] = hexGenBatchData("ff"+z32[2:], hexStateRoot(99), batchDataSize)
+	_, _, err := contract.Call("advanceState", args, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for bad batch data")
+	}
+	t.Logf("correctly rejected: %v", err)
+}
+
 // TestRollupBasefold_LongChain runs 25 full-sized advances back-to-back
 // to prove there is no state drift or stack leak across a long chain of
 // Basefold covenant advances.

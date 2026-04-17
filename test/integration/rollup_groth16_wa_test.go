@@ -378,3 +378,34 @@ func TestRollupGroth16WA_RejectWrongChainID(t *testing.T) {
 	}
 	t.Logf("correctly rejected: %v", err)
 }
+
+// TestRollupGroth16WA_RejectWrongPostStateRoot verifies that an advance
+// whose newStateRoot arg disagrees with the public values post-state root
+// is rejected on-chain.
+func TestRollupGroth16WA_RejectWrongPostStateRoot(t *testing.T) {
+	contract, provider, signer, _ := deployGroth16WARollupLifecycle(t)
+	z32 := hexZeros32()
+	args := buildGroth16WAAdvanceArgs(z32, 1)
+	args[0] = "ff" + args[0].(string)[2:]
+	witness := loadGate0Groth16WAWitness(t)
+	_, _, err := callGroth16WAAdvanceWithWitness(t, contract, provider, signer, args, witness)
+	if err == nil {
+		t.Fatal("expected rejection for wrong post-state root")
+	}
+	t.Logf("correctly rejected: %v", err)
+}
+
+// TestRollupGroth16WA_RejectBadBatchData verifies that replacing the batch
+// data with a different blob is rejected on-chain.
+func TestRollupGroth16WA_RejectBadBatchData(t *testing.T) {
+	contract, provider, signer, _ := deployGroth16WARollupLifecycle(t)
+	z32 := hexZeros32()
+	args := buildGroth16WAAdvanceArgs(z32, 1)
+	args[3] = hexGenBatchData("ff"+z32[2:], hexStateRoot(99), batchDataSize)
+	witness := loadGate0Groth16WAWitness(t)
+	_, _, err := callGroth16WAAdvanceWithWitness(t, contract, provider, signer, args, witness)
+	if err == nil {
+		t.Fatal("expected rejection for bad batch data")
+	}
+	t.Logf("correctly rejected: %v", err)
+}

@@ -490,3 +490,40 @@ func TestRollupGroth16_RejectWrongChainID(t *testing.T) {
 	}
 	t.Logf("correctly rejected: %v", err)
 }
+
+// TestRollupGroth16_RejectWrongPostStateRoot verifies that an advance
+// whose newStateRoot arg disagrees with the public values post-state root
+// is rejected on-chain.
+func TestRollupGroth16_RejectWrongPostStateRoot(t *testing.T) {
+	contract, provider, signer, _, deployErr := deployGroth16Rollup(t)
+	if deployErr != nil {
+		t.Skipf("deploy failed (expected on constrained regtest): %v", deployErr)
+	}
+	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	z32 := hexZeros32()
+	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
+	args[0] = "ff" + args[0].(string)[2:]
+	_, _, err := contract.Call("advanceState", args, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for wrong post-state root")
+	}
+	t.Logf("correctly rejected: %v", err)
+}
+
+// TestRollupGroth16_RejectBadBatchData verifies that replacing the batch
+// data with a different blob is rejected on-chain.
+func TestRollupGroth16_RejectBadBatchData(t *testing.T) {
+	contract, provider, signer, _, deployErr := deployGroth16Rollup(t)
+	if deployErr != nil {
+		t.Skipf("deploy failed (expected on constrained regtest): %v", deployErr)
+	}
+	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	z32 := hexZeros32()
+	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
+	args[3] = hexGenBatchData("ff"+z32[2:], hexStateRoot(99), batchDataSize)
+	_, _, err := contract.Call("advanceState", args, provider, signer, nil)
+	if err == nil {
+		t.Fatal("expected rejection for bad batch data")
+	}
+	t.Logf("correctly rejected: %v", err)
+}
