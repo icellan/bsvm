@@ -32,6 +32,13 @@ type InitShardParams struct {
 	Verification covenant.VerificationMode
 	// SP1VerifyingKey is the raw SP1 verifying key bytes.
 	SP1VerifyingKey []byte
+	// Groth16VK is the decomposed Groth16 verification key. Required when
+	// Verification == VerifyGroth16. Ignored in other modes.
+	Groth16VK *covenant.Groth16VK
+	// Groth16WAVKPath is the absolute path to the SP1-format vk.json file
+	// baked into the witness-assisted Groth16 preamble. Required when
+	// Verification == VerifyGroth16WA. Ignored in other modes.
+	Groth16WAVKPath string
 }
 
 // InitShard creates a new shard by initializing the L2 genesis state,
@@ -60,6 +67,22 @@ func InitShard(params *InitShardParams) (*ShardConfig, *block.L2Header, error) {
 	}
 	if err := params.Governance.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("invalid governance config: %w", err)
+	}
+
+	// Fail fast on missing mode-specific verification-key inputs. The
+	// covenant layer rejects these too, but catching them here yields a
+	// clearer, earlier error from the shard-level API. Error strings are
+	// stable so callers (and the _MissingVK tests in this package) can
+	// key off them.
+	switch params.Verification {
+	case covenant.VerifyGroth16:
+		if params.Groth16VK == nil {
+			return nil, nil, fmt.Errorf("groth16 VK must be provided when Verification is VerifyGroth16")
+		}
+	case covenant.VerifyGroth16WA:
+		if params.Groth16WAVKPath == "" {
+			return nil, nil, fmt.Errorf("groth16 WA vk.json path must be provided when Verification is VerifyGroth16WA")
+		}
 	}
 
 	// Determine gas limit.
@@ -101,6 +124,8 @@ func InitShard(params *InitShardParams) (*ShardConfig, *block.L2Header, error) {
 		InitialStateRoot: header.StateRoot,
 		Governance:       params.Governance,
 		Verification:     params.Verification,
+		Groth16VK:        params.Groth16VK,
+		Groth16WAVKPath:  params.Groth16WAVKPath,
 		CovenantSats:     covenant.DefaultCovenantSats,
 	})
 	if err != nil {
