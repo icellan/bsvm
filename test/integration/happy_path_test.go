@@ -505,3 +505,59 @@ func TestHappyPath_SpeculativeAdvancesToFinalized(t *testing.T) {
 		return bundle.Node.ConfirmationWatcherRef().Outstanding() == 0
 	})
 }
+
+// TestHappyPath_GasRefund deploys the storage contract, writes slot 0
+// (set(42)), then clears slot 0 (set(0)). Clearing a storage slot triggers
+// an EIP-2200 gas refund. The test verifies that the clear operation's
+// receipt gas is less than the initial write, proving refunds are applied.
+func TestHappyPath_GasRefund(t *testing.T) {
+	bundle := happyPathSetup(t)
+
+	// Batch 1: deploy.
+	deployTx := signCreate(t, bundle, 0, storageContractCreationCode)
+	r1, err := bundle.Node.ProcessBatch([]*types.Transaction{deployTx})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if r1.Receipts[0].Status != 1 {
+		t.Fatalf("deploy receipt status = %d, want 1", r1.Receipts[0].Status)
+	}
+	contractAddr := r1.Receipts[0].ContractAddress
+
+	// Batch 2: set(42) — initial write to empty slot (cold SSTORE).
+	setTx := signCall(t, bundle, 1, contractAddr, encodeStorageSetCall(42))
+	r2, err := bundle.Node.ProcessBatch([]*types.Transaction{setTx})
+	if err != nil {
+		t.Fatalf("set(42): %v", err)
+	}
+	if r2.Receipts[0].Status != 1 {
+		t.Fatalf("set(42) receipt status = %d, want 1", r2.Receipts[0].Status)
+	}
+	gasWrite := r2.Receipts[0].GasUsed
+	t.Logf("set(42) gasUsed = %d", gasWrite)
+
+	// Batch 3: set(0) — clear slot (triggers EIP-2200 refund).
+	clearTx := signCall(t, bundle, 2, contractAddr, encodeStorageSetCall(0))
+	r3, err := bundle.Node.ProcessBatch([]*types.Transaction{clearTx})
+	if err != nil {
+		t.Fatalf("set(0): %v", err)
+	}
+	if r3.Receipts[0].Status != 1 {
+		t.Fatalf("set(0) receipt status = %d, want 1", r3.Receipts[0].Status)
+	}
+	gasClear := r3.Receipts[0].GasUsed
+	t.Logf("set(0) gasUsed = %d (refund applied)", gasClear)
+
+	// The clear operation should use LESS gas than the initial write because
+	// the EIP-2200 SSTORE refund is subtracted from the gas consumed.
+	if gasClear >= gasWrite {
+		t.Errorf("expected gasClear (%d) < gasWrite (%d) — refund not applied", gasClear, gasWrite)
+	}
+
+	// Verify slot 0 is indeed cleared.
+	sdb := stateAt(t, bundle, r3.StateRoot)
+	slot0 := sdb.GetState(contractAddr, types.Hash{})
+	if slot0 != (types.Hash{}) {
+		t.Errorf("slot 0 after clear = %s, want zero", slot0.Hex())
+	}
+}
