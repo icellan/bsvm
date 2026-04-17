@@ -230,7 +230,7 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		newCovState := n.covenantMgr.CurrentState()
 		newCovState.BlockNumber = l2Block.NumberU64()
 		newCovState.StateRoot = postStateRoot
-		advanceProof, apErr := buildAdvanceProofForOutput(proveOutput, encodedBatch)
+		advanceProof, apErr := BuildAdvanceProofForOutput(proveOutput, encodedBatch)
 		if apErr != nil {
 			slog.Warn("advance proof construction failed", "block", l2Block.NumberU64(), "error", apErr)
 		} else {

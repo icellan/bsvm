@@ -372,10 +372,10 @@ func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth1
 	}, nil
 }
 
-// buildAdvanceProofForOutput returns the mode-specific AdvanceProof for a
-// mock prover output. Real prover binaries will produce this directly from
+// BuildAdvanceProofForOutput returns the mode-specific AdvanceProof for a
+// prover output. Real prover binaries will produce this directly from
 // proof bytes; the mock path synthesises placeholder proof scaffolding.
-func buildAdvanceProofForOutput(
+func BuildAdvanceProofForOutput(
 	out *prover.ProveOutput,
 	batch []byte,
 ) (covenant.AdvanceProof, error) {
