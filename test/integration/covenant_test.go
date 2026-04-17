@@ -38,7 +38,8 @@ func TestCovenant_UnlimitedUnconfirmedChain(t *testing.T) {
 func TestCovenant_FreezeRejectsAdvance(t *testing.T) {
 	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
 	// Freeze
-	_, _, err := contract.Call("freezeSingleKey", []interface{}{}, provider, signer, nil)
+	// Sig params accept nil — the SDK auto-computes the signature from the signer.
+	_, _, err := contract.Call("freezeSingleKey", []interface{}{nil}, provider, signer, nil)
 	if err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
@@ -52,33 +53,33 @@ func TestCovenant_FreezeRejectsAdvance(t *testing.T) {
 	t.Logf("correctly rejected advance on frozen shard: %v", err)
 }
 
-// TestCovenant_FreezeUnfreezeLifecycle freezes the shard, verifies that
-// advance is rejected, unfreezes, then verifies that advance succeeds.
+// TestCovenant_FreezeUnfreezeLifecycle freezes the shard, unfreezes it,
+// then verifies that advance succeeds after unfreeze.
+//
+// Note: the advance-while-frozen rejection is tested separately in
+// TestCovenant_FreezeRejectsAdvance. This test does NOT attempt an
+// advance between freeze and unfreeze because a failed contract.Call
+// can leave the Rúnar SDK's internal UTXO tracker in a stale state.
 func TestCovenant_FreezeUnfreezeLifecycle(t *testing.T) {
 	contract, provider, signer, _ := deployBasefoldRollupLifecycle(t)
-	// 1. Freeze
-	_, _, err := contract.Call("freezeSingleKey", []interface{}{}, provider, signer, nil)
+	// 1. Freeze.
+	_, _, err := contract.Call("freezeSingleKey", []interface{}{nil}, provider, signer, nil)
 	if err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
-	// 2. Advance fails (frozen)
-	z32 := hexZeros32()
-	args := buildBasefoldAdvanceArgs(z32, 1)
-	_, _, err = contract.Call("advanceState", args, provider, signer, nil)
-	if err == nil {
-		t.Fatal("expected rejection while frozen")
-	}
-	// 3. Unfreeze
-	_, _, err = contract.Call("unfreezeSingleKey", []interface{}{}, provider, signer, nil)
+	// 2. Unfreeze.
+	_, _, err = contract.Call("unfreezeSingleKey", []interface{}{nil}, provider, signer, nil)
 	if err != nil {
 		t.Fatalf("unfreeze: %v", err)
 	}
-	// 4. Advance succeeds
+	// 3. Advance should succeed now.
+	z32 := hexZeros32()
+	args := buildBasefoldAdvanceArgs(z32, 1)
 	_, _, err = contract.Call("advanceState", args, provider, signer, nil)
 	if err != nil {
 		t.Fatalf("advance after unfreeze: %v", err)
 	}
-	t.Logf("freeze → reject → unfreeze → accept: lifecycle complete")
+	t.Logf("freeze → unfreeze → accept: lifecycle complete")
 }
 
 // TestCovenant_SatoshiPreservation verifies the covenant output carries
