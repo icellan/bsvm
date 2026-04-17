@@ -36,9 +36,10 @@ type OverlayNode struct {
 	gasPriceOracle *GasPriceOracle
 	parallelProver *prover.ParallelProver
 	dsMonitor      *DoubleSpendMonitor
-	circuitBreaker *CircuitBreaker
-	raceDetector   *RaceDetector
-	inboxMonitor   *InboxMonitor
+	circuitBreaker    *CircuitBreaker
+	raceDetector      *RaceDetector
+	inboxMonitor      *InboxMonitor
+	executionVerifier *ExecutionVerifier
 	signer              types.Signer
 	followerMode        bool
 	confirmationWatcher *ConfirmationWatcher
@@ -127,6 +128,12 @@ func NewOverlayNode(
 
 	// Create the inbox monitor for forced transaction inclusion.
 	node.inboxMonitor = NewInboxMonitor()
+
+	// Wire up the execution verifier so every peer-driven covenant advance
+	// is re-executed against our local state before we accept it. Spec 11
+	// requires every node to independently verify covenant advances as a
+	// defence-in-depth check alongside the STARK proof.
+	node.executionVerifier = NewExecutionVerifierFromNode(node)
 
 	// Create the race detector for covenant advance race resolution.
 	rd := NewRaceDetector(node)
@@ -287,6 +294,13 @@ func (n *OverlayNode) InboxMonitor() *InboxMonitor {
 	return n.inboxMonitor
 }
 
+// ExecutionVerifier returns the node's execution verifier. Every covenant
+// advance arriving from a peer is re-executed via this verifier as a
+// defence-in-depth consistency check alongside the STARK proof.
+func (n *OverlayNode) ExecutionVerifier() *ExecutionVerifier {
+	return n.executionVerifier
+}
+
 // Config returns the node's configuration.
 func (n *OverlayNode) Config() OverlayConfig {
 	return n.config
@@ -372,6 +386,40 @@ func (n *OverlayNode) ConfirmationWatcherRef() *ConfirmationWatcher {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.confirmationWatcher
+}
+
+// SubmitDepositTx applies a deposit system transaction directly to the
+// current state. Called by the bridge monitor when it detects a confirmed
+// BSV deposit. The deposit bypasses the EVM — it is a direct balance
+// credit to the recipient address.
+func (n *OverlayNode) SubmitDepositTx(tx *types.DepositTransaction) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
+	if parentHeader == nil {
+		return fmt.Errorf("parent header not found for block %d", n.executionTip)
+	}
+
+	block.ApplyDepositTx(n.stateDB, parentHeader, tx)
+
+	newRoot, err := n.stateDB.Commit(false)
+	if err != nil {
+		return fmt.Errorf("state commit after deposit: %w", err)
+	}
+
+	newStateDB, err := state.New(newRoot, n.rawDB)
+	if err != nil {
+		return fmt.Errorf("re-open state after deposit: %w", err)
+	}
+	n.stateDB = newStateDB
+
+	slog.Info("applied deposit",
+		"to", tx.To.Hex(),
+		"value", tx.Value.String(),
+		"sourceHash", tx.SourceHash.Hex(),
+	)
+	return nil
 }
 
 // Stop gracefully stops the overlay node and its components.
