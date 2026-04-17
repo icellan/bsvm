@@ -184,7 +184,7 @@ func TestParseDeposit(t *testing.T) {
 		},
 	}
 
-	deposit := ParseDeposit(tx, bridgeScript)
+	deposit := ParseDeposit(tx, bridgeScript, 0)
 	if deposit == nil {
 		t.Fatal("expected deposit, got nil")
 	}
@@ -276,7 +276,7 @@ func TestParseDepositInvalid(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			deposit := ParseDeposit(tt.tx, bridgeScript)
+			deposit := ParseDeposit(tt.tx, bridgeScript, 0)
 			if deposit != nil {
 				t.Error("expected nil deposit for invalid transaction")
 			}
@@ -1271,7 +1271,8 @@ func TestParseDeposit_ShardID4Bytes(t *testing.T) {
 		},
 	}
 
-	deposit := ParseDeposit(tx, bridgeScript)
+	// Local shard matches the OP_RETURN shard_id (0x42).
+	deposit := ParseDeposit(tx, bridgeScript, 0x42)
 	if deposit == nil {
 		t.Fatal("expected deposit with 4-byte shard ID, got nil")
 	}
@@ -1280,6 +1281,12 @@ func TestParseDeposit_ShardID4Bytes(t *testing.T) {
 	}
 	if deposit.SatoshiAmount != 100000 {
 		t.Errorf("SatoshiAmount = %d, want 100000", deposit.SatoshiAmount)
+	}
+
+	// A foreign shard_id must be rejected.
+	foreign := ParseDeposit(tx, bridgeScript, 0x43)
+	if foreign != nil {
+		t.Errorf("foreign shard_id accepted; expected nil")
 	}
 }
 
@@ -1312,7 +1319,7 @@ func TestParseDeposit_Old32ByteShardIDRejected(t *testing.T) {
 	// The old 32-byte format will parse but extract the wrong address
 	// (bytes 9..28 of a 57-byte payload are part of the shard ID zeros,
 	// not the L2 address). The L2 address extracted will be all zeros.
-	deposit := ParseDeposit(tx, bridgeScript)
+	deposit := ParseDeposit(tx, bridgeScript, 0)
 	if deposit != nil && deposit.L2Address == l2Addr {
 		t.Error("32-byte shard ID should not correctly extract the L2 address")
 	}

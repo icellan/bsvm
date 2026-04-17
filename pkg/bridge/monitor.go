@@ -72,6 +72,7 @@ type BridgeMonitor struct {
 	overlay           OverlaySubmitter
 	db                DepositStore
 	bridgeScriptHash  []byte
+	localShardID      uint32
 	processedDeposits map[depositID]bool
 	pendingDeposits   []*Deposit
 	lastHorizon       uint64
@@ -101,6 +102,22 @@ func (m *BridgeMonitor) SetBridgeScriptHash(scriptHash []byte) {
 	defer m.mu.Unlock()
 	m.bridgeScriptHash = make([]byte, len(scriptHash))
 	copy(m.bridgeScriptHash, scriptHash)
+}
+
+// SetLocalShardID configures the shard ID this monitor accepts deposits
+// for. Deposits whose OP_RETURN encodes a different shard_id are
+// rejected at parse time to prevent cross-shard credit.
+func (m *BridgeMonitor) SetLocalShardID(shardID uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.localShardID = shardID
+}
+
+// LocalShardID returns the shard ID this monitor accepts deposits for.
+func (m *BridgeMonitor) LocalShardID() uint32 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.localShardID
 }
 
 // depositKey builds the DB key for a deposit: "d" + txid(32) + vout(4 BE).
@@ -246,7 +263,7 @@ func (m *BridgeMonitor) ProcessBlock(height uint64, txs []*BSVTransaction) {
 	defer m.mu.Unlock()
 
 	for _, tx := range txs {
-		deposit := ParseDeposit(tx, m.bridgeScriptHash)
+		deposit := ParseDeposit(tx, m.bridgeScriptHash, m.localShardID)
 		if deposit == nil {
 			continue
 		}

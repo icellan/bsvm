@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 
 	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/crypto"
@@ -104,12 +105,21 @@ func SatoshisToWei(satoshis uint64) *uint256.Int {
 }
 
 // WeiToSatoshis converts L2 wei to satoshis. 1 satoshi = 10^10 wei.
-// Fractional satoshis are truncated (floor division).
+// Fractional satoshis are truncated (floor division). Values whose
+// integer satoshi quotient exceeds math.MaxUint64 saturate to
+// math.MaxUint64 rather than silently wrapping via the low 64 bits
+// of the uint256 division result.
 func WeiToSatoshis(wei *uint256.Int) uint64 {
 	if wei == nil || wei.IsZero() {
 		return 0
 	}
 	result := new(uint256.Int).Div(wei, SatoshiToWeiMultiplier)
+	// Saturate to math.MaxUint64 when the satoshi quotient does not fit
+	// in a uint64. uint256.Int.Uint64() returns only the low 64 bits,
+	// which silently wraps for huge inputs; guard with IsUint64().
+	if !result.IsUint64() {
+		return math.MaxUint64
+	}
 	return result.Uint64()
 }
 
