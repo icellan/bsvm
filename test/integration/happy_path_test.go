@@ -81,6 +81,39 @@ func encodeStorageSetCall(v uint64) []byte {
 	return out
 }
 
+// erc20Bytecode is the compiled bytecode for a minimal ERC-20 contract
+// (MinimalERC20.sol, solc 0.8.28, optimizer 200 runs). Constructor takes
+// uint256 initialSupply. Functions: totalSupply() 0x18160ddd,
+// balanceOf(address) 0x70a08231, transfer(address,uint256) 0xa9059cbb.
+var erc20Bytecode = mustHex("6080604052348015600e575f5ffd5b5060405161028d38038061028d833981016040819052602b916043565b6001819055335f908152602081905260409020556059565b5f602082840312156052575f5ffd5b5051919050565b610227806100665f395ff3fe608060405234801561000f575f5ffd5b506004361061003f575f3560e01c806318160ddd1461004357806370a082311461005f578063a9059cbb1461007e575b5f5ffd5b61004c60015481565b6040519081526020015b60405180910390f35b61004c61006d36600461016f565b5f6020819052908152604090205481565b61009161008c36600461018f565b6100a1565b6040519015158152602001610056565b335f908152602081905260408120548211156100fa5760405162461bcd60e51b8152602060048201526014602482015273696e73756666696369656e742062616c616e636560601b604482015260640160405180910390fd5b335f90815260208190526040812080548492906101189084906101cb565b90915550506001600160a01b0383165f90815260208190526040812080548492906101449084906101de565b9091555060019150505b92915050565b80356001600160a01b038116811461016a575f5ffd5b919050565b5f6020828403121561017f575f5ffd5b61018882610154565b9392505050565b5f5f604083850312156101a0575f5ffd5b6101a983610154565b946020939093013593505050565b634e487b7160e01b5f52601160045260245ffd5b8181038181111561014e5761014e6101b7565b8082018082111561014e5761014e6101b756fea26469706673582212206fa265391acff9a75aac63cca692d7eca9d912167ee87212105807c23dcb9d3864736f6c634300081c0033")
+
+// encodeERC20Deploy appends the ABI-encoded constructor arg (uint256 initialSupply)
+// to the ERC-20 bytecode.
+func encodeERC20Deploy(initialSupply uint64) []byte {
+	arg := make([]byte, 32)
+	binary.BigEndian.PutUint64(arg[24:], initialSupply)
+	return append(erc20Bytecode, arg...)
+}
+
+// encodeERC20Transfer encodes transfer(address,uint256).
+func encodeERC20Transfer(to types.Address, amount uint64) []byte {
+	out := make([]byte, 68)
+	out[0], out[1], out[2], out[3] = 0xa9, 0x05, 0x9c, 0xbb
+	copy(out[4+12:36], to[:])
+	binary.BigEndian.PutUint64(out[68-8:], amount)
+	return out
+}
+
+// erc20BalanceSlot computes the storage slot for balanceOf[addr] in the
+// MinimalERC20 contract. The balanceOf mapping is at slot 0, so the key
+// is keccak256(abi.encode(addr, 0)).
+func erc20BalanceSlot(addr types.Address) types.Hash {
+	key := make([]byte, 64)
+	copy(key[12:32], addr[:])
+	// slot index 0 is already zero in key[32:64]
+	return types.BytesToHash(crypto.Keccak256(key))
+}
+
 // happyPathSetup deploys a fresh BasefoldRollupContract, builds a bundle
 // against it, starts the confirmation watcher, and registers a t.Cleanup
 // that stops the overlay node. Per-test seed derivation from t.Name()
@@ -607,5 +640,70 @@ func TestHappyPath_BridgeDeposit(t *testing.T) {
 	sdb := stateAt(t, bundle, result.StateRoot)
 	if got := sdb.GetBalance(depositAddr); got.Cmp(depositAmount) != 0 {
 		t.Errorf("deposit balance after batch = %s, want %s", got, depositAmount)
+	}
+}
+
+// TestHappyPath_ERC20FullLifecycle deploys a minimal ERC-20 token contract,
+// mints 1,000,000 tokens to the deployer, transfers 100 tokens to a
+// recipient, then verifies balances via storage slot reads.
+func TestHappyPath_ERC20FullLifecycle(t *testing.T) {
+	bundle := happyPathSetup(t)
+
+	const initialSupply = 1_000_000
+	const transferAmount = 100
+	recipient := types.HexToAddress("0x00000000000000000000000000000000000000e1")
+
+	// Batch 1: deploy ERC-20 with initial supply minted to deployer.
+	deployData := encodeERC20Deploy(initialSupply)
+	deployTx := types.MustSignNewTx(bundle.TxKey, bundle.Signer, &types.LegacyTx{
+		Nonce:    0,
+		GasPrice: big.NewInt(1_000_000_000),
+		Gas:      500_000,
+		To:       nil,
+		Value:    uint256.NewInt(0),
+		Data:     deployData,
+	})
+	r1, err := bundle.Node.ProcessBatch([]*types.Transaction{deployTx})
+	if err != nil {
+		t.Fatalf("deploy ERC-20: %v", err)
+	}
+	if r1.Receipts[0].Status != 1 {
+		t.Fatalf("deploy receipt status = %d, want 1", r1.Receipts[0].Status)
+	}
+	tokenAddr := r1.Receipts[0].ContractAddress
+	if tokenAddr == (types.Address{}) {
+		t.Fatal("deploy receipt has zero ContractAddress")
+	}
+	t.Logf("ERC-20 deployed at %s", tokenAddr.Hex())
+
+	// Verify deployer balance == initialSupply via storage slot read.
+	sdb := stateAt(t, bundle, r1.StateRoot)
+	deployerSlot := erc20BalanceSlot(bundle.TxAddr)
+	deployerBal := sdb.GetState(tokenAddr, deployerSlot)
+	if got := new(big.Int).SetBytes(deployerBal[:]).Uint64(); got != initialSupply {
+		t.Errorf("deployer token balance = %d, want %d", got, initialSupply)
+	}
+
+	// Batch 2: transfer 100 tokens to recipient.
+	transferData := encodeERC20Transfer(recipient, transferAmount)
+	transferTx := signCall(t, bundle, 1, tokenAddr, transferData)
+	r2, err := bundle.Node.ProcessBatch([]*types.Transaction{transferTx})
+	if err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	if r2.Receipts[0].Status != 1 {
+		t.Fatalf("transfer receipt status = %d, want 1", r2.Receipts[0].Status)
+	}
+
+	// Verify balances after transfer.
+	sdb = stateAt(t, bundle, r2.StateRoot)
+	deployerBal = sdb.GetState(tokenAddr, deployerSlot)
+	if got := new(big.Int).SetBytes(deployerBal[:]).Uint64(); got != initialSupply-transferAmount {
+		t.Errorf("deployer balance after transfer = %d, want %d", got, initialSupply-transferAmount)
+	}
+	recipientSlot := erc20BalanceSlot(recipient)
+	recipientBal := sdb.GetState(tokenAddr, recipientSlot)
+	if got := new(big.Int).SetBytes(recipientBal[:]).Uint64(); got != transferAmount {
+		t.Errorf("recipient balance after transfer = %d, want %d", got, transferAmount)
 	}
 }
