@@ -11,6 +11,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/types"
 )
 
@@ -101,8 +102,11 @@ func TestDA_ProcessBatchReturnsBatchData(t *testing.T) {
 }
 
 // TestDA_BatchHashMatchesPublicValues verifies that hash256(batchData) in
-// the ProcessResult matches the batch hash committed in the SP1 public
-// values. This ties the DA layer to the proof system.
+// the covenant's public values blob matches the actual batch data hash.
+// The covenant's PV blob is rebuilt by BuildAdvanceProofForOutput (which
+// places hash256(batchData) at offset 104..136), NOT in the prover's raw
+// PublicValues (which has a different layout with receiptsHash/gasUsed at
+// those offsets).
 func TestDA_BatchHashMatchesPublicValues(t *testing.T) {
 	bundle := happyPathSetup(t)
 	recipient := types.HexToAddress("0x00000000000000000000000000000000000000db")
@@ -114,12 +118,20 @@ func TestDA_BatchHashMatchesPublicValues(t *testing.T) {
 	if result.ProveOutput == nil {
 		t.Fatal("no proof output")
 	}
-	// The public values blob has hash256(batchData) at offset 104..136.
-	// hash256 = sha256(sha256(data)), matching BSV's OP_HASH256.
-	pv := result.ProveOutput.PublicValues
-	if len(pv) < 136 {
-		t.Fatalf("public values too short: %d bytes", len(pv))
+	if result.BatchData == nil {
+		t.Fatal("no batch data")
 	}
+
+	// Build the covenant's AdvanceProof to get the covenant-side PV blob.
+	proof, err := overlay.BuildAdvanceProofForOutput(result.ProveOutput, result.BatchData)
+	if err != nil {
+		t.Fatalf("BuildAdvanceProofForOutput: %v", err)
+	}
+	pv := proof.PublicValues()
+	if len(pv) < 136 {
+		t.Fatalf("covenant public values too short: %d bytes", len(pv))
+	}
+
 	// Compute hash256 of the batch data.
 	batchHash := hash256Bytes(result.BatchData)
 	pvBatchHash := pv[104:136]
