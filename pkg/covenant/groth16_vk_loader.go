@@ -1,12 +1,176 @@
 package covenant
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math/big"
+	"os"
 
 	runar "github.com/icellan/runar/packages/runar-go"
 	"github.com/icellan/runar/packages/runar-go/bn254witness"
 )
+
+// PinnedSP1Groth16VKHashes is the allowlist of sha256 digests of SP1
+// Groth16 vk.json files that mainnet shards may bake into the covenant
+// locking script. Each entry corresponds to a specific SP1 release whose
+// trusted-setup ceremony has been reviewed.
+//
+// Adding an entry here is security-significant: it authorises a ceremony
+// transcript to serve as the Groth16 root of trust for every covenant
+// pinned to this allowlist. Review the transcript and coordinator
+// attestations before adding entries.
+//
+// The "gate0-fixture" entry below is the Gate 0b fixture shipped in
+// tests/sp1/ and is ACCEPTED ONLY under VKTrustPolicyGate0Fixture. It
+// MUST NOT be used on mainnet — it is not backed by a real ceremony.
+var PinnedSP1Groth16VKHashes = map[string][32]byte{
+	// tests/sp1/sp1_groth16_vk.json — Gate 0b fixture (NOT FOR MAINNET).
+	// sha256: ba315d87303b212ac0c221881a34468013e6afc6b865e2abe3d68ad1c500c1d7
+	"gate0-fixture": {
+		0xba, 0x31, 0x5d, 0x87, 0x30, 0x3b, 0x21, 0x2a,
+		0xc0, 0xc2, 0x21, 0x88, 0x1a, 0x34, 0x46, 0x80,
+		0x13, 0xe6, 0xaf, 0xc6, 0xb8, 0x65, 0xe2, 0xab,
+		0xe3, 0xd6, 0x8a, 0xd1, 0xc5, 0x00, 0xc1, 0xd7,
+	},
+}
+
+// VKTrustPolicy controls how aggressively LoadSP1Groth16VKPinned verifies
+// the VK's sha256 digest before parsing. Use VKTrustPolicyMainnet for
+// real shard deployments; the other modes are for tests / regtest only.
+type VKTrustPolicy int
+
+const (
+	// VKTrustPolicyMainnet requires the VK's sha256 to match a
+	// PinnedSP1Groth16VKHashes entry whose name does NOT begin with
+	// "gate0-" or "test-". The only policy safe for mainnet.
+	VKTrustPolicyMainnet VKTrustPolicy = iota
+
+	// VKTrustPolicyGate0Fixture allows the Gate 0b fixture. Use ONLY for
+	// conformance tests and the regtest harness.
+	VKTrustPolicyGate0Fixture
+
+	// VKTrustPolicyAllowUnpinned disables the pinning check. Use ONLY for
+	// Go-side unit tests constructing VKs on the fly. Never for a genesis
+	// that will hold real funds.
+	VKTrustPolicyAllowUnpinned
+)
+
+// String returns a human-readable name for the policy.
+func (p VKTrustPolicy) String() string {
+	switch p {
+	case VKTrustPolicyMainnet:
+		return "mainnet"
+	case VKTrustPolicyGate0Fixture:
+		return "gate0-fixture"
+	case VKTrustPolicyAllowUnpinned:
+		return "allow-unpinned"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(p))
+	}
+}
+
+// LoadSP1Groth16VKPinned reads an SP1-format Groth16 vk.json AND verifies
+// its sha256 matches the given trust policy. Use this in any new code.
+// The historical LoadSP1Groth16VK entry point is equivalent to
+// LoadSP1Groth16VKPinned(path, VKTrustPolicyAllowUnpinned).
+func LoadSP1Groth16VKPinned(vkJSONPath string, policy VKTrustPolicy) (*Groth16VK, error) {
+	raw, err := os.ReadFile(vkJSONPath)
+	if err != nil {
+		return nil, fmt.Errorf("covenant: read vk.json %q: %w", vkJSONPath, err)
+	}
+	if err := checkPinnedVKHash(raw, policy); err != nil {
+		return nil, fmt.Errorf("covenant: vk.json %q rejected by policy %s: %w",
+			vkJSONPath, policy, err)
+	}
+	vk, err := bn254witness.LoadSP1VKFromFile(vkJSONPath)
+	if err != nil {
+		return nil, fmt.Errorf("covenant: LoadSP1Groth16VK: %w", err)
+	}
+	return Groth16VKFromBN254Witness(&vk)
+}
+
+// VerifyPinnedVKHash is a standalone helper for callers that want to
+// confirm a file matches the pinned hash before passing it onwards
+// (notably CompileGroth16WARollupPinned, which takes a path rather than
+// pre-parsed VK bytes).
+func VerifyPinnedVKHash(vkJSONPath string, policy VKTrustPolicy) error {
+	raw, err := os.ReadFile(vkJSONPath)
+	if err != nil {
+		return fmt.Errorf("covenant: read vk.json %q: %w", vkJSONPath, err)
+	}
+	return checkPinnedVKHash(raw, policy)
+}
+
+// checkPinnedVKHash enforces F06: the VK bytes must match one of the
+// allowed pinned hashes for the active policy.
+func checkPinnedVKHash(raw []byte, policy VKTrustPolicy) error {
+	actual := sha256.Sum256(raw)
+	switch policy {
+	case VKTrustPolicyAllowUnpinned:
+		return nil
+	case VKTrustPolicyGate0Fixture:
+		expected, ok := PinnedSP1Groth16VKHashes["gate0-fixture"]
+		if !ok {
+			return fmt.Errorf("internal: gate0-fixture entry missing from PinnedSP1Groth16VKHashes")
+		}
+		if actual != expected {
+			return fmt.Errorf("sha256 mismatch under gate0-fixture policy: got %x, want %x",
+				actual, expected)
+		}
+		return nil
+	case VKTrustPolicyMainnet:
+		for name, pinned := range PinnedSP1Groth16VKHashes {
+			if len(name) >= 5 && name[:5] == "gate0" {
+				continue
+			}
+			if len(name) >= 5 && name[:5] == "test-" {
+				continue
+			}
+			if actual == pinned {
+				return nil
+			}
+		}
+		return fmt.Errorf("sha256 %x is not in PinnedSP1Groth16VKHashes for mainnet policy (no real ceremony has been added yet)", actual)
+	default:
+		return fmt.Errorf("unknown VKTrustPolicy %d", int(policy))
+	}
+}
+
+// Bn254ScalarMaskBitWidth is the exponent used to reduce SP1 public input
+// scalars into the BN254 scalar field. SP1's Groth16 wrapper commits
+// vkeyHash and committedValuesDigest as `sha256(x) & ((1<<253)-1)`; the
+// covenant's reducePublicValuesToScalar applies the same mask. 2^253 < r
+// (BN254 scalar order), so the mask result is always a valid scalar.
+const Bn254ScalarMaskBitWidth = 253
+
+// SP1Bn254ScalarMask returns the mask value 2^253.
+func SP1Bn254ScalarMask() *big.Int {
+	return new(big.Int).Lsh(big.NewInt(1), Bn254ScalarMaskBitWidth)
+}
+
+// ReduceSP1ProgramVkHashScalar computes the F01 reduction of
+// sha256(sp1VerifyingKey) into the BN254 scalar field. This is the value
+// the covenant pins as SP1ProgramVkHashScalar and asserts against
+// g16Input0 on every advance.
+func ReduceSP1ProgramVkHashScalar(sp1VerifyingKey []byte) *big.Int {
+	if len(sp1VerifyingKey) == 0 {
+		return new(big.Int)
+	}
+	h := sha256.Sum256(sp1VerifyingKey)
+	hashInt := new(big.Int).SetBytes(h[:])
+	mask := new(big.Int).Sub(SP1Bn254ScalarMask(), big.NewInt(1))
+	return new(big.Int).And(hashInt, mask)
+}
+
+// ReducePublicValuesToBn254Scalar mirrors the covenant's on-chain
+// reduction of sha256(publicValues) used for the g16Input1 binding.
+// Callers precompute this off-chain before broadcasting an advance.
+func ReducePublicValuesToBn254Scalar(publicValues []byte) *big.Int {
+	h := sha256.Sum256(publicValues)
+	hashInt := new(big.Int).SetBytes(h[:])
+	mask := new(big.Int).Sub(SP1Bn254ScalarMask(), big.NewInt(1))
+	return new(big.Int).And(hashInt, mask)
+}
 
 // Mode2PublicInputCount is the fixed number of BN254 public inputs in the
 // SP1 circuit that the Mode 2 (generic Groth16) rollup contract's IC
@@ -218,11 +382,11 @@ func ApplyZeroInputWorkaround(vk *Groth16VK, inputs []*big.Int) (*Groth16VK, Mod
 	icSlots := [][]byte{vk.IC1, vk.IC2, vk.IC3, vk.IC4, vk.IC5}
 
 	// Accumulate the correction -Σ IC[i+1] for zero indices by running
-	// it off-chain with the mock-free runar.Bn254G1* helpers (those are
-	// the same primitives the on-chain codegen implements, so their
-	// output is bit-for-bit identical to what the real script would
-	// produce for well-formed inputs — and these inputs are well-formed
-	// because the IC constants are non-identity G1 points).
+	// it off-chain with the runar.Bn254G1* helpers (same primitives the
+	// on-chain codegen implements, so output is bit-for-bit identical
+	// for well-formed inputs). Post-R8 runar.Bn254G1Add and Bn254G1Negate
+	// always return fresh allocations — no more identity-operand aliasing
+	// bug that required the haveZero guard.
 	correction := make([]byte, 64) // identity
 	for i := 0; i < Mode2PublicInputCount; i++ {
 		if inputs[i] == nil {

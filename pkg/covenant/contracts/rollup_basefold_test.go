@@ -416,17 +416,25 @@ func TestBasefoldRollup_RejectPostStateRootMismatch(t *testing.T) {
 	callBasefoldAdvance(c, args)
 }
 
-func TestBasefoldRollup_RejectBadProofBlobHash(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected assertion failure")
-		}
-	}()
+// TestBasefoldRollup_ProofBlobNotBoundToCovenant pins the F04 fix.
+// The old covenant
+// asserted `Hash256(proofBlob) == publicValues[64..96]`, which was either
+// tautological (prover controls both) or unsatisfiable (spec 12 defines
+// offset 64 as receiptsHash committed by the guest). Post-fix the
+// covenant does NOT constrain the submitted proofBlob bytes — proof
+// integrity is carried by the Basefold field-product and Poseidon2 Merkle
+// checks over the proof field elements and Merkle inclusion witness, and
+// the proofBlob argument is retained only to preserve the unlock-script
+// positional layout. This test pins that invariant by verifying a fresh
+// advance with a swapped proofBlob is ACCEPTED.
+func TestBasefoldRollup_ProofBlobNotBoundToCovenant(t *testing.T) {
 	c := newBasefoldRollup(zeros32(), 0, 0)
 	args := buildBasefoldArgs(zeros32(), 1)
-	// Replace proofBlob — pv[64..96] no longer matches.
 	args.proofBlob = runar.ByteString(generateProofBlob(99, testProofBlobSize))
 	callBasefoldAdvance(c, args)
+	if c.BlockNumber != 1 {
+		t.Errorf("expected block 1 after F04-allowed advance, got %d", c.BlockNumber)
+	}
 }
 
 // ---------------------------------------------------------------------------

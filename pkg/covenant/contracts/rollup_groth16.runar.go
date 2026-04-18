@@ -33,6 +33,8 @@ import runar "github.com/icellan/runar/packages/runar-go"
 //     binding parity with the Basefold variant even though the BN254 verifier
 //     does not consume it at runtime.
 //   - ChainId:             shard chain ID for cross-shard replay prevention
+//   - Bn254ScalarOrder:    BN254 scalar field order r, used to range-check
+//     g16Input0..g16Input4 (finding F08). See field doc below for rationale.
 //   - Governance*:         freeze / unfreeze / upgrade authorization
 //   - AlphaG1, BetaG2*, GammaG2*, DeltaG2*, IC0..IC5: Groth16 verification key
 type Groth16RollupContract struct {
@@ -46,6 +48,43 @@ type Groth16RollupContract struct {
 	// ---- Readonly: shared with the Basefold variant ----
 	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey)
 	ChainId             runar.Bigint     `runar:"readonly"` // shard chain ID
+
+	// ---- Readonly: BN254 scalar field order (F08) ----
+	// Bn254ScalarOrder is r = 21888242871839275222246405745257275088548364400416034343698204186575808495617,
+	// the BN254 scalar field order. Used to bound each of g16Input0..g16Input4
+	// into the canonical range [0, r). Without this bound, a prover could
+	// submit a scalar s >= r that would still pair-verify on-chain (EC scalar
+	// mul is periodic mod r) but would be ABI-rejected by SP1's Solidity /
+	// in-circuit reference verifiers — a differential-oracle hazard for
+	// fuzzing and conformance parity, not a direct cryptographic break.
+	//
+	// R4c: typed BigintBig so the Go-mock F08 range check runs over the real
+	// 254-bit r via runar.BigintBigLess, not truncated to int64. Script emit
+	// is unchanged (BigintBig is a bigint alias at AST level).
+	Bn254ScalarOrder runar.BigintBig `runar:"readonly"`
+
+	// ---- Readonly: SP1 public-input bindings (F01) ----
+	// SP1ProgramVkHashScalar is the SP1 guest program's vkey hash reduced
+	// into the BN254 scalar field (same reduction SP1's Groth16 wrapper
+	// applies before committing it as public input 0). Asserted equal to
+	// g16Input0 on every advance, binding the proof to the specific SP1
+	// program baked in at genesis. Without this binding any SP1 proof for
+	// any guest program would pair-verify. R4c: typed BigintBig so the
+	// Go-mock F01 vkey-scalar equality runs over the real ~253-bit value.
+	SP1ProgramVkHashScalar runar.BigintBig `runar:"readonly"`
+
+	// Bn254ScalarMask is 2^253, used to reduce sha256(publicValues) into
+	// the BN254 scalar field to match SP1's committedValuesDigest
+	// convention. 2^253 < r, so the reduction result is always a valid
+	// scalar. R4c: typed BigintBig — the mask is inherently >63 bits.
+	Bn254ScalarMask runar.BigintBig `runar:"readonly"`
+
+	// Bn254Zero is a pre-computed BigintBig zero used as the RHS of the
+	// F01 g16Input2 / g16Input4 equality assertions. A readonly is
+	// necessary because BigintBig is *big.Int under Go and we cannot spell
+	// a BigintBig literal inside the .runar.go source (no type-conversion
+	// from untyped int to *big.Int). Script emit is a constant OP_0.
+	Bn254Zero runar.BigintBig `runar:"readonly"`
 
 	// ---- Readonly: governance ----
 	GovernanceMode      runar.Bigint `runar:"readonly"` // 0=none, 1=single_key, 2=multisig
@@ -77,16 +116,46 @@ type Groth16RollupContract struct {
 	IC5 runar.Point `runar:"readonly"` // PUB_4
 }
 
+// reducePublicValuesToScalar is the Go-DSL expression of SP1's
+// `committedValuesDigest = sha256(publicValues) & ((1<<253)-1)` reduction
+// implemented on-chain via OP_SHA256 / OP_REVERSEBYTES / OP_BIN2NUM /
+// OP_MOD. The trailing 0x00 byte forces positive Script-number
+// interpretation so sha256 outputs with the top bit set still reduce
+// correctly. R4c: returns runar.BigintBig and uses Bin2NumBig + BigintBigMod
+// so the Go-mock reduction produces the full 253-bit digest instead of
+// truncating at int64 — matching what the compiled Script emits.
+func reducePublicValuesToScalar(c *Groth16RollupContract, publicValues runar.ByteString) runar.BigintBig {
+	hashBE := runar.Sha256(publicValues)
+	hashLE := runar.ReverseBytes(hashBE)
+	zeroByte := runar.Num2Bin(0, 1)
+	hashLEPadded := runar.Cat(hashLE, zeroByte)
+	return runar.BigintBigMod(runar.Bin2NumBig(hashLEPadded), c.Bn254ScalarMask)
+}
+
 // AdvanceState advances the covenant state with a Groth16-verified proof.
 // Invariants enforced (in order):
 //  1. Shard must not be frozen.
 //  2. New block number must be exactly previous + 1.
-//  3. Groth16 BN254 pairing check: prepared_inputs = IC0 + sum(input[i]*IC[i+1])
+//  3. F08: each g16Input* is in [0, r) (BN254 scalar field order).
+//  4. F01: SP1 public input bindings:
+//     - g16Input0 == SP1ProgramVkHashScalar (proof targets the pinned
+//       SP1 guest program, not an attacker-chosen program).
+//     - g16Input1 == reducePublicValuesToScalar(publicValues) (binds the
+//       on-chain publicValues to the SP1-circuit-committed digest).
+//     - g16Input2 == 0 (SP1 exitCode — reject failed-guest proofs).
+//     - g16Input4 == 0 (vkRoot — single-program mode only).
+//     - g16Input3 (proofNonce) left unconstrained per SP1 convention.
+//  5. Groth16 BN254 pairing check: prepared_inputs = IC0 + sum(input[i]*IC[i+1])
 //     over the 5 SP1 public inputs, followed by the 4-pairing product
 //     e(-A, B) * e(prepared_inputs, gamma) * e(C, delta) * e(alpha, -beta) == 1.
-//  4. proofBlobHash at public values offset 64 must equal hash256(proofBlob).
-//  5. Public values offsets 0/32/104/136 must match StateRoot / newStateRoot
+//  6. Public values offsets 0/32/104/136 must match StateRoot / newStateRoot
 //     / hash256(batchData) / ChainId (little-endian 8 bytes) respectively.
+//
+// The tautological publicValues[64..96] == hash256(proofBlob) check present
+// before F04 was removed: spec 12 defines that slot as receiptsHash
+// (committed by the guest but not verified by the covenant). The prior
+// assertion was either unsatisfiable by an honest prover or tautological
+// (prover controls both sides).
 func (c *Groth16RollupContract) AdvanceState(
 	newStateRoot runar.ByteString,
 	newBlockNumber runar.Bigint,
@@ -100,12 +169,14 @@ func (c *Groth16RollupContract) AdvanceState(
 	proofBY0 runar.Bigint,
 	proofBY1 runar.Bigint,
 	proofC runar.Point,
-	// SP1 Groth16 has 5 public inputs (BN254 scalar field elements)
-	g16Input0 runar.Bigint,
-	g16Input1 runar.Bigint,
-	g16Input2 runar.Bigint,
-	g16Input3 runar.Bigint,
-	g16Input4 runar.Bigint,
+	// SP1 Groth16 has 5 public inputs (BN254 scalar field elements). R4c:
+	// typed BigintBig so the F01 / F08 assertions and the IC MSM run over
+	// the real 254-bit scalar in the Go-mock, not truncated to int64.
+	g16Input0 runar.BigintBig,
+	g16Input1 runar.BigintBig,
+	g16Input2 runar.BigintBig,
+	g16Input3 runar.BigintBig,
+	g16Input4 runar.BigintBig,
 ) {
 	// 0. Reject if shard is frozen by governance.
 	runar.Assert(c.Frozen == 0)
@@ -113,12 +184,41 @@ func (c *Groth16RollupContract) AdvanceState(
 	// 1. Block number must be exactly previous + 1.
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
-	// 2. Groth16: BN254 pairing verification with 5-input MSM.
-	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulP(c.IC1, g16Input0))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC2, g16Input1))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC3, g16Input2))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC4, g16Input3))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC5, g16Input4))
+	// 2. F08: range-check each BN254 scalar public input into [0, r).
+	//    SP1 and Solidity reference verifiers reduce inputs mod r before
+	//    ABI-encoding them; accepting unreduced scalars here would produce
+	//    the same pairing result (EC scalar mul is periodic mod r) but
+	//    diverge from reference verifiers during fuzzing / conformance
+	//    testing. Must appear before the MSM so the oracle-mismatch
+	//    surface never enters Bn254G1ScalarMulBigP. R4c: BigintBigLess
+	//    lowers to OP_LESSTHAN in Script and runs value comparison in
+	//    the Go-mock (since `<` on *big.Int is a Go compile error).
+	runar.Assert(runar.BigintBigLess(g16Input0, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input1, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input2, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input3, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input4, c.Bn254ScalarOrder))
+
+	// 3. F01: bind the 5 SP1 public inputs to domain values. Must precede
+	//    the pairing check so the pairing verifies a proof for inputs the
+	//    covenant has pinned, not ones the prover chose. R4c: BigintBigEqual
+	//    is value-equality (via big.Int.Cmp) matching Script OP_NUMEQUAL
+	//    instead of pointer-equality (which is what `==` on *big.Int is in
+	//    pure Go).
+	runar.Assert(runar.BigintBigEqual(g16Input0, c.SP1ProgramVkHashScalar))
+	runar.Assert(runar.BigintBigEqual(g16Input1, reducePublicValuesToScalar(c, publicValues)))
+	runar.Assert(runar.BigintBigEqual(g16Input2, c.Bn254Zero))
+	runar.Assert(runar.BigintBigEqual(g16Input4, c.Bn254Zero))
+
+	// 4. Groth16: BN254 pairing verification with 5-input MSM. R4c: uses
+	//    the *Big G1 scalar-mul variant so the Go-mock MSM runs over real
+	//    254-bit scalars (prior Bn254G1ScalarMulP truncated to int64,
+	//    silently producing wrong intermediate points under the mock).
+	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulBigP(c.IC1, g16Input0))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC2, g16Input1))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC3, g16Input2))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC4, g16Input3))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC5, g16Input4))
 	runar.Assert(runar.Bn254G1OnCurveP(proofA))
 	runar.Assert(runar.Bn254G1OnCurveP(proofC))
 	runar.Assert(runar.Bn254G1OnCurveP(preparedInputs))
@@ -132,12 +232,7 @@ func (c *Groth16RollupContract) AdvanceState(
 		c.AlphaG1, c.BetaG2X0, c.BetaG2X1, negBetaY0, negBetaY1,
 	))
 
-	// 3. Proof blob integrity: hash the full proof and verify it matches
-	//    the proofBlobHash in public values (offset 64).
-	pvProofHash := runar.Substr(publicValues, 64, 32)
-	runar.Assert(pvProofHash == runar.Hash256(proofBlob))
-
-	// 4. Extract and verify public values at spec offsets.
+	// 5. Extract and verify public values at spec offsets.
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
@@ -148,9 +243,26 @@ func (c *Groth16RollupContract) AdvanceState(
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 
+	// F07 (post-R7): emit the spec-12 advance OP_RETURN output
+	//   OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4> "BSVM\x02" <batchData>
+	// addDataOutput includes the output in the continuation hash, so
+	// the on-chain tx is cryptographically required to carry batchData
+	// verbatim — giving overlay-node replay direct access via BSV
+	// OP_RETURN without reading the covenant input script. The
+	// "BSVM\x02" magic lets indexers filter covenant-advance OP_RETURNs
+	// from unrelated traffic and mirrors the "BSVM\x01" genesis prefix.
+	opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
+	bsvmMagic := runar.ByteString("BSVM\x02")
+	payload := runar.Cat(bsvmMagic, batchData)
+	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
+	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
+	c.AddDataOutput(0, opReturnScript)
+
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
+
+	_ = proofBlob
 }
 
 // ---------------------------------------------------------------------------
@@ -261,11 +373,11 @@ func (c *Groth16RollupContract) UpgradeSingleKey(
 	proofBY0 runar.Bigint,
 	proofBY1 runar.Bigint,
 	proofC runar.Point,
-	g16Input0 runar.Bigint,
-	g16Input1 runar.Bigint,
-	g16Input2 runar.Bigint,
-	g16Input3 runar.Bigint,
-	g16Input4 runar.Bigint,
+	g16Input0 runar.BigintBig,
+	g16Input1 runar.BigintBig,
+	g16Input2 runar.BigintBig,
+	g16Input3 runar.BigintBig,
+	g16Input4 runar.BigintBig,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -274,11 +386,31 @@ func (c *Groth16RollupContract) UpgradeSingleKey(
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
-	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulP(c.IC1, g16Input0))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC2, g16Input1))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC3, g16Input2))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC4, g16Input3))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC5, g16Input4))
+	// F08: range-check each BN254 scalar public input into [0, r). Applies
+	// on the Upgrade path so a compromised governance set cannot use it to
+	// sneak an unreduced scalar past the differential-oracle barrier. R4c:
+	// BigintBigLess runs value comparison in the Go-mock over the real
+	// 254-bit r instead of a truncated int64 placeholder.
+	runar.Assert(runar.BigintBigLess(g16Input0, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input1, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input2, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input3, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input4, c.Bn254ScalarOrder))
+
+	// F01: bind the SP1 public inputs on the Upgrade path too, so a
+	// compromised governance set cannot tunnel a proof for a different
+	// SP1 guest program via Upgrade. R4c: BigintBigEqual is value-equality
+	// matching Script OP_NUMEQUAL.
+	runar.Assert(runar.BigintBigEqual(g16Input0, c.SP1ProgramVkHashScalar))
+	runar.Assert(runar.BigintBigEqual(g16Input1, reducePublicValuesToScalar(c, publicValues)))
+	runar.Assert(runar.BigintBigEqual(g16Input2, c.Bn254Zero))
+	runar.Assert(runar.BigintBigEqual(g16Input4, c.Bn254Zero))
+
+	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulBigP(c.IC1, g16Input0))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC2, g16Input1))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC3, g16Input2))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC4, g16Input3))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC5, g16Input4))
 	runar.Assert(runar.Bn254G1OnCurveP(proofA))
 	runar.Assert(runar.Bn254G1OnCurveP(proofC))
 	runar.Assert(runar.Bn254G1OnCurveP(preparedInputs))
@@ -325,11 +457,11 @@ func (c *Groth16RollupContract) UpgradeMultiSig2(
 	proofBY0 runar.Bigint,
 	proofBY1 runar.Bigint,
 	proofC runar.Point,
-	g16Input0 runar.Bigint,
-	g16Input1 runar.Bigint,
-	g16Input2 runar.Bigint,
-	g16Input3 runar.Bigint,
-	g16Input4 runar.Bigint,
+	g16Input0 runar.BigintBig,
+	g16Input1 runar.BigintBig,
+	g16Input2 runar.BigintBig,
+	g16Input3 runar.BigintBig,
+	g16Input4 runar.BigintBig,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -342,11 +474,29 @@ func (c *Groth16RollupContract) UpgradeMultiSig2(
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
-	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulP(c.IC1, g16Input0))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC2, g16Input1))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC3, g16Input2))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC4, g16Input3))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC5, g16Input4))
+	// F08: range-check each BN254 scalar public input into [0, r). R4c:
+	// BigintBigLess runs value comparison in the Go-mock over the real
+	// 254-bit r.
+	runar.Assert(runar.BigintBigLess(g16Input0, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input1, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input2, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input3, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input4, c.Bn254ScalarOrder))
+
+	// F01: bind the SP1 public inputs on the Upgrade path too, so a
+	// compromised governance set cannot tunnel a proof for a different
+	// SP1 guest program via Upgrade. R4c: BigintBigEqual is value-equality
+	// matching Script OP_NUMEQUAL.
+	runar.Assert(runar.BigintBigEqual(g16Input0, c.SP1ProgramVkHashScalar))
+	runar.Assert(runar.BigintBigEqual(g16Input1, reducePublicValuesToScalar(c, publicValues)))
+	runar.Assert(runar.BigintBigEqual(g16Input2, c.Bn254Zero))
+	runar.Assert(runar.BigintBigEqual(g16Input4, c.Bn254Zero))
+
+	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulBigP(c.IC1, g16Input0))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC2, g16Input1))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC3, g16Input2))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC4, g16Input3))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC5, g16Input4))
 	runar.Assert(runar.Bn254G1OnCurveP(proofA))
 	runar.Assert(runar.Bn254G1OnCurveP(proofC))
 	runar.Assert(runar.Bn254G1OnCurveP(preparedInputs))
@@ -394,11 +544,11 @@ func (c *Groth16RollupContract) UpgradeMultiSig3(
 	proofBY0 runar.Bigint,
 	proofBY1 runar.Bigint,
 	proofC runar.Point,
-	g16Input0 runar.Bigint,
-	g16Input1 runar.Bigint,
-	g16Input2 runar.Bigint,
-	g16Input3 runar.Bigint,
-	g16Input4 runar.Bigint,
+	g16Input0 runar.BigintBig,
+	g16Input1 runar.BigintBig,
+	g16Input2 runar.BigintBig,
+	g16Input3 runar.BigintBig,
+	g16Input4 runar.BigintBig,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -411,11 +561,29 @@ func (c *Groth16RollupContract) UpgradeMultiSig3(
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
-	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulP(c.IC1, g16Input0))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC2, g16Input1))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC3, g16Input2))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC4, g16Input3))
-	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulP(c.IC5, g16Input4))
+	// F08: range-check each BN254 scalar public input into [0, r). R4c:
+	// BigintBigLess runs value comparison in the Go-mock over the real
+	// 254-bit r.
+	runar.Assert(runar.BigintBigLess(g16Input0, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input1, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input2, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input3, c.Bn254ScalarOrder))
+	runar.Assert(runar.BigintBigLess(g16Input4, c.Bn254ScalarOrder))
+
+	// F01: bind the SP1 public inputs on the Upgrade path too, so a
+	// compromised governance set cannot tunnel a proof for a different
+	// SP1 guest program via Upgrade. R4c: BigintBigEqual is value-equality
+	// matching Script OP_NUMEQUAL.
+	runar.Assert(runar.BigintBigEqual(g16Input0, c.SP1ProgramVkHashScalar))
+	runar.Assert(runar.BigintBigEqual(g16Input1, reducePublicValuesToScalar(c, publicValues)))
+	runar.Assert(runar.BigintBigEqual(g16Input2, c.Bn254Zero))
+	runar.Assert(runar.BigintBigEqual(g16Input4, c.Bn254Zero))
+
+	preparedInputs := runar.Bn254G1AddP(c.IC0, runar.Bn254G1ScalarMulBigP(c.IC1, g16Input0))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC2, g16Input1))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC3, g16Input2))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC4, g16Input3))
+	preparedInputs = runar.Bn254G1AddP(preparedInputs, runar.Bn254G1ScalarMulBigP(c.IC5, g16Input4))
 	runar.Assert(runar.Bn254G1OnCurveP(proofA))
 	runar.Assert(runar.Bn254G1OnCurveP(proofC))
 	runar.Assert(runar.Bn254G1OnCurveP(preparedInputs))

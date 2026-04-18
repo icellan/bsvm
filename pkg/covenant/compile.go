@@ -63,7 +63,10 @@ func CompileBasefoldRollup(sp1VerifyingKey []byte, chainID uint64, governanceCon
 	}
 
 	contractPath := findBasefoldContractSource()
-	args := buildBasefoldConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	args, err := buildBasefoldConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building basefold constructor args: %w", err)
+	}
 
 	return compileRollupContract(contractPath, args, "", sp1VerifyingKey, chainID, governanceConfig, VerifyBasefold)
 }
@@ -90,27 +93,42 @@ func CompileGroth16Rollup(sp1VerifyingKey []byte, chainID uint64, governanceConf
 	}
 
 	contractPath := findGroth16ContractSource()
-	args := buildGroth16ConstructorArgs(sp1VerifyingKey, chainID, governanceConfig, vk)
+	args, err := buildGroth16ConstructorArgs(sp1VerifyingKey, chainID, governanceConfig, vk)
+	if err != nil {
+		return nil, fmt.Errorf("building groth16 constructor args: %w", err)
+	}
 
 	return compileRollupContract(contractPath, args, "", sp1VerifyingKey, chainID, governanceConfig, VerifyGroth16)
 }
 
-// CompileGroth16WARollup compiles the witness-assisted Groth16 rollup
-// covenant contract ("Mode 3"). It routes through the Rúnar Go compiler
-// with CompileOptions.Groth16WAVKey set, which causes any method that
-// begins with runar.AssertGroth16WitnessAssisted() (i.e. AdvanceState) to
-// have the BN254 Groth16 verifier inlined as a method-entry preamble with
-// the SP1 VK baked in as pushdata.
+// CompileGroth16WARollup compiles the Mode 3 witness-assisted Groth16
+// rollup contract with the VK's sha256 digest NOT pinned. This is the
+// historical entry point; it is equivalent to
+// CompileGroth16WARollupPinned(..., VKTrustPolicyAllowUnpinned) and must
+// NOT be used to produce a mainnet locking script. Use
+// CompileGroth16WARollupPinned with VKTrustPolicyMainnet for any shard
+// that will hold real funds.
+func CompileGroth16WARollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig, vkJSONPath string) (*CompiledCovenant, error) {
+	return CompileGroth16WARollupPinned(sp1VerifyingKey, chainID, governanceConfig, vkJSONPath, VKTrustPolicyAllowUnpinned)
+}
+
+// CompileGroth16WARollupPinned compiles the Mode 3 witness-assisted
+// Groth16 rollup contract AND enforces a VK trust policy (F06). It
+// routes through the Rúnar Go compiler with CompileOptions.Groth16WAVKey
+// set, which causes any method that begins with
+// runar.AssertGroth16WitnessAssisted() (i.e. AdvanceState) to have the
+// BN254 Groth16 verifier inlined as a method-entry preamble with the
+// SP1 VK baked in as pushdata.
 //
 // vkJSONPath MUST be the absolute path to a SP1-format vk.json file
-// (schema matches tests/sp1/sp1_groth16_vk.json). Passing an empty path
-// causes the compiler to reject AssertGroth16WitnessAssisted at stack
-// lowering time — validate before calling.
+// (schema matches tests/sp1/sp1_groth16_vk.json). The VK bytes are
+// sha256'd and compared against PinnedSP1Groth16VKHashes per the given
+// policy; a mismatch fails the compile before any Rúnar work happens.
 //
 // Unlike CompileGroth16Rollup, no Groth16VK readonly fields are populated
 // on the contract — the VK is emitted as pushdata by the witness-assisted
 // preamble, not as readonly constructor args.
-func CompileGroth16WARollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig, vkJSONPath string) (*CompiledCovenant, error) {
+func CompileGroth16WARollupPinned(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig, vkJSONPath string, policy VKTrustPolicy) (*CompiledCovenant, error) {
 	if err := governanceConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid governance config: %w", err)
 	}
@@ -126,9 +144,17 @@ func CompileGroth16WARollup(sp1VerifyingKey []byte, chainID uint64, governanceCo
 	if _, err := os.Stat(vkJSONPath); err != nil {
 		return nil, fmt.Errorf("groth16 WA vk.json not readable at %q: %w", vkJSONPath, err)
 	}
+	// F06: verify the VK sha256 matches the pinned allowlist for the
+	// active policy BEFORE handing the path to Rúnar.
+	if err := VerifyPinnedVKHash(vkJSONPath, policy); err != nil {
+		return nil, fmt.Errorf("compile: groth16 WA vk.json failed pinning check: %w", err)
+	}
 
 	contractPath := findGroth16WAContractSource()
-	args := buildGroth16WAConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	args, err := buildGroth16WAConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building groth16 WA constructor args: %w", err)
+	}
 
 	return compileRollupContract(contractPath, args, vkJSONPath, sp1VerifyingKey, chainID, governanceConfig, VerifyGroth16WA)
 }
@@ -188,7 +214,19 @@ func compileRollupContract(
 // the chain ID, and the governance configuration (mode, threshold, keys).
 // Both contracts use the camelCase property names produced by the Rúnar Go
 // parser from the struct field names.
-func buildSharedConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) map[string]interface{} {
+//
+// F11 defence-in-depth: this helper re-validates the shape of the active
+// governance key slots via assertGovernanceKeysShape before emitting them.
+// GovernanceConfig.Validate() already rejects zero-prefixed and malformed
+// keys, but a future refactor that forgets to call Validate must not
+// silently produce a covenant whose CheckSig / CheckMultiSig slots carry
+// zero pubkeys — that script would compile cleanly but never accept a
+// signature, locking the shard's governance out forever.
+func buildSharedConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
+	if err := assertGovernanceKeysShape(governanceConfig); err != nil {
+		return nil, err
+	}
+
 	vkHash := sha256.Sum256(sp1VerifyingKey)
 
 	args := map[string]interface{}{
@@ -211,13 +249,65 @@ func buildSharedConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governan
 	args["governanceKey2"] = keys[1]
 	args["governanceKey3"] = keys[2]
 
-	return args
+	return args, nil
+}
+
+// assertGovernanceKeysShape verifies that the governance key slots that
+// should hold a real compressed secp256k1 pubkey actually do, regardless
+// of whether GovernanceConfig.Validate() was called first. This is a
+// defence-in-depth check for F11 — it mirrors validateCompressedPubKey
+// on each active slot and explicitly rejects zero-prefixed bytes that
+// would otherwise be baked into the covenant as a dead CheckSig /
+// CheckMultiSig target.
+//
+// Slot semantics (matches buildSharedConstructorArgs):
+//   - GovernanceNone: all slots must be empty (len(Keys) == 0). Any key
+//     present is a caller-side misuse.
+//   - GovernanceSingleKey: slot 0 must be a valid 33-byte compressed
+//     pubkey (prefix 0x02 / 0x03). Slots 1 and 2 are unused.
+//   - GovernanceMultiSig: slots 0..len(Keys)-1 must each be valid
+//     compressed pubkeys. Slots above len(Keys) stay as the zero
+//     placeholder and are not checked.
+func assertGovernanceKeysShape(governanceConfig GovernanceConfig) error {
+	switch governanceConfig.Mode {
+	case GovernanceNone:
+		if len(governanceConfig.Keys) != 0 {
+			return fmt.Errorf("governance mode none must have no keys, got %d", len(governanceConfig.Keys))
+		}
+		return nil
+
+	case GovernanceSingleKey:
+		if len(governanceConfig.Keys) != 1 {
+			return fmt.Errorf("governance mode single_key requires exactly 1 key, got %d", len(governanceConfig.Keys))
+		}
+		if err := validateCompressedPubKey(governanceConfig.Keys[0]); err != nil {
+			return fmt.Errorf("governance key slot 0 invalid: %w", err)
+		}
+		return nil
+
+	case GovernanceMultiSig:
+		if len(governanceConfig.Keys) < 2 {
+			return fmt.Errorf("governance mode multisig requires at least 2 keys, got %d", len(governanceConfig.Keys))
+		}
+		if len(governanceConfig.Keys) > 3 {
+			return fmt.Errorf("governance mode multisig supports at most 3 keys, got %d", len(governanceConfig.Keys))
+		}
+		for i, key := range governanceConfig.Keys {
+			if err := validateCompressedPubKey(key); err != nil {
+				return fmt.Errorf("governance key slot %d invalid: %w", i, err)
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown governance mode %d", int(governanceConfig.Mode))
+	}
 }
 
 // buildBasefoldConstructorArgs creates the ConstructorArgs map for the
 // Basefold rollup contract. Only the shared readonly fields are populated —
 // the Basefold variant has no mode-specific readonly properties.
-func buildBasefoldConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) map[string]interface{} {
+func buildBasefoldConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
 	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
 }
 
@@ -243,8 +333,39 @@ func buildBasefoldConstructorArgs(sp1VerifyingKey []byte, chainID uint64, govern
 // zero-valued placeholders (both encodings resolve to OP_0) but fatal for
 // real SP1 verification keys — which is why the Mode 2 tests stayed red
 // until this loader started passing *big.Int.
-func buildGroth16ConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig, vk *Groth16VK) map[string]interface{} {
-	args := buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+func buildGroth16ConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig, vk *Groth16VK) (map[string]interface{}, error) {
+	args, err := buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// F08: BN254 scalar field order r baked into the script so
+	// AdvanceState and the Upgrade* variants can enforce
+	// g16Input_i < r. Without this bound, an unreduced scalar would
+	// pair-verify on-chain (EC scalar mul is periodic mod r) but be
+	// ABI-rejected by SP1's Solidity / in-circuit reference verifiers,
+	// breaking differential-oracle parity during fuzzing and
+	// conformance testing. Passed as *big.Int so the Rúnar compiler
+	// emits the LE sign-magnitude Bitcoin Script number encoding the
+	// BN254 primitives expect.
+	bn254ScalarOrder, _ := new(big.Int).SetString(
+		"21888242871839275222246405745257275088548364400416034343698204186575808495617",
+		10,
+	)
+	args["bn254ScalarOrder"] = bn254ScalarOrder
+
+	// F01: SP1 public input bindings. SP1ProgramVkHashScalar is the
+	// pinned vkey hash reduced into the scalar field; Bn254ScalarMask
+	// (= 2^253) is used by the on-chain reducePublicValuesToScalar to
+	// match SP1's committedValuesDigest convention.
+	args["sP1ProgramVkHashScalar"] = ReduceSP1ProgramVkHashScalar(sp1VerifyingKey)
+	args["bn254ScalarMask"] = SP1Bn254ScalarMask()
+
+	// R4c: Bn254Zero is a BigintBig readonly used as the RHS of the F01
+	// g16Input2 / g16Input4 equality assertions. Baked as a compile-time
+	// constant (OP_0 in Script) rather than spelled inline because
+	// *big.Int has no untyped-zero conversion in Go source.
+	args["bn254Zero"] = big.NewInt(0)
 
 	args["alphaG1"] = hex.EncodeToString(vk.AlphaG1)
 	args["betaG2X0"] = bytesToBigInt(vk.BetaG2[0])
@@ -266,7 +387,7 @@ func buildGroth16ConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governa
 	args["iC4"] = hex.EncodeToString(vk.IC4)
 	args["iC5"] = hex.EncodeToString(vk.IC5)
 
-	return args
+	return args, nil
 }
 
 // bytesToBigInt interprets a big-endian byte slice as a non-negative
@@ -282,13 +403,36 @@ func bytesToBigInt(b []byte) *big.Int {
 }
 
 // buildGroth16WAConstructorArgs creates the ConstructorArgs map for the
-// witness-assisted Groth16 rollup contract. Only the shared readonly fields
-// are populated — the BN254 verifying key is baked by the witness-assisted
-// preamble emitter at compile time via CompileOptions.Groth16WAVKey, not
-// as readonly constructor args. This is why the Mode 3 contract has no
+// Mode 3 witness-assisted Groth16 rollup contract. Populates the shared
+// readonly fields plus the three BN254-scalar domain-binding fields
+// (F01 / F08):
+//
+//   - SP1ProgramVkHashScalar: sha256(sp1VerifyingKey) reduced into the
+//     BN254 scalar field. Asserted equal to Groth16PublicInput(0) on
+//     every advance.
+//   - Bn254ScalarMask:        2^253, used by reducePublicValuesToScalarWA
+//     to match SP1's committedValuesDigest convention.
+//   - Bn254ScalarOrder:       r, used for F08 input range checks.
+//
+// The BN254 verifying key is baked by the witness-assisted preamble
+// emitter at compile time via CompileOptions.Groth16WAVKey, not as
+// readonly constructor args, so the Mode 3 contract still has no
 // Groth16VK readonly fields on its struct.
-func buildGroth16WAConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) map[string]interface{} {
-	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+func buildGroth16WAConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
+	args, err := buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	bn254ScalarOrder, _ := new(big.Int).SetString(
+		"21888242871839275222246405745257275088548364400416034343698204186575808495617",
+		10,
+	)
+	args["bn254ScalarOrder"] = bn254ScalarOrder
+	args["sP1ProgramVkHashScalar"] = ReduceSP1ProgramVkHashScalar(sp1VerifyingKey)
+	args["bn254ScalarMask"] = SP1Bn254ScalarMask()
+
+	return args, nil
 }
 
 // findBasefoldContractSource locates the Basefold rollup source file.

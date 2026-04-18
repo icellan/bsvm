@@ -234,9 +234,12 @@ func TestGroth16WARollupContract_UpgradeMethods(t *testing.T) {
 	// so the governance signatures are the sole authorization. Common
 	// upgrade payload is 2 args: newCovenantScript, newBlockNumber.
 	rt := reflect.TypeOf(&Groth16WARollupContract{})
-	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+2) // receiver + sig + 2 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+2)
-	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+2)
+	// F05: Mode 3 Upgrade* payload is 3 args — newCovenantScript,
+	// migrationHash, newBlockNumber — with migrationHash asserted equal
+	// to Hash256(newCovenantScript) on chain.
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+3) // receiver + sig + 3 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+3)
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+3)
 }
 
 // ---------------------------------------------------------------------------

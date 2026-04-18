@@ -55,9 +55,15 @@ type BasefoldRollupContract struct {
 //  3. Basefold proof: KoalaBear field product check + Poseidon2 Merkle
 //     inclusion of the provided leaf at the given index must reconstruct to
 //     the SP1VerifyingKeyHash stored in the readonly property.
-//  4. proofBlobHash at public values offset 64 must equal hash256(proofBlob).
-//  5. Public values offsets 0/32/104/136 must match StateRoot / newStateRoot
+//  4. Public values offsets 0/32/104/136 must match StateRoot / newStateRoot
 //     / hash256(batchData) / ChainId (little-endian 8 bytes) respectively.
+//
+// Note: the tautological `publicValues[64..96] == hash256(proofBlob)` check
+// present before 2026-04-18 was removed (finding F04). That slot holds
+// receiptsHash per spec 12 and is intentionally unverified by the covenant
+// (nodes check it during batch replay); the prior assertion was either
+// unsatisfiable by an honest prover (if publicValues came straight from
+// the guest) or tautological (if the prover controlled publicValues).
 func (c *BasefoldRollupContract) AdvanceState(
 	newStateRoot runar.ByteString,
 	newBlockNumber runar.Bigint,
@@ -82,12 +88,7 @@ func (c *BasefoldRollupContract) AdvanceState(
 	computedRoot := runar.MerkleRootSha256(merkleLeaf, merkleProof, merkleIndex, 20)
 	runar.Assert(computedRoot == c.SP1VerifyingKeyHash)
 
-	// 3. Proof blob integrity: hash the full proof and verify it matches
-	//    the proofBlobHash in public values (offset 64).
-	pvProofHash := runar.Substr(publicValues, 64, 32)
-	runar.Assert(pvProofHash == runar.Hash256(proofBlob))
-
-	// 4. Extract and verify public values at spec offsets.
+	// 3. Extract and verify public values at spec offsets.
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
@@ -101,6 +102,8 @@ func (c *BasefoldRollupContract) AdvanceState(
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
+
+	_ = proofBlob
 }
 
 // ---------------------------------------------------------------------------

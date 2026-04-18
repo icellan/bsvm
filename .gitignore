@@ -23,3 +23,9 @@ test/evmtest/testdata/
 # Internal planning notes (not for repo)
 BSVM-INTEGRATION-TESTS-PROMPT.md
 
+
+# local working notes, do not commit
+RUNAR-ISSUES.md
+
+# temp security review docs, do not commit
+docs/security/

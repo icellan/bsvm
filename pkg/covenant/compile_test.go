@@ -90,9 +90,12 @@ func TestBuildBasefoldConstructorArgs(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	vkHash := sha256.Sum256(vk)
 
-	args := buildBasefoldConstructorArgs(vk, 42, GovernanceConfig{
+	args, err := buildBasefoldConstructorArgs(vk, 42, GovernanceConfig{
 		Mode: GovernanceNone,
 	})
+	if err != nil {
+		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+	}
 
 	// sP1VerifyingKeyHash: hex of SHA256(vk)
 	if got, ok := args["sP1VerifyingKeyHash"].(string); !ok {
@@ -155,10 +158,13 @@ func TestBuildBasefoldConstructorArgs_SingleKey(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	key := testKey(1)
 
-	args := buildBasefoldConstructorArgs(vk, 100, GovernanceConfig{
+	args, err := buildBasefoldConstructorArgs(vk, 100, GovernanceConfig{
 		Mode: GovernanceSingleKey,
 		Keys: [][]byte{key},
 	})
+	if err != nil {
+		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+	}
 
 	// governanceMode: float64(1) for GovernanceSingleKey
 	if got := args["governanceMode"].(float64); got != 1.0 {
@@ -177,11 +183,14 @@ func TestBuildBasefoldConstructorArgs_MultiSig(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	keys := [][]byte{testKey(1), testKey(2), testKey(3)}
 
-	args := buildBasefoldConstructorArgs(vk, 200, GovernanceConfig{
+	args, err := buildBasefoldConstructorArgs(vk, 200, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
 		Keys:      keys,
 		Threshold: 2,
 	})
+	if err != nil {
+		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+	}
 
 	// governanceMode: float64(2)
 	if got := args["governanceMode"].(float64); got != 2.0 {
@@ -241,7 +250,10 @@ func TestBuildGroth16ConstructorArgs(t *testing.T) {
 		IC5: bytes.Repeat([]byte{0x15}, 64),
 	}
 
-	args := buildGroth16ConstructorArgs(vk, 42, GovernanceConfig{Mode: GovernanceNone}, g16)
+	args, err := buildGroth16ConstructorArgs(vk, 42, GovernanceConfig{Mode: GovernanceNone}, g16)
+	if err != nil {
+		t.Fatalf("buildGroth16ConstructorArgs: %v", err)
+	}
 
 	// Shared fields are still present.
 	if _, ok := args["sP1VerifyingKeyHash"]; !ok {
@@ -558,9 +570,12 @@ func TestBuildGroth16WAConstructorArgs(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	vkHash := sha256.Sum256(vk)
 
-	args := buildGroth16WAConstructorArgs(vk, 42, GovernanceConfig{
+	args, err := buildGroth16WAConstructorArgs(vk, 42, GovernanceConfig{
 		Mode: GovernanceNone,
 	})
+	if err != nil {
+		t.Fatalf("buildGroth16WAConstructorArgs: %v", err)
+	}
 
 	if got, ok := args["sP1VerifyingKeyHash"].(string); !ok {
 		t.Error("sP1VerifyingKeyHash should be a string")
@@ -619,7 +634,12 @@ func TestCompileGroth16WARollup_Basic(t *testing.T) {
 
 	size := len(compiled.LockingScript)
 	const minSize = 50 * 1024        // 50 KB
-	const maxSize = 900 * 1024       // 900 KB (upper bound per the brief — 50-700 KB expected)
+	// Post-R1/R2: the Mode 3 contract opens AdvanceState with the
+	// MSM-binding preamble (AssertGroth16WitnessAssistedWithMSM), which
+	// adds the on-chain IC[0] + Σ pub_i · IC[i+1] computation plus
+	// proof.B G2 on-curve + subgroup checks. Measured ~1.35 MB in
+	// practice vs the ~688 KB raw preamble figure quoted pre-R1/R2.
+	const maxSize = 1600 * 1024
 	t.Logf("Mode 3 locking script: %d bytes (%.1f KB)", size, float64(size)/1024.0)
 	if size < minSize {
 		t.Errorf("locking script %d bytes is suspiciously small; expected > %d", size, minSize)

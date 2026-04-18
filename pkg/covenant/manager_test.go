@@ -207,10 +207,9 @@ func TestLoadPersistedState(t *testing.T) {
 
 	// Prepare persisted state.
 	persistedState := CovenantState{
-		StateRoot:          testStateRoot(42),
-		BlockNumber:        42,
-		Frozen:             0,
-		AdvancesSinceInbox: 3,
+		StateRoot:   testStateRoot(42),
+		BlockNumber: 42,
+		Frozen:      0,
 	}
 	persistedTxID := types.BytesToHash([]byte{0xde, 0xad, 0xbe, 0xef})
 
@@ -231,9 +230,6 @@ func TestLoadPersistedState(t *testing.T) {
 	}
 	if cm.CurrentState().StateRoot != testStateRoot(42) {
 		t.Error("state root mismatch after load")
-	}
-	if cm.CurrentState().AdvancesSinceInbox != 3 {
-		t.Errorf("advances since inbox = %d, want 3", cm.CurrentState().AdvancesSinceInbox)
 	}
 	if cm.CurrentTxID() != persistedTxID {
 		t.Errorf("txid = %x, want %x", cm.CurrentTxID(), persistedTxID)

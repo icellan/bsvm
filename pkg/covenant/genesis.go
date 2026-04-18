@@ -25,7 +25,17 @@ type GenesisConfig struct {
 	// baked into the witness-assisted Groth16 preamble. Required when
 	// Verification == VerifyGroth16WA.
 	Groth16WAVKPath string
-	CovenantSats    uint64 // Default: DefaultCovenantSats (10000)
+	// VKTrustPolicy controls the F06 pinning check applied by the Mode 3
+	// WA compile path. VKTrustPolicyMainnet is required when Mainnet=true.
+	// Tests use Gate0Fixture or AllowUnpinned.
+	VKTrustPolicy VKTrustPolicy
+	// Mainnet flags the shard as mainnet-bound. When true, PrepareGenesis
+	// enforces VKTrustPolicy == VKTrustPolicyMainnet. Mode 3 WA is now a
+	// full production target — the Rúnar R1b groth16PublicInput wiring
+	// closes F01 at the contract layer, alongside the already-shipped
+	// F02/F03 MSM-binding + G2 subgroup checks.
+	Mainnet      bool
+	CovenantSats uint64 // Default: DefaultCovenantSats (10000)
 }
 
 // GenesisResult holds the output of PrepareGenesis. It contains the compiled
@@ -64,6 +74,16 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 		sats = DefaultCovenantSats
 	}
 
+	// F06 mainnet guardrail — the VK must be pinned via a reviewed
+	// ceremony allowlist entry, not the gate0 fixture and not unpinned
+	// random bytes. The old Mode 3 mainnet block was lifted once R1b +
+	// R2 landed upstream — all three verification modes are now
+	// mainnet-eligible under the pinning policy.
+	if config.Mainnet && config.VKTrustPolicy != VKTrustPolicyMainnet {
+		return nil, fmt.Errorf("mainnet genesis requires VKTrustPolicy=Mainnet, got %s",
+			config.VKTrustPolicy)
+	}
+
 	var compiled *CompiledCovenant
 	var err error
 	switch config.Verification {
@@ -72,7 +92,7 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 	case VerifyGroth16:
 		compiled, err = CompileGroth16Rollup(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16VK)
 	case VerifyGroth16WA:
-		compiled, err = CompileGroth16WARollup(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16WAVKPath)
+		compiled, err = CompileGroth16WARollupPinned(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16WAVKPath, config.VKTrustPolicy)
 	default:
 		return nil, fmt.Errorf("unknown verification mode %d", int(config.Verification))
 	}
@@ -139,7 +159,7 @@ func (g *GenesisResult) BuildGenesisTransaction(
 		},
 	}
 
-	// Build OP_RETURN payload: BSVM\x01 + initial state encoded (49 bytes).
+	// Build OP_RETURN payload: BSVM\x01 + initial state encoded (41 bytes).
 	opReturnPayload := make([]byte, 0, len(genesisOpReturnPrefix)+covenantStateEncodedSize)
 	opReturnPayload = append(opReturnPayload, genesisOpReturnPrefix...)
 	opReturnPayload = append(opReturnPayload, g.InitialState.Encode()...)

@@ -70,24 +70,6 @@ func TestCovenantStateSerialization(t *testing.T) {
 				Frozen:      0,
 			},
 		},
-		{
-			name: "with advances since inbox",
-			state: CovenantState{
-				StateRoot:          testStateRoot(50),
-				BlockNumber:        50,
-				Frozen:             0,
-				AdvancesSinceInbox: 7,
-			},
-		},
-		{
-			name: "max advances since inbox",
-			state: CovenantState{
-				StateRoot:          testStateRoot(99),
-				BlockNumber:        99,
-				Frozen:             0,
-				AdvancesSinceInbox: ^uint64(0),
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -110,9 +92,6 @@ func TestCovenantStateSerialization(t *testing.T) {
 			}
 			if decoded.Frozen != tt.state.Frozen {
 				t.Errorf("frozen mismatch: got %d, want %d", decoded.Frozen, tt.state.Frozen)
-			}
-			if decoded.AdvancesSinceInbox != tt.state.AdvancesSinceInbox {
-				t.Errorf("advances since inbox mismatch: got %d, want %d", decoded.AdvancesSinceInbox, tt.state.AdvancesSinceInbox)
 			}
 		})
 	}

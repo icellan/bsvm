@@ -133,7 +133,7 @@ func TestBuildGenesisTransaction_OpReturn(t *testing.T) {
 		t.Error("OP_RETURN script does not contain BSVM\\x01 prefix")
 	}
 
-	// The payload should also contain the initial state (49 bytes).
+	// The payload should also contain the initial state (41 bytes).
 	initialStateBytes := gr.InitialState.Encode()
 	if !bytes.Contains(opReturnOutput.Script, initialStateBytes) {
 		t.Error("OP_RETURN script does not contain initial state")
