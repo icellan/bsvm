@@ -1,0 +1,840 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{booktabs}
+\usepackage{array}
+
+% Theorem environments
+\newtheorem{definition}{Definition}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}[section]
+\newtheorem{assumption}{Assumption}[section]
+
+% cleveref name formats for custom theorem-like environments
+\crefname{definition}{Definition}{Definitions}
+\Crefname{definition}{Definition}{Definitions}
+\crefname{theorem}{Theorem}{Theorems}
+\Crefname{theorem}{Theorem}{Theorems}
+\crefname{lemma}{Lemma}{Lemmas}
+\Crefname{lemma}{Lemma}{Lemmas}
+\crefname{corollary}{Corollary}{Corollaries}
+\Crefname{corollary}{Corollary}{Corollaries}
+\crefname{proposition}{Proposition}{Propositions}
+\Crefname{proposition}{Proposition}{Propositions}
+\crefname{remark}{Remark}{Remarks}
+\Crefname{remark}{Remark}{Remarks}
+\crefname{assumption}{Assumption}{Assumptions}
+\Crefname{assumption}{Assumption}{Assumptions}
+
+% Notation
+\newcommand{\negl}{\mathsf{negl}}
+\newcommand{\poly}{\mathsf{poly}}
+\newcommand{\PPT}{\mathsf{PPT}}
+\newcommand{\Adv}{\mathcal{A}}
+\newcommand{\Hashd}{\mathsf{H_d}}        % SHA256d (double SHA-256), used for BSV tx and batch-data hash256 bindings
+\newcommand{\Hashs}{\mathsf{H_s}}        % single SHA-256, used for SP1 committed-values-digest reduction
+\newcommand{\Verify}{\mathsf{Verify}}
+\newcommand{\Prove}{\mathsf{Prove}}
+\newcommand{\Exec}{\mathsf{Exec}}
+\newcommand{\Cov}{\mathsf{Cov}}
+\newcommand{\FRI}{\mathsf{FRI}}
+\newcommand{\Groth}{\mathsf{Groth16}}    % SP1 Groth16 wrapper proof system (Modes 2 and 3)
+\newcommand{\SPone}{\mathsf{SP1}}
+\newcommand{\revm}{\textsf{revm}}
+\newcommand{\EVM}{\mathsf{EVM}}
+\newcommand{\BSV}{\mathsf{BSV}}
+\newcommand{\UTXO}{\mathsf{UTXO}}
+\newcommand{\Runar}{\textsf{R\'{u}nar}}
+\newcommand{\SRS}{\mathsf{srs}_{\mathsf{BN254}}}  % BN254 trusted-setup structured reference string (Modes 2/3)
+\newcommand{\vkSP}{\mathsf{vk}_{\SPone}}           % SP1 Groth16 verifying key (baked or pinned per mode)
+\newcommand{\VKAllow}{\mathsf{VKAllow}}            % compile-time pinning allowlist
+
+\title{Formal Security Model for BSVM:\\A Validity-Proven EVM Layer~2 on Bitcoin~SV}
+\author{Supplementary Material to the BSVM Whitepaper}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent We present a formal security model for BSVM, a Layer~2 Ethereum Virtual Machine settled on Bitcoin~SV via covenant UTXO chains and STARK validity proofs. The system is modelled as a validity-enforced state transition system instantiated over a UTXO-based ledger, parameterised by an execution function, a composed proving system, and a covenant-enforced verification mechanism compiled into base-layer Script. We define seven cryptographic and protocol assumptions, an adversary model with explicit capabilities (including adaptive corruption, minority miner collusion, and governance key compromise), and eight security properties: state transition integrity, canonical state uniqueness, data availability binding, bridge conservation, bridge liveness, censorship resistance, cross-shard isolation, and conditional liveness. All eight properties hold at full strength in trustless (\texttt{none}) governance mode; we explicitly characterise which properties degrade under governance and how. For each property we state a formal definition, prove intermediate lemmas, and provide theorems reducing the property to the stated assumptions. The core security reduction is: any violation of state transition integrity requires breaking STARK soundness over the composed $\SPone[\revm]$ execution, forging a hash collision, violating base-layer consensus, or exploiting a compiler defect in the Script-compiled verifier. The overall guarantee is as strong as the weakest assumption; we explicitly identify the execution faithfulness layer as empirically justified rather than formally proven, and characterise pre-confirmation and post-confirmation security, proof non-malleability, bridge double-withdrawal prevention, selective validity surfaces from Script resource limits, governance upgrade risks, and the trust assumptions for each governance mode.
+\end{abstract}
+
+%% ============================================================
+\section{Preliminaries}\label{sec:prelim}
+%% ============================================================
+
+Let $\lambda$ denote the security parameter. All probabilistic algorithms run in time polynomial in $\lambda$. A function $f(\lambda)$ is \emph{negligible} if for every polynomial $p(\cdot)$ there exists $\lambda_0$ such that for all $\lambda > \lambda_0$, $f(\lambda) < 1/p(\lambda)$.
+
+We assume the existence of:
+\begin{enumerate}[nosep,label=(\roman*)]
+    \item a collision-resistant hash function $\Hashd : \{0,1\}^* \to \{0,1\}^{256}$, instantiated as $\mathsf{SHA256d}$ (double SHA-256). Used for BSV tx hashing and the batch-data $\mathsf{hash256}$ binding.
+    \item a collision-resistant hash function $\Hashs : \{0,1\}^* \to \{0,1\}^{256}$, instantiated as single SHA-256. Used for SP1's committed-values-digest reduction; distinguished from $\Hashd$ because the reduction to the BN254 scalar field (Modes 2/3) reads its output under a different convention (reverse-bytes + $\bmod\ 2^{253}$).
+    \item a STARK-based proving system $(\Prove_{\FRI}, \Verify_{\FRI})$ with computational soundness (used natively in Mode 1 and as the inner proof in the Modes 2/3 wrap).
+    \item a Groth16/BN254 proving system $(\Prove_{\Groth}, \Verify_{\Groth})$ with computational soundness relative to a structured reference string $\SRS$ produced by a trusted setup ceremony. Used as the outer proof in Modes 2 and 3 (SP1's optional Groth16 wrapper).
+    \item a compiler $\Runar$ mapping verifier programs into Bitcoin Script. Distinct verifier programs are emitted per mode: the FRI verifier for Mode 1 and two variants of the BN254 Groth16 pairing verifier (generic readonly-VK for Mode 2, witness-assisted with inlined VK preamble for Mode 3).
+    \item a deterministic execution function $\Exec_{\EVM}$ corresponding to EVM semantics.
+\end{enumerate}
+
+\begin{definition}[Verification Mode]\label{def:mode}
+The BSVM covenant is parametrised by a verification mode $k \in \{1, 2, 3\}$, fixed at shard genesis and baked into the compiled locking script:
+\begin{itemize}[nosep]
+    \item \emph{Mode 1 (Basefold)}: native on-chain STARK verification via the Rúnar-compiled FRI verifier. No trusted setup.
+    \item \emph{Mode 2 (Groth16)}: SP1's Groth16 wrap verified by a BN254 pairing check; verifying key components are readonly fields on the covenant struct.
+    \item \emph{Mode 3 (Groth16-WA)}: same proof as Mode 2 but the pairing verifier is emitted as a compile-time inlined preamble with the SP1 verifying key baked in as pushdata; the prover supplies a BN254 witness bundle at spend time.
+\end{itemize}
+We write $\Verify_{\mathsf{Script}}^{(k)}$ for the Rúnar-compiled on-chain verifier under mode $k$.
+\end{definition}
+
+%% ============================================================
+\section{System Model}\label{sec:system}
+%% ============================================================
+
+\subsection{Entities}
+
+\begin{definition}[System Entities]\label{def:entities}
+The BSVM system comprises:
+\begin{enumerate}[label=(\roman*),nosep]
+    \item \textbf{BSV miners} $\mathcal{M} = \{M_1, \ldots, M_m\}$: maintain BSV consensus, order transactions, enforce UTXO spending rules. Individual miners may be adversarial provided the honest majority condition holds.
+    \item \textbf{Shard provers} $\mathcal{P} = \{P_1, \ldots, P_p\}$: overlay nodes that execute EVM transactions, generate STARK proofs, and broadcast covenant-advance transactions.
+    \item \textbf{Users} $\mathcal{U} = \{U_1, \ldots, U_n\}$: submit signed EVM transactions and interact with bridges.
+    \item \textbf{Guardians} $\mathcal{G} = \{G_1, \ldots, G_g\}$ (optional): governance multisig participants. Present only in shards with governance mode $\neq \mathtt{none}$.
+    \item \textbf{Covenant chain} $\mathcal{C} = (\UTXO_0, \UTXO_1, \ldots)$: the sequence of BSV transactions forming the canonical state commitment chain.
+    \item \textbf{Bridge covenant} $\mathcal{B} = \{B_1, \ldots, B_k\}$: sub-covenant UTXOs holding locked BSV backing the shard's wBSV supply.
+\end{enumerate}
+\end{definition}
+
+\subsection{State Representation}
+
+\begin{definition}[Covenant State]\label{def:state}
+A shard covenant state at block number $i$ is a 41-byte tuple
+\[
+    \Sigma_i = (r_i,\; i,\; f_i)
+\]
+where:
+\begin{itemize}[nosep]
+    \item $r_i \in \{0,1\}^{256}$ is the 32-byte Merkle Patricia Trie root of the EVM world state;
+    \item $i \in \mathbb{N}$ is the 8-byte block number (incremented by one per covenant advance);
+    \item $f_i \in \{0, 1\}$ is the 1-byte frozen flag, toggled only by governance (if enabled); advances are rejected while $f_i = 1$.
+\end{itemize}
+The shard's chain identifier $\mathsf{cid} \in \mathbb{N}$ is \emph{not} part of $\Sigma_i$: it is a readonly property baked into the compiled locking script at shard genesis, so every advance is implicitly bound to the shard. Each shard is represented on-chain by a unique canonical covenant UTXO $U_i$ committing to $\Sigma_i$ under a locking script parametrised by $(k, \mathsf{cid}, \vkSP, \mathsf{gov})$ where $k$ is the verification mode (\Cref{def:mode}), $\vkSP$ is the pinned SP1 Groth16 verifying key (present for $k \in \{2, 3\}$), and $\mathsf{gov}$ is the shard's governance configuration.
+\end{definition}
+
+\begin{definition}[Bridge Sub-Covenant State]\label{def:bridge-state}
+Bridge commitments are held in separate sub-covenant UTXOs $B_j$, independent of the main state covenant. Each $B_j$ carries its own 48-byte state tuple
+\[
+    \beta_j = (\mathsf{bal}_j,\; \mathsf{nonce}_j,\; \omega_j)
+\]
+where $\mathsf{bal}_j \in \mathbb{N}$ is the total locked BSV (8 bytes), $\mathsf{nonce}_j \in \mathbb{N}$ is the monotonic withdrawal nonce (8 bytes), and $\omega_j \in \{0,1\}^{256}$ is a 32-byte \emph{withdrawal-nullifier hash-chain commitment}: $\omega_j$ is the running hash-chain root over claimed-withdrawal nullifiers, updated on each claim as $\omega_j' = \Hashd(\omega_j \,\|\, \mathsf{nullifier})$ where $\mathsf{nullifier} = \Hashd(\mathsf{addr}\,\|\,\mathsf{amt}\,\|\,\mathsf{nonce}_j)$.
+\end{definition}
+
+\begin{definition}[Withdrawal Event Commitment]\label{def:wd-event-commitment}
+The SP1 guest program, when executing a batch $B$ that emits withdrawal events $e_1, \ldots, e_m$ targeted at sub-covenant indices $j_1, \ldots, j_m$, commits a per-advance \emph{withdrawal commitment} $W \in \{0,1\}^{256}$ equal to the hash-chain root over the emitted events. A withdrawal claim on $B_j$ supplies a chain-membership witness for its event under $W$; $W$ is one of the public outputs of the proof.
+\end{definition}
+
+\subsection{Batches and Execution}
+
+\begin{definition}[Batch]\label{def:batch}
+A batch $B = (\mathsf{tx}_1, \ldots, \mathsf{tx}_b)$ is an ordered sequence of signed Layer~2 transactions together with auxiliary data required for execution and data availability. Let $h_B = \Hashd(B)$ denote the batch commitment.
+\end{definition}
+
+\begin{definition}[Execution Semantics]\label{def:exec}
+The execution function is
+\[
+    \Exec_{\EVM} : (r_i, B) \mapsto (r_{i+1}, O)
+\]
+where $r_{i+1}$ is the resulting state root and $O$ is the execution output (logs, receipts, withdrawal events). $\Exec_{\EVM}$ is deterministic: identical inputs produce identical outputs across all compliant implementations.
+\end{definition}
+
+\subsection{Valid Transition}
+
+\begin{definition}[Valid Transition]\label{def:valid-transition}
+A transition from $\Sigma_i$ to $\Sigma_{i+1}$ is \emph{valid} if there exists a batch $B$, a proof $\pi$, and public outputs $\mathsf{pv} = (r_i, r_{i+1}, h_B, \mathsf{cid}, W, \ldots)$ such that:
+\begin{enumerate}[nosep,label=(V\arabic*)]
+    \item $(r_{i+1}, O) = \Exec_{\EVM}(r_i, B)$;
+    \item $\Verify^{(k)}(\pi, \mathsf{pv}) = 1$ under the shard's verification mode $k$;
+    \item $h_B = \Hashd(B_{\mathsf{on\text{-}chain}})$, where $B_{\mathsf{on\text{-}chain}}$ is the batch data published in the $\mathsf{OP\_RETURN}$ output (\Cref{def:da-output});
+    \item the covenant conditions enforce that $U_i$ is consumed and $U_{i+1}$ is created uniquely;
+    \item $f_i = 0$ (the shard is not frozen at advance time).
+\end{enumerate}
+\end{definition}
+
+\subsection{Covenant Advance}
+
+\begin{definition}[Covenant Advance DA Output]\label{def:da-output}
+The advance transaction's second output is a standard BSV data output with locking script
+\[
+    \mathsf{OP\_FALSE}\;\mathsf{OP\_RETURN}\;\mathsf{OP\_PUSHDATA4}\;\langle \ell \rangle\;\texttt{"BSVM\textbackslash x02"}\;\| \;B_{\mathsf{on\text{-}chain}}
+\]
+where $\ell = 5 + |B_{\mathsf{on\text{-}chain}}|$. The ``\texttt{BSVM\textbackslash x02}'' magic distinguishes covenant-advance OP\_RETURNs from unrelated BSV traffic and mirrors the ``\texttt{BSVM\textbackslash x01}'' genesis marker. The covenant emits this output via R\'{u}nar's \texttt{AddDataOutput} intrinsic, which folds it into the covenant's continuation-hash commitment, so the spending BSV transaction is forced to carry the exact script verbatim.
+\end{definition}
+
+\begin{definition}[Covenant Advance Transaction]\label{def:cov-advance}
+A covenant advance transaction $T_{i+1}$ under verification mode $k$ is a BSV transaction that:
+\begin{enumerate}[nosep,label=(\alph*)]
+    \item spends $U_i$ (the current covenant output);
+    \item creates $U_{i+1}$ with locking script $\Cov(\Sigma_{i+1};\,k,\,\mathsf{cid},\,\vkSP,\,\mathsf{gov})$;
+    \item includes the DA output of \Cref{def:da-output} carrying $B_{\mathsf{on\text{-}chain}}$;
+    \item includes in its unlocking script the proof bundle $\pi_{i+1}$ appropriate to mode $k$ (a raw SP1 STARK for $k = 1$, a BN254 Groth16 proof with public inputs for $k = 2$, or a Groth16 proof plus the witness-assisted BN254 auxiliary bundle for $k = 3$).
+\end{enumerate}
+The covenant locking script $\Cov$ enforces acceptance if and only if:
+\begin{enumerate}[nosep,label=(C\arabic*)]
+    \item $\Verify_{\mathsf{Script}}^{(k)}(\pi_{i+1};\,\vkSP) = 1$ \hfill (proof validity);
+    \item $\pi_{i+1}.\mathsf{pre\_root} = r_i$ \hfill (state continuity);
+    \item $\pi_{i+1}.\mathsf{post\_root} = r_{i+1}$ \hfill (state advance);
+    \item $\pi_{i+1}.\mathsf{block\_num} = i + 1$ \hfill (block number increment);
+    \item $\pi_{i+1}.\mathsf{chain\_id} = \mathsf{cid}$ \hfill (chain binding);
+    \item $\Hashd(B_{\mathsf{on\text{-}chain}}) = \pi_{i+1}.\mathsf{batch\_hash}$ \hfill (batch-data binding);
+    \item $\mathsf{hashOutputs}(T_{i+1})$ matches the expected covenant-output + DA-output structure (\Cref{def:da-output}) \hfill (output binding);
+    \item $f_i = 0$ \hfill (not frozen).
+\end{enumerate}
+For $k \in \{2, 3\}$, the verification of (C1) is a BN254 pairing equation over the proof $(A, B, C)$ and the five SP1 public inputs $I_0, \ldots, I_4$, extracted from the unlocking script. The covenant additionally enforces the following domain bindings on these inputs (finding \textbf{F01} / \textbf{F08}):
+\begin{enumerate}[nosep,label=(C\arabic*),start=9]
+    \item $I_0 = \rho(\vkSP)$, where $\rho(\mathsf{vk}) \coloneqq \Hashs(\mathsf{vk}) \,\bmod\, 2^{253}$ is SP1's vkey-scalar reduction \hfill (guest-program binding);
+    \item $I_1 = \rho(\mathsf{pv})$, where $\mathsf{pv} = \pi_{i+1}.\mathsf{public\_values}$ is the on-chain-committed public-values byte string \hfill (public-values binding);
+    \item $I_2 = 0$ \hfill (SP1 exit-code slot);
+    \item $I_4 = 0$ \hfill (SP1 vkRoot slot, single-program mode);
+    \item $I_j < r_{\mathrm{BN254}}$ for $j \in \{0, 1, 2, 3, 4\}$, where $r_{\mathrm{BN254}}$ is the BN254 scalar field order \hfill (scalar range).
+\end{enumerate}
+$I_3$ (SP1's \texttt{proofNonce} slot) is deliberately left unconstrained per SP1 convention.
+
+There is no signature check on the advance path. The proof is the sole authorisation.
+\end{definition}
+
+\begin{definition}[Upgrade Path]\label{def:upgrade}
+For shards with $\mathsf{gov} \neq \mathtt{none}$, the covenant additionally exposes an \texttt{upgrade} method, signature-gated per $\mathsf{gov}$ and admissible only while $f_i = 1$. The upgrade replaces the locking script on the successor UTXO with a script of sha256-hash $\mu$ where $\mu$ is bound to the signed message (the \emph{migration-hash} binding, finding \textbf{F05}), preventing a compromised governance set from tunnelling a different script under a correctly-signed upgrade message. Conditions (C9)--(C13) are enforced on the upgrade path with the same strength as on the advance path.
+\end{definition}
+
+\subsection{Proof System}
+
+\begin{definition}[BSVM Proof System]\label{def:proof-system}
+The BSVM proof system is mode-parametrised. For all three modes the inner proof is $\SPone[\revm]$, where $\SPone$ is a STARK-based zkVM proving RISC-V program execution and \revm{} is a Rust EVM interpreter compiled to a RISC-V ELF binary via the standard Rust/LLVM toolchain:
+\[
+    \SPone.\Prove(\mathsf{elf}_{\revm},\; (r_i, B)) \;\to\; \bigl(\pi_{\FRI},\; \mathsf{pv}\bigr)
+\]
+where $\mathsf{pv} = (r_i,\; r_{i+1},\; h_B,\; h_{\mathsf{receipts}},\; \mathsf{gas},\; \mathsf{cid},\; W)$ is the public-output tuple (pre-state root, post-state root, batch hash, receipts hash, gas used, chain ID, and withdrawal hash-chain commitment).
+
+The outer proof and on-chain verifier depend on the mode:
+\begin{description}[nosep,leftmargin=0em]
+    \item[Mode 1 (Basefold).] The outer proof is identical to the inner proof: $\pi^{(1)} = \pi_{\FRI}$. The on-chain verifier $\Verify_{\mathsf{Script}}^{(1)} = \Runar(\Verify_{\FRI})$ is a native FRI verifier compiled to Bitcoin Script.
+    \item[Mode 2 (Groth16).] The outer proof $\pi^{(2)} = (A, B, C, I_0, \ldots, I_4)$ is a BN254 Groth16 proof attesting, under a verifying key $\vkSP$ derived from the SP1 recursion circuit $\mathsf{circ}_{\SPone}$ bound to $\mathsf{elf}_{\revm}$, that there exists $\pi_{\FRI}$ with $\Verify_{\FRI}(\pi_{\FRI}, \mathsf{pv}) = 1$ and $I_0, I_1, I_2, I_4$ derive from $\mathsf{pv}$ per SP1's Groth16-wrapper public-input schedule. The on-chain verifier $\Verify_{\mathsf{Script}}^{(2)} = \Runar(\Verify_{\Groth})$ is the generic BN254 Groth16 verifier with $\vkSP$ carried as readonly constructor fields.
+    \item[Mode 3 (Groth16-WA).] The outer proof is the same as Mode 2. The on-chain verifier $\Verify_{\mathsf{Script}}^{(3)} = \Runar_{\mathrm{WA}}(\Verify_{\Groth};\, \vkSP)$ is the witness-assisted BN254 Groth16 verifier: $\vkSP$ is baked into a compile-time inlined preamble and the prover supplies a BN254 witness bundle (on-curve point witnesses, the $IC$ multi-scalar-multiplication binding, the $-A$ and $-\beta$ negations, and the precomputed $\alpha \cdot \beta$ Fp12 constant) at spend time, reducing the on-chain pairing equation to a single four-pairing $\mathsf{MultiPairing4}$ check with one pairing short-circuited to the $\alpha \cdot \beta$ value.
+\end{description}
+
+The compiled verifier $\Verify_{\mathsf{Script}}^{(k)}$ is embedded in the covenant locking script. It checks the proof and extracts $\mathsf{pv}$ (or, for $k \in \{2, 3\}$, asserts the extracted $\mathsf{pv}$ matches the $I_j$ bindings of \Cref{def:cov-advance}). The covenant then checks the extracted public values against on-chain data (conditions C2--C8, plus C9--C13 for $k \in \{2, 3\}$).
+\end{definition}
+
+\begin{remark}[Composition Stack]\label{rem:composition}
+The proof covers the following composition stack, each layer of which must be correct for the system to be sound. Layers marked [M2/3] apply only to Modes 2 and 3.
+\begin{enumerate}[nosep]
+    \item EVM semantics (defined by the Ethereum specification);
+    \item \revm{} implementation of EVM semantics (tested via VMTests/GeneralStateTests);
+    \item Rust-to-RISC-V compilation of \revm{} (via LLVM);
+    \item $\SPone$ RISC-V execution proving (STARK soundness);
+    \item[\textit{M2/3:}] SP1's Groth16-wrapper recursion circuit (the circuit that proves ``there exists a valid inner STARK proof'');
+    \item[\textit{M2/3:}] BN254 trusted-setup ceremony producing $\SRS$ (structured reference string), and deterministic derivation of $\vkSP$ from $\mathsf{circ}_{\SPone}$ under $\SRS$;
+    \item[\textit{M2/3:}] VK pinning: the $\vkSP$ baked into the locking script equals an allowlisted $\vkSP^* \in \VKAllow$ (mainnet policy) or a designated test fixture (other policies);
+    \item \Runar{} compilation of the mode-appropriate verifier to Bitcoin Script (FRI verifier for Mode 1, Groth16 BN254 verifier for Modes 2/3, with witness-assisted inlining for Mode 3);
+    \item BSV Script evaluation of the compiled verifier.
+\end{enumerate}
+A defect at any layer can compromise the system. Assumptions~\ref{ass:stark}--\ref{ass:script} collectively cover the Mode 1 layers; the Mode 2/3 layers are covered by \Cref{ass:groth,ass:vkpin} below. See \Cref{sec:composition-risk} for per-layer analysis.
+\end{remark}
+
+%% ============================================================
+\section{Assumptions}\label{sec:assumptions}
+%% ============================================================
+
+Every security property in \Cref{sec:properties} traces to a specific subset of these assumptions.
+
+\begin{assumption}[Composed STARK Soundness]\label{ass:stark}
+The $\SPone$ STARK proof system, instantiated over the specific RISC-V program $\mathsf{elf}_{\revm}$, has computational soundness: for any $\PPT$ adversary $\Adv$ and any statement $(r_i, r_{i+1}, h_B, \mathsf{cid})$ that is false (i.e., $r_{i+1} \neq \Exec_{\EVM}(r_i, B).\mathsf{root}$ for any $B$ with $\Hashd(B) = h_B$),
+\[
+    \Pr\!\left[\Adv(1^\lambda) \to \pi_{\FRI}^* : \Verify_{\FRI}(\pi_{\FRI}^*,\; \mathsf{pv}) = 1\right] \leq \negl(\lambda).
+\]
+This holds under the assumption that the hash function family used in the FRI protocol is collision-resistant and the $\SPone$ arithmetisation is correct. Under Mode 1 this assumption is directly load-bearing (the covenant checks $\pi_{\FRI}$ on-chain). Under Modes 2 and 3 it remains load-bearing because the SP1 Groth16 wrapper's inner proof is an $\SPone$ STARK; if $\SPone$ were unsound, the wrapper circuit could be satisfied for a false statement.
+\end{assumption}
+
+\begin{assumption}[Composed Groth16 Soundness over BN254]\label{ass:groth}
+The SP1 Groth16 wrapper, instantiated over the SP1 recursion circuit $\mathsf{circ}_{\SPone}$ and a structured reference string $\SRS$ produced by a BN254 trusted-setup ceremony, has computational soundness relative to $\SRS$: for any $\PPT$ adversary $\Adv$ and any statement $(r_i, r_{i+1}, h_B, \mathsf{cid})$ that is false,
+\[
+    \Pr\!\left[\Adv(1^\lambda,\, \SRS,\, \vkSP) \to \pi^* : \Verify_{\Groth}(\pi^*,\; I_0^*, \ldots, I_4^*;\, \vkSP) = 1 \wedge \textrm{F01/F08 hold}\right] \leq \negl(\lambda).
+\]
+This holds under:
+\begin{enumerate}[nosep,label=(\alph*)]
+    \item the generic-group / algebraic-group model over BN254 (Groth16 soundness; see~\cite{groth2016}); and
+    \item \emph{ceremony honesty}: the BN254 trusted-setup ceremony that produced $\SRS$ included at least one honest participant who destroyed their toxic-waste contribution. A fully adversarial ceremony permits $\Adv$ to produce valid-verifying proofs for false statements. BSVM does not run its own ceremony; it reuses SP1's production Groth16 ceremony, which is a one-of-many MPC with documented public contributions.
+\end{enumerate}
+``F01/F08 hold'' abbreviates the public-input-binding and scalar-range conditions (C9)--(C13) from \Cref{def:cov-advance}; without these bindings, a proof for one SP1 guest program could be trivially accepted as a proof for a different guest (the reduction from Groth16 soundness to state-transition integrity would not go through).
+\end{assumption}
+
+\begin{assumption}[VK Pinning Integrity]\label{ass:vkpin}
+For shards operating in Mode 2 or Mode 3 under the mainnet pinning policy, the SP1 verifying key $\vkSP$ baked into (or referenced by) the compiled locking script equals an allowlisted $\vkSP^* \in \VKAllow$. Formally, the compile-time pipeline enforces the check
+\[
+    \Hashd(\vkSP) \in \VKAllow \quad \Rightarrow \quad \text{compile succeeds},
+\]
+and no mainnet covenant can be produced where $\vkSP$ is adversary-chosen.
+
+This is a trust assumption on the build pipeline and on the integrity of $\VKAllow$ (a curated allowlist of SP1 verifying-key hashes corresponding to known-good $(\mathsf{circ}_{\SPone}, \SRS)$ pairs). It is mitigated structurally in Mode 3 by baking $\vkSP$ into the inlined Script preamble: any tampering with $\vkSP$ after compilation produces a covenant whose (C9) check, $I_0 = \rho(\vkSP)$, fails against proofs generated under the correct SP1 key, rendering the tampered covenant non-functional (denial-of-service rather than unsoundness). For Mode 2, the readonly VK fields occupy the same role structurally.
+\end{assumption}
+
+\begin{assumption}[Compiler Correctness]\label{ass:runar}
+For every verification mode $k \in \{1, 2, 3\}$, let $\Verify_{\mathsf{Script}}^{(k)} = \Runar^{(k)}(\Verify^{(k)})$ where $\Verify^{(1)} = \Verify_{\FRI}$ and $\Verify^{(2)} = \Verify^{(3)} = \Verify_{\Groth}$ (with Mode 3 additionally specialising the compilation via the witness-assisted VK inlining). Then for all inputs $(\pi, x)$ \emph{within the resource bounds of BSV Script execution} (stack depth, script size, opcode count):
+\[
+    \Verify^{(k)}(\pi, x) = 1 \iff \Verify_{\mathsf{Script}}^{(k)}(\pi, x) = 1
+\]
+Additionally, $\Verify_{\mathsf{Script}}^{(k)}$ extracts public values from $\pi$ identically to $\Verify^{(k)}$: if $\Verify^{(k)}$ extracts public values $\mathsf{pv}$ from $\pi$, then $\Verify_{\mathsf{Script}}^{(k)}$ extracts the same $\mathsf{pv}$.
+
+This is supported (but not formally proven) by the multi-implementation conformance property: four independent \Runar{} compilers (Go, Rust, TypeScript, Python) produce byte-identical Script output for the same source program. \emph{Conformance is evidence of consistency with a shared specification, not evidence of correctness of the specification itself.} All four implementations could agree on semantically incorrect output if the specification contains an error. This risk is mitigated by the diversity of implementation languages and teams but is not eliminable without formal verification of the \Runar{} specification against the underlying verifier specifications (FRI for Mode 1, Groth16/BN254 for Modes 2/3).
+
+\emph{Resource bound requirement}: The compiled verifier must execute within BSV's Script resource limits. If a valid proof $\pi$ causes $\Verify_{\mathsf{Script}}^{(k)}$ to exceed resource limits, the covenant will reject a valid transition. This is primarily a liveness concern: the system fails safe by rejecting the advance. However, if resource limits vary by proof structure, an adversary may bias execution toward transitions whose proofs are ``cheap to verify,'' creating a \emph{selective validity surface}: only a subset of valid transitions are admissible on-chain. This does not compromise safety (no invalid transition is accepted) but may constrain the set of reachable states in ways that interact with economic incentives. The verifier must therefore be designed to verify all valid proofs within resource limits uniformly, and this uniformity should be validated empirically. The risk profile differs by mode: Mode 3's inlined Groth16 verifier is substantially smaller than the Mode 1 FRI verifier, reducing both the selective-validity surface and the compiler attack surface.
+\end{assumption}
+
+\begin{assumption}[Execution Faithfulness]\label{ass:evm}
+The RISC-V binary $\mathsf{elf}_{\revm}$, produced by compiling \revm{} via the Rust/LLVM toolchain, faithfully implements EVM semantics: for all pre-states $r_i$ and batches $B$:
+\[
+    \mathsf{elf}_{\revm}(r_i, B) = \Exec_{\EVM}(r_i, B)
+\]
+
+\emph{This is an empirical assumption, not a formally proven equivalence.} It is supported by two independent mechanisms:
+\begin{enumerate}[nosep,label=(\alph*)]
+    \item Native \revm{} passes 100\% of the Ethereum Foundation's VMTests and GeneralStateTests---the canonical conformance suite, but not a complete specification of all reachable states;
+    \item The Rust-to-RISC-V compilation preserves semantics under standard compiler correctness for the LLVM backend targeting RISC-V---a production compiler with a strong but not formally verified correctness record.
+\end{enumerate}
+Condition (a) provides high-coverage evidence that \revm{} correctly implements EVM semantics, but does not exclude divergence on untested execution paths or undefined-behaviour edge cases. Condition (b) provides high-confidence evidence that the RISC-V binary faithfully represents \revm{}, subject to the absence of miscompilation bugs in the LLVM RISC-V backend. Together they provide strong empirical justification for the assumption but do not constitute a formal proof. A formally verified EVM implementation or a verified compiler backend would strengthen this assumption to a theorem.
+\end{assumption}
+
+\begin{assumption}[Hash Binding]\label{ass:cr}
+Both $\Hashd = \mathsf{SHA256d}$ (double SHA-256) and $\Hashs = \mathsf{SHA256}$ (single SHA-256) are collision-resistant: for any $\PPT$ adversary $\Adv$ and $\mathsf{H} \in \{\Hashd, \Hashs\}$,
+\[
+    \Pr\!\left[\Adv(1^\lambda) \to (x, x') : x \neq x' \wedge \mathsf{H}(x) = \mathsf{H}(x')\right] \leq \negl(\lambda).
+\]
+We refer to this joint assumption as \emph{hash binding}. $\Hashd$ is used for batch-data binding and BSV tx hashing; $\Hashs$ is used for the SP1 committed-values-digest reduction.
+\end{assumption}
+
+\begin{assumption}[Consensus Safety]\label{ass:bsv-safety}
+BSV provides safety under honest-majority mining: no $\PPT$ adversary controlling less than 50\% of hash power can cause a confirmed transaction (depth $\geq k$, typically $k=6$) to be reversed, except with negligible probability. A minority of adversarial miners may selectively delay or deprioritise transactions but cannot reverse confirmed ones.
+\end{assumption}
+
+\begin{assumption}[Script Correctness]\label{ass:script}
+All BSV nodes enforce Script evaluation faithfully. $\mathsf{OP\_CHECKSEQUENCEVERIFY}$, $\mathsf{OP\_PUSH\_TX}$, $\mathsf{OP\_HASH256}$, and all arithmetic and hash opcodes execute according to the BSV protocol specification. In particular, the covenant locking script $\Cov$ and the forced-inclusion inbox covenant are evaluated correctly.
+\end{assumption}
+
+\begin{assumption}[Proof Non-Malleability]\label{ass:non-malleable}
+Given a valid proof $\pi$ with public values $\mathsf{pv}$, no $\PPT$ adversary can produce $\pi' \neq \pi$ such that $\Verify^{(k)}(\pi', \mathsf{pv}') = 1$ for $\mathsf{pv}' \neq \mathsf{pv}$, except by generating a fresh proof for a valid statement.
+\begin{itemize}[nosep]
+    \item For Mode 1, this is a standard property of STARK proofs: the proof is bound to its public values via the Merkle commitment structure of the FRI protocol.
+    \item For Modes 2 and 3, this follows from Groth16 soundness (\Cref{ass:groth}) as applied to the public-input slots $I_0, \ldots, I_4$: a pairing equation that verifies for inputs $(I_0', \ldots, I_4')$ is a fresh proof, and forging it requires breaking Groth16 over BN254. Note Groth16 proofs admit a limited randomisation of $(A, B, C)$ that preserves $(I_0, \ldots, I_4)$; this \emph{does not} constitute malleability in our sense because the public values are unchanged.
+\end{itemize}
+\end{assumption}
+
+\begin{remark}[Consensus Liveness]\label{rem:liveness-assumption}
+We additionally require for liveness properties that BSV provides liveness: any valid transaction broadcast to the network is included in a block within bounded time $\Delta_{\BSV}$, provided it pays the minimum relay fee and the network is synchronous. This is not numbered as a security assumption because safety properties do not depend on it. However, a minority of adversarial miners may selectively delay specific transactions for up to $\Delta_{\BSV}$; this is addressed in \Cref{sec:miner-censorship}.
+\end{remark}
+
+\begin{remark}[Assumption Boundary]\label{rem:boundary}
+We do \emph{not} assume correctness of any specific EVM smart contract deployed on the L2. The proof system guarantees that the EVM executed the deployed bytecode correctly---it does not guarantee that the bytecode implements the programmer's intent. A bug in a deployed contract (including the bridge contract) will be faithfully proven. This boundary applies to every validity-proven rollup, not only BSVM.
+\end{remark}
+
+%% ============================================================
+\section{Adversary Model}\label{sec:adversary}
+%% ============================================================
+
+\begin{definition}[Adversary]\label{def:adversary}
+The adversary $\Adv$ is a $\PPT$ algorithm that may:
+\begin{enumerate}[nosep,label=(A\arabic*)]
+    \item \textbf{Corrupt provers:} control any subset $\mathcal{P}' \subseteq \mathcal{P}$, including all provers ($\mathcal{P}' = \mathcal{P}$).
+    \item \textbf{Adaptively corrupt participants:} corrupt additional provers and users during execution.
+    \item \textbf{Collude with minority miners:} coordinate with a minority ($< 50\%$) of BSV miners to delay, deprioritise, or selectively exclude unconfirmed transactions.
+    \item \textbf{Inject transactions:} submit arbitrary signed EVM transactions to any prover or to the forced-inclusion inbox.
+    \item \textbf{Submit malformed batches:} construct batches with invalid transactions or incorrect ordering.
+    \item \textbf{Observe all public data:} read the full EVM state, all BSV transactions, batch data, and proofs.
+    \item \textbf{Race for covenant spends:} broadcast competing covenant-advance transactions.
+    \item \textbf{Attempt proof forgery:} submit purported STARK proofs to the covenant.
+    \item \textbf{Attempt proof modification:} modify a valid proof $\pi$ to produce $\pi'$ with different public values.
+    \item \textbf{Attempt bridge theft:} construct BSV transactions attempting to spend bridge sub-covenant UTXOs, including double-withdrawal attempts.
+    \item \textbf{Withhold, delay, or reorder:} delay own submissions and reorder transactions within batches.
+    \item \textbf{Attempt censorship and front-running:} exclude specific user transactions or reorder for profit.
+    \item \textbf{Exploit governance:} (for governed shards) attempt to compromise guardian keys to freeze or maliciously upgrade the covenant.
+    \item \textbf{Attempt VK substitution:} (Modes 2/3) attempt to cause a mainnet covenant to be compiled against an adversary-chosen $\vkSP$, or attempt to tamper with $\vkSP$ after compilation.
+    \item \textbf{Participate in the BN254 ceremony:} (Modes 2/3) participate as one of many contributors in the BN254 trusted-setup ceremony.
+\end{enumerate}
+
+The adversary \emph{cannot}:
+\begin{enumerate}[nosep,label=(N\arabic*)]
+    \item Break STARK soundness except with negligible probability (\Cref{ass:stark}).
+    \item (Modes 2/3) Break Groth16 soundness over BN254 except with negligible probability (\Cref{ass:groth}).
+    \item Forge hash collisions except with negligible probability (\Cref{ass:cr}).
+    \item Violate base-layer consensus safety (\Cref{ass:bsv-safety}).
+    \item Cause Script evaluation to deviate from protocol rules (\Cref{ass:script}).
+    \item Produce malleable proofs with altered public values (\Cref{ass:non-malleable}).
+    \item (Modes 2/3) Bypass VK pinning on mainnet builds (\Cref{ass:vkpin}).
+    \item (Modes 2/3) Subvert the BN254 trusted-setup ceremony to the point that no honest contribution exists (\Cref{ass:groth}(b)).
+    \item (For governed shards) Corrupt $\geq M$ of $M$-of-$N$ guardian keys.
+\end{enumerate}
+\end{definition}
+
+%% ============================================================
+\section{Security Properties}\label{sec:properties}
+%% ============================================================
+
+\subsection{Intermediate Lemmas}
+
+\begin{lemma}[Proof Binding]\label{lem:proof-bind}
+If $\Verify_{\mathsf{Script}}^{(k)}(\pi_{i+1};\,\vkSP) = 1$ and the covenant conditions (C1)--(C13 where applicable) of \Cref{def:cov-advance} hold, then with overwhelming probability:
+\[
+    (r_{i+1}, O) = \Exec_{\EVM}(r_i, B)
+\]
+where $r_i$, $r_{i+1}$, and $h_B$ are the public values extracted from $\pi_{i+1}$ by $\Verify_{\mathsf{Script}}^{(k)}$ (or, for $k \in \{2, 3\}$, the $\mathsf{pv}$ byte string to which the public inputs $I_0, I_1$ are bound via conditions C9--C10).
+\end{lemma}
+
+\begin{proof}
+By \Cref{ass:runar}, the Script-compiled verifier under mode $k$ accepts if and only if the specification-level verifier $\Verify^{(k)}$ accepts, and extracts identical public values.
+
+\emph{Mode 1.} By \Cref{ass:stark}, acceptance of $\Verify_{\FRI}$ implies the attested $\SPone$ execution trace is correct except with negligible probability. The trace proves that $\mathsf{elf}_{\revm}$ executed on inputs $(r_i, B)$ and produced outputs $(r_{i+1}, O)$.
+
+\emph{Modes 2 and 3.} By \Cref{ass:groth}, acceptance of $\Verify_{\Groth}$ under $\vkSP$ with public inputs $(I_0, \ldots, I_4)$ implies the existence of an inner $\pi_{\FRI}^*$ with $\Verify_{\FRI}(\pi_{\FRI}^*, \mathsf{pv}^*) = 1$ where $\mathsf{pv}^*$ is consistent with $(I_0, \ldots, I_4)$ under SP1's public-input schedule. Condition (C9), $I_0 = \rho(\vkSP)$, pins the accepted $\pi_{\FRI}^*$ to the specific SP1 guest program identified by $\vkSP$; \Cref{ass:vkpin} gives $\vkSP \in \VKAllow$ corresponding to $\mathsf{elf}_{\revm}$. Condition (C10), $I_1 = \rho(\mathsf{pv})$, pins the proof to the on-chain-committed public-values byte string; by \Cref{ass:cr} (applied to $\Hashs$), a collision would be required to substitute different $\mathsf{pv}$. Conditions (C11), (C12), and (C13) close residual degrees of freedom in the wrapper's public-input schedule (exit code, vkRoot, scalar range). Together, acceptance implies a valid inner $\SPone$ trace on $(r_i, B)$ with the committed $\mathsf{pv}$; \Cref{ass:stark} then gives the execution-correctness conclusion as in Mode 1.
+
+In both cases, by \Cref{ass:evm}, $\mathsf{elf}_{\revm}(r_i, B) = \Exec_{\EVM}(r_i, B)$, so the outputs correspond to correct EVM execution. \qedhere
+\end{proof}
+
+\begin{lemma}[Batch Consistency]\label{lem:batch}
+If a covenant advance is accepted, then the batch used in proof verification equals the batch published on-chain.
+\end{lemma}
+
+\begin{proof}
+Covenant condition (C6) enforces $\Hashd(B_{\mathsf{on\text{-}chain}}) = \pi_{i+1}.\mathsf{batch\_hash}$, where the left side is computed on-chain via $\mathsf{OP\_HASH256}$ and the right side is the value extracted from $\pi_{i+1}$ by $\Verify_{\mathsf{Script}}$. The $\SPone$ guest program commits $h_B = \Hashd(B)$ as a public value, where $B$ is the batch it executed. By \Cref{ass:non-malleable}, the adversary cannot modify the proof to change the committed batch hash without producing a fresh valid proof. If $B_{\mathsf{on\text{-}chain}} \neq B$ yet $\Hashd(B_{\mathsf{on\text{-}chain}}) = \Hashd(B)$, this constitutes a collision, contradicting \Cref{ass:cr}. \qedhere
+\end{proof}
+
+\begin{lemma}[Single Successor]\label{lem:single}
+At most one valid successor state can be confirmed for a given $U_i$.
+\end{lemma}
+
+\begin{proof}
+$U_i$ is a BSV UTXO. A UTXO can be spent exactly once---this is the fundamental UTXO invariant enforced by BSV consensus. If two competing transactions attempt to spend $U_i$, miners accept exactly one. By \Cref{ass:bsv-safety}, after $k$ confirmations the spend is irreversible. \qedhere
+\end{proof}
+
+\begin{lemma}[Withdrawal Uniqueness]\label{lem:withdrawal-unique}
+Each withdrawal event can be claimed at most once from the bridge.
+\end{lemma}
+
+\begin{proof}
+Withdrawal claims are serialised through the bridge sub-covenant UTXO spending mechanism. Each bridge sub-covenant UTXO $B_j$ encodes a withdrawal nonce $\mathsf{nonce}_j$ in its locking script. A withdrawal claim must spend $B_j$, incrementing $\mathsf{nonce}_j$ to $\mathsf{nonce}_j + 1$ in the successor output $B_j'$. Because $B_j$ is a UTXO, it can be spent exactly once (UTXO invariant); the successor $B_j'$ encodes the incremented nonce. A repeated claim for the same withdrawal event at the same nonce would require spending an already-spent UTXO, which BSV consensus rejects.
+
+Cross-sub-covenant uniqueness is enforced by binding each withdrawal event to a specific sub-covenant at the L2 contract level: the bridge contract assigns each withdrawal to a sub-covenant index $j$ (e.g., round-robin or balance-weighted), and this index is included in the withdrawal event data committed under $W$ (\Cref{def:wd-event-commitment}). The sub-covenant script verifies that the withdrawal event's target index matches its own index $j$. A withdrawal intended for $B_j$ cannot be claimed at $B_{j'}$ because the index check fails. By \Cref{ass:script}, these checks are evaluated faithfully. \qedhere
+\end{proof}
+
+
+\subsection{Property 1: State Transition Integrity}
+
+\begin{definition}[State Transition Integrity]\label{def:sti}
+For any $\PPT$ adversary $\Adv$, the probability that a confirmed covenant advance from $U_i$ to $U_{i+1}$ embeds a post-state root $r_{i+1}$ such that
+\[
+    r_{i+1} \neq \Exec_{\EVM}(r_i, B_{\mathsf{on\text{-}chain}}).\mathsf{root}
+\]
+is negligible in $\lambda$.
+\end{definition}
+
+\begin{theorem}[State Transition Integrity]\label{thm:sti}
+Under Assumptions~\ref{ass:stark}--\ref{ass:non-malleable}, and additionally (for $k \in \{2, 3\}$) \Cref{ass:groth,ass:vkpin}, BSVM satisfies state transition integrity.
+\end{theorem}
+
+\begin{proof}
+Assume a violation. Then either:
+\begin{enumerate}[nosep]
+    \item A false execution is accepted $\Rightarrow$ contradicts \Cref{lem:proof-bind}.
+    \item Batch mismatch occurs $\Rightarrow$ contradicts \Cref{lem:batch}.
+    \item Covenant rules are bypassed $\Rightarrow$ contradicts \Cref{ass:script}.
+\end{enumerate}
+Thus violation occurs only with negligible probability. \qedhere
+\end{proof}
+
+
+\subsection{Property 2: Canonical State Uniqueness}
+
+\begin{definition}[Canonical State Uniqueness]\label{def:unique}
+At any settled height $i$ (i.e., after $k$ BSV confirmations), there exists exactly one unspent canonical covenant UTXO per shard.
+\end{definition}
+
+\begin{theorem}[Canonical State Uniqueness]\label{thm:unique}
+Under \Cref{ass:bsv-safety}, BSVM ensures canonical state uniqueness.
+\end{theorem}
+
+\begin{proof}
+Follows from \Cref{lem:single}. The UTXO invariant guarantees exactly one successor. Covenant condition (C4) enforces sequential block numbering, preventing gaps. The result is a linear chain with no forks and no gaps after settlement depth $k$. \qedhere
+\end{proof}
+
+\begin{remark}[Pre-Confirmation Window]\label{rem:preconf}
+Before $k$ confirmations, BSV's unconfirmed chain may contain multiple competing spends of $U_i$. During this window, the canonical successor is not yet determined. Users relying on unconfirmed state transitions accept reorg risk bounded by $\Pr[\text{reorg at depth } d]$, which decreases exponentially with $d$ under honest-majority mining. For applications requiring immediate finality, users should wait for $k$ confirmations. The security model's integrity guarantees apply only to confirmed (depth $\geq k$) transitions.
+\end{remark}
+
+
+\subsection{Property 3: Data Availability Binding}
+
+\begin{definition}[Data Availability Binding]\label{def:da}
+For any accepted transition, the batch used in proof verification equals the batch reconstructable from on-chain data.
+\end{definition}
+
+\begin{theorem}[Data Availability Binding]\label{thm:da}
+Under Assumptions~\ref{ass:cr},~\ref{ass:bsv-safety}, and~\ref{ass:non-malleable}, BSVM satisfies data availability binding.
+\end{theorem}
+
+\begin{proof}
+Direct consequence of \Cref{lem:batch}. Batch data is published in the OP\_RETURN output of the covenant advance transaction with the exact format specified in \Cref{def:da-output} (\texttt{"BSVM\textbackslash x02"} magic plus payload). Covenant condition (C7) verifies the output structure via $\mathsf{hashOutputs}$ from the sighash preimage; R\'{u}nar's \texttt{AddDataOutput} intrinsic folds the DA output into the covenant's continuation-hash commitment, making the OP\_RETURN script cryptographically required to appear verbatim in the spending transaction. By \Cref{ass:bsv-safety}, confirmed transactions are permanent. The batch is therefore permanently available and verifiably bound to the proof. \qedhere
+\end{proof}
+
+\begin{remark}
+This is a stronger data availability guarantee than systems using off-chain data availability committees. The data is on-chain, matched against the expected OP\_RETURN shape via the continuation-hash check, and cryptographically bound to the validity proof.
+\end{remark}
+
+
+\subsection{Property 4: Bridge Conservation}
+
+\begin{definition}[Bridge Conservation]\label{def:bridge-cons}
+Total value released by the bridge does not exceed value deposited plus the aggregate of valid, uniquely-claimed, state-transition-authorised withdrawals. Formally: no $\PPT$ adversary can cause BSV to be released from a bridge sub-covenant $B_j$ unless:
+\begin{enumerate}[nosep,label=(\roman*)]
+    \item there exists a confirmed covenant advance embedding a withdrawal commitment $W$ (\Cref{def:wd-event-commitment});
+    \item the withdrawal event is included under $W$ (verified by hash-chain membership proof);
+    \item the withdrawal has not been previously claimed (\Cref{lem:withdrawal-unique});
+    \item the CSV timelock for the applicable withdrawal tier has expired;
+    \item the withdrawal has not been frozen by guardians (if governance is enabled).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Bridge Conservation]\label{thm:bridge-cons}
+Under Assumptions~\ref{ass:stark}--\ref{ass:non-malleable}, and additionally (for $k \in \{2, 3\}$) \Cref{ass:groth,ass:vkpin}, BSVM preserves bridge conservation.
+\end{theorem}
+
+\begin{proof}
+The bridge sub-covenant script requires: a validity proof (establishing a valid state advance committing the withdrawal commitment $W$), a hash-chain membership proof (establishing the withdrawal event under $W$), a withdrawal uniqueness check (via the bridge nonce and nullifier chain $\omega_j$, \Cref{lem:withdrawal-unique}), and CSV timelock satisfaction (enforced by BSV consensus via $\mathsf{OP\_CHECKSEQUENCEVERIFY}$).
+
+To release BSV without a valid withdrawal, the adversary must either: (a)~forge the SP1 proof (contradicting \Cref{ass:stark} via \Cref{ass:runar} for Mode 1, or \Cref{ass:groth} together with \Cref{ass:vkpin} via \Cref{ass:runar} for Modes 2/3), (b)~forge a hash-chain membership proof for an event not in the committed chain (contradicting \Cref{ass:cr}), (c)~claim the same withdrawal twice (contradicting \Cref{lem:withdrawal-unique} via \Cref{ass:script}), (d)~modify a valid proof to alter the withdrawal commitment (contradicting \Cref{ass:non-malleable}), or (e)~bypass the CSV timelock (contradicting \Cref{ass:bsv-safety} and \Cref{ass:script}). Each occurs with negligible probability. \qedhere
+\end{proof}
+
+\begin{remark}[Contract Logic Boundary]\label{rem:contract}
+Bridge conservation as defined above is conservation of the \emph{covenant mechanism}. If the L2 bridge \emph{contract} (the Solidity code that burns wBSV and emits withdrawal events) contains a logic bug, the STARK proof will faithfully prove the buggy execution, and the bridge covenant will release BSV for a withdrawal event that was correctly computed by a flawed contract. This is inherent to all validity-proven rollups. Defence-in-depth measures (rate limiting at 10\% of TVL per period, guardian freeze, sharded bridge UTXOs capped at 100~BSV each) bound the damage from contract bugs but do not eliminate the residual risk.
+\end{remark}
+
+
+\subsection{Property 5: Bridge Liveness}
+
+\begin{definition}[Bridge Liveness]\label{def:bridge-live}
+For any valid withdrawal event included in a confirmed batch, the user can claim the corresponding BSV within bounded time, provided BSV liveness holds and the withdrawal is not frozen by guardians.
+\end{definition}
+
+\begin{theorem}[Bridge Liveness]\label{thm:bridge-live}
+Under BSV liveness (\Cref{rem:liveness-assumption}) and the condition that at least one honest relayer exists, BSVM satisfies bridge liveness.
+\end{theorem}
+
+\begin{proof}
+Given a confirmed covenant advance containing the withdrawal commitment $W$, any party (user or relayer) can construct the BSV spending transaction providing the hash-chain membership proof. By BSV liveness, this is confirmed within $\Delta_{\BSV}$. After CSV timelock expiry, the withdrawal output is spendable. Total claim time is bounded by $\Delta_{\BSV} + \Delta_{\mathsf{CSV}}$, where $\Delta_{\mathsf{CSV}}$ is tier-dependent (6 blocks for $\leq$10~BSV, 20 blocks for $\leq$100~BSV, 100 blocks for $>$100~BSV). \qedhere
+\end{proof}
+
+\begin{remark}
+For governed shards, guardians can freeze withdrawals during the CSV period, trading liveness for an additional safety buffer. This creates a tension: governance improves recoverability but introduces a liveness dependency on guardian honesty.
+\end{remark}
+
+
+\subsection{Property 6: Censorship Resistance}
+
+\begin{definition}[Forced-Inclusion Inbox]\label{def:inbox}
+The forced-inclusion inbox is a BSV covenant UTXO that any user can spend to submit a signed EVM transaction on-chain. The inbox covenant enforces: (a) the submitted transaction is well-formed (valid signature, non-zero gas); (b) the transaction is recorded with a timestamp or sequence number indicating the covenant-advance height at which it was submitted. The state covenant $\Cov$ enforces: if any inbox transaction has age $\geq \delta$ advances (i.e., was submitted at or before advance $i - \delta$), then advance $i+1$ \emph{must} include that transaction in $B$, or $\Cov$ rejects the advance. The parameter $\delta \in \mathbb{N}$ is fixed at shard genesis (typical values: $\delta \in [5, 50]$).
+\end{definition}
+
+\begin{definition}[Censorship Resistance]\label{def:censor}
+For any valid signed EVM transaction $\mathsf{tx}$ submitted by a user, $\mathsf{tx}$ is included in the shard's state within bounded time, even if all shard provers collude to exclude it.
+\end{definition}
+
+\begin{theorem}[Censorship Resistance]\label{thm:censor}
+Under BSV liveness, \Cref{ass:script} (applied to both the state covenant and the forced-inclusion inbox covenant), and shard liveness (\Cref{subsec:liveness}), BSVM satisfies censorship resistance.
+\end{theorem}
+
+\begin{proof}
+The forced-inclusion inbox is a BSV covenant that any user can spend to submit an EVM transaction on-chain. The state covenant enforces: if an inbox transaction is older than $\delta$ covenant advances, the next advance \emph{must} include it, or the covenant rejects the advance. This enforcement is part of the covenant locking script and is subject to \Cref{ass:script}.
+
+If all provers censor $\mathsf{tx}$: the user submits $\mathsf{tx}$ to the inbox on BSV (confirmed within $\Delta_{\BSV}$). After $\delta$ further advances, any prover must include $\mathsf{tx}$ or be unable to advance. This creates a \emph{conditional forcing mechanism}: the prover is forced to include the transaction as a precondition for earning any batch revenue. The mechanism is effective as long as the aggregate batch revenue (including all other transactions) exceeds the cost of including the forced transaction. If forced inclusion imposes costs exceeding batch revenue (e.g., a deliberately expensive forced transaction), a rational prover may choose not to advance, degrading liveness rather than censoring.
+
+Inclusion bound: $\Delta_{\BSV} + \delta \cdot \Delta_{\mathsf{batch}}$, where $\Delta_{\mathsf{batch}}$ is the average inter-advance time and $\delta$ is the forced-inclusion deadline defined in \Cref{def:inbox}. \qedhere
+\end{proof}
+
+\begin{remark}
+Censorship resistance depends on two distinct mechanisms: the forced-inclusion inbox (a Script covenant, subject to \Cref{ass:script}) and shard liveness (an economic condition). If either fails---inbox covenant bug or no active prover---censorship resistance degrades. If \emph{no} prover advances the covenant, the forced-inclusion mechanism cannot force inclusion.
+\end{remark}
+
+
+\subsection{Property 7: Cross-Shard Isolation}
+
+\begin{definition}[Cross-Shard Isolation]\label{def:shard-iso}
+A compromise of shard $s$ (including complete corruption of all provers and exploitation of any contract bug) cannot cause loss of funds in any other shard $s' \neq s$. Actions on shard $s$ cannot directly alter $\Sigma_{s'}$ or its bridge state except via explicitly verified cross-shard mechanisms.
+\end{definition}
+
+\begin{theorem}[Cross-Shard Isolation]\label{thm:shard-iso}
+Under Assumptions~\ref{ass:cr},~\ref{ass:bsv-safety}, and~\ref{ass:script}, and the administrative requirement that each shard is assigned a globally unique chain ID at genesis, BSVM satisfies cross-shard isolation.
+\end{theorem}
+
+\begin{proof}
+Each shard maintains an independent covenant chain identified by a unique chain ID and its own bridge sub-covenant UTXOs. Covenant condition (C5) enforces chain ID binding: a proof generated for shard $s$ cannot advance the covenant of shard $s'$ because the proof commits to $\mathsf{cid}_s$ and the covenant of $s'$ checks against $\mathsf{cid}_{s'}$; matching requires $\mathsf{cid}_s = \mathsf{cid}_{s'}$, which contradicts uniqueness of chain IDs (an administrative invariant enforced at shard creation, not a cryptographic assumption). Bridge UTXOs for shard $s$ are locked to shard $s$'s covenant chain. A compromise of shard $s$ can at most drain $s$'s own bridge UTXOs. By \Cref{ass:bsv-safety}, the adversary cannot retroactively modify $s'$'s covenant chain. \qedhere
+\end{proof}
+
+\begin{remark}[Shared Infrastructure]\label{rem:shared-infra}
+All shards share the BSV base layer. A 51\% attack on BSV would compromise \emph{all} shards simultaneously by violating \Cref{ass:bsv-safety}. Cross-shard isolation is therefore isolation \emph{conditional on BSV consensus safety}---it protects against shard-level compromise, not base-layer compromise. This is analogous to how Ethereum L2s share Ethereum's consensus as a common dependency.
+\end{remark}
+
+
+\subsection{Property 8: Conditional Liveness}\label{subsec:liveness}
+
+\begin{definition}[Conditional Liveness]\label{def:shard-live}
+A shard is \emph{live} if: for any submitted EVM transaction $\mathsf{tx}$ (via a prover or the forced-inclusion inbox), $\mathsf{tx}$ is included in a confirmed covenant advance within bounded time.
+\end{definition}
+
+\begin{proposition}[Economic Liveness Condition]\label{prop:liveness}
+Shard liveness holds if:
+\begin{enumerate}[nosep,label=(\alph*)]
+    \item at least one prover $P_j$ finds it economically rational to generate proofs and broadcast covenant-advance transactions, which requires
+\[
+    \sum_{\mathsf{tx} \in B} \mathsf{gasFee}(\mathsf{tx}) > \mathsf{L1Cost}(B) + \mathsf{ProveCost}(B);
+\]
+    \item the prover has network connectivity to broadcast the covenant-advance transaction;
+    \item BSV liveness holds (\Cref{rem:liveness-assumption}).
+\end{enumerate}
+If no prover satisfies (a)--(c), the shard halts but no funds are lost: the state is frozen at the last confirmed $r_i$, all batch data is permanently available on BSV, and bridge withdrawals for events already committed remain claimable.
+\end{proposition}
+
+\begin{remark}
+Liveness is economic, not cryptographic. The security properties (integrity, conservation, isolation) hold unconditionally regardless of prover activity. This is a direct consequence of removing privileged operators: no entity is obligated to advance the chain.
+\end{remark}
+
+\begin{remark}[Governance Scope of Properties]\label{rem:gov-scope}
+The security properties in this section hold at full strength only in \texttt{none} governance mode, where no entity can alter the covenant. In governed modes (\texttt{single\_key} or \texttt{multisig}):
+\begin{itemize}[nosep]
+    \item \emph{State transition integrity} holds while the shard is active (unfrozen). A malicious upgrade can violate it post-unfreeze (\Cref{prop:gov-upgrade}).
+    \item \emph{Bridge conservation} holds while the covenant is unmodified. A backdoored upgrade can drain bridge funds.
+    \item \emph{Censorship resistance} degrades: governance can freeze the shard, halting all advances.
+    \item \emph{Cross-shard isolation}, \emph{canonical state uniqueness}, and \emph{data availability binding} are unaffected by governance (they depend only on base-layer properties).
+\end{itemize}
+All governance actions require a visible on-chain freeze, providing users a window to exit before an upgrade takes effect. For $k \in \{2, 3\}$ on mainnet, a governance-initiated \texttt{upgrade} must still satisfy the VK-pinning precondition of \Cref{ass:vkpin} when the \emph{new} locking script is compiled: a compromised governance set cannot deploy a Mode 3 verifier against an attacker-chosen $\vkSP$ without also subverting the allowlist $\VKAllow$.
+\end{remark}
+
+
+%% ============================================================
+\section{System Security Theorem}\label{sec:main}
+%% ============================================================
+
+\begin{theorem}[System Security]\label{thm:system}
+Under Assumptions~\ref{ass:stark}--\ref{ass:non-malleable}, and additionally (for $k \in \{2, 3\}$) \Cref{ass:groth,ass:vkpin}, for any $\PPT$ adversary $\Adv$, the probability that:
+\begin{enumerate}[nosep]
+    \item the shard state advances incorrectly; or
+    \item assets are created or released without authorisation; or
+    \item a withdrawal is claimed more than once
+\end{enumerate}
+is negligible in $\lambda$.
+\end{theorem}
+
+\begin{proof}
+Follows from Theorems~\ref{thm:sti} and~\ref{thm:bridge-cons} and \Cref{lem:withdrawal-unique}. Any violation reduces to one of:
+\begin{enumerate}[nosep,label=(\roman*)]
+    \item breaking composed STARK soundness (\Cref{ass:stark});
+    \item (Modes 2/3) breaking Groth16 soundness over BN254 or subverting the ceremony (\Cref{ass:groth});
+    \item (Modes 2/3) bypassing VK pinning on mainnet (\Cref{ass:vkpin});
+    \item exploiting a compiler defect in \Runar{} (\Cref{ass:runar});
+    \item exploiting a divergence between $\mathsf{elf}_{\revm}$ and EVM semantics (\Cref{ass:evm});
+    \item forging a hash collision (\Cref{ass:cr});
+    \item violating base-layer consensus (\Cref{ass:bsv-safety});
+    \item causing Script to deviate from specification (\Cref{ass:script}); or
+    \item producing a malleable proof with altered public values (\Cref{ass:non-malleable}).
+\end{enumerate}
+Items (i), (ii), (vi), (vii), and (ix) hold with cryptographic strength (negligible probability under standard assumptions; item (ii) additionally requires at least one honest BN254-ceremony contribution). Items (iv) and (viii) hold under protocol correctness assumptions supported by multi-implementation conformance and node implementation maturity respectively. Item (iii) is a build-pipeline trust assumption mitigated structurally in Mode 3 by inlining $\vkSP$. Item (v) holds under an empirical assumption (\Cref{ass:evm}) supported by test suite coverage and compiler maturity but not by formal proof. The overall security guarantee is therefore as strong as the weakest link: empirically justified with high confidence, but not formally proven at the execution faithfulness layer, and for Modes 2/3 also dependent on the integrity of the BN254 ceremony reused from SP1. \qedhere
+\end{proof}
+
+
+%% ============================================================
+\section{Composition Risk Analysis}\label{sec:composition-risk}
+%% ============================================================
+
+The security of BSVM depends on the correctness of a multi-layer composition stack (\Cref{rem:composition}). We classify each layer by its verification status and residual risk.
+
+\begin{table}[h]
+\centering
+\caption{Composition stack: verification status and residual risk. Rows marked [M2/3] apply only to Modes 2 and 3.}
+\label{tab:composition}
+\begin{tabular}{@{}l l p{4.5cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Verification} & \textbf{Residual risk} \\
+\midrule
+EVM semantics & Ethereum Yellow Paper & Specification ambiguity in edge cases \\
+\addlinespace
+\revm{} implementation & VMTests, GeneralStateTests (100\% pass) & Untested execution paths not covered by the test suite \\
+\addlinespace
+Rust $\to$ RISC-V (LLVM) & Production compiler, widely deployed & Compiler miscompilation bugs \\
+\addlinespace
+$\SPone$ arithmetisation & Four independent audits & Circuit bugs, undiscovered soundness errors \\
+\addlinespace
+{[}M2/3{]} $\SPone$ Groth16 wrap circuit $\mathsf{circ}_{\SPone}$ & Part of SP1 audits & Circuit bugs in the recursive FRI-verification wrapper \\
+\addlinespace
+{[}M2/3{]} BN254 trusted-setup ceremony ($\SRS$) & One-of-many MPC; public contributions & All contributors colluding (vanishingly unlikely but possible) \\
+\addlinespace
+{[}M2/3{]} VK pinning ($\vkSP \in \VKAllow$) & Compile-time allowlist check; Mode 3 structurally binds via inlined preamble + C9 & Build-pipeline subversion; allowlist curation errors \\
+\addlinespace
+\Runar{} $\to$ Script (mode-specific verifier) & Multi-implementation conformance per verifier & Shared specification bug across all four compilers for the emitted verifier variant \\
+\addlinespace
+BSV Script evaluation & Node implementation & Node software bugs, consensus splits \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}
+A shared specification bug in the \Runar{} compilers---where all four implementations agree on incorrect output---is the most subtle risk, as it would not be detected by conformance testing. This risk is mitigated (but not eliminated) by the diversity of implementation languages and teams. The risk surface differs by mode: the Mode 1 FRI verifier is substantially larger than the Mode 3 witness-assisted Groth16 verifier, correspondingly widening the Mode 1 specification-bug surface.
+\end{remark}
+
+
+%% ============================================================
+\section{Miner Censorship}\label{sec:miner-censorship}
+%% ============================================================
+
+A minority of adversarial miners cannot reverse confirmed transactions but can selectively delay unconfirmed ones.
+
+\begin{proposition}[Miner Censorship Bound]\label{prop:miner-censor}
+An adversary controlling fraction $\alpha < 0.5$ of hash power can delay a specific unconfirmed transaction by expected time $\Delta_{\BSV} / (1 - \alpha)$. This delays but cannot prevent covenant advances or forced-inclusion inbox submissions.
+\end{proposition}
+
+\begin{remark}
+Miner censorship is a base-layer concern shared by all systems building on BSV (or any proof-of-work chain). It is not specific to BSVM. The forced-inclusion mechanism mitigates prover-level censorship but not miner-level censorship. Full resistance to miner censorship requires honest-majority mining, which is already assumed (\Cref{ass:bsv-safety}).
+\end{remark}
+
+
+%% ============================================================
+\section{Governance Upgrade Attacks}\label{sec:governance-attacks}
+%% ============================================================
+
+\begin{proposition}[Governance Upgrade Equivalence]\label{prop:gov-upgrade}
+For shards with governance enabled, a malicious covenant upgrade (by the key holder or $M$-of-$N$ guardians) is equivalent to complete shard compromise. The upgraded covenant may:
+\begin{enumerate}[nosep,label=(\alph*)]
+    \item bypass STARK verification (accepting arbitrary state advances);
+    \item drain all bridge sub-covenant UTXOs;
+    \item censor all transactions.
+\end{enumerate}
+\end{proposition}
+
+\begin{remark}
+This is bounded by design:
+\begin{enumerate}[nosep]
+    \item Governance keys \emph{cannot} operate on an active shard---they must freeze first, which is visible on-chain and alerts users.
+    \item The freeze $\to$ upgrade $\to$ unfreeze sequence is publicly observable. Users can exit (claim pending withdrawals, bridge out) during the freeze period before the upgrade takes effect.
+    \item For \texttt{none} governance mode, no upgrade is possible and this attack vector does not exist---at the cost of zero recoverability from verifier bugs.
+\end{enumerate}
+Users evaluate this trade-off by inspecting the governance mode published in the genesis $\mathsf{OP\_RETURN}$ before depositing.
+\end{remark}
+
+
+%% ============================================================
+\section{Ordering and Extractable Value}\label{sec:mev}
+%% ============================================================
+
+\begin{definition}[Prover Ordering Power]\label{def:mev}
+The prover whose covenant-advance transaction is accepted determines transaction ordering within the batch. Formally, for batch $B = (\mathsf{tx}_1, \ldots, \mathsf{tx}_b)$, the winning prover $P_j$ selects the permutation $\sigma$ such that the executed sequence is $(\mathsf{tx}_{\sigma(1)}, \ldots, \mathsf{tx}_{\sigma(b)})$ and determines the inclusion set (which pending transactions are included at all). This ordering power is MEV-equivalent to sequencer ordering in conventional L2 architectures.
+\end{definition}
+
+\begin{definition}[Ordering Fairness]\label{def:fairness}
+A system satisfies \emph{ordering fairness} if no party can profitably reorder or selectively include transactions to extract value from other users' pending transactions. BSVM does \emph{not} satisfy ordering fairness. This is stated as a property boundary, not a weakness to be resolved within the proof system.
+\end{definition}
+
+\begin{proposition}[MEV Redistribution]\label{prop:mev}
+The system does not eliminate extractable value; it redistributes it among competing provers. The sequencer-free property ensures no single entity has \emph{exclusive} ordering power---any prover can produce a competing batch---but the winning prover for any given batch has full ordering discretion over inclusion and permutation. In the limit of $|\mathcal{P}| = 1$, MEV concentration is identical to a single-sequencer system.
+\end{proposition}
+
+\begin{remark}
+Mitigation strategies include commit-reveal transaction submission, fair ordering protocols at the overlay level (FCFS with attestation), and threshold encryption of the mempool. These are engineering extensions and are not formally modelled here.
+\end{remark}
+
+
+%% ============================================================
+\section{Trust Assumptions by Governance Mode}\label{sec:governance}
+%% ============================================================
+
+\begin{table}[h]
+\centering
+\caption{Trust assumptions by shard governance mode}
+\label{tab:governance}
+\begin{tabular}{@{}l p{3.8cm} p{2.2cm} p{2.8cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{Trust assumptions} & \textbf{Max damage from governance compromise} & \textbf{Recovery from verifier bug} \\
+\midrule
+\texttt{none} & Assumptions~\ref{ass:stark}--\ref{ass:non-malleable}; for $k \in \{2, 3\}$ also \Cref{ass:groth,ass:vkpin} (BN254 ceremony honest + VK pinning uncompromised) & N/A & None. Shard permanently compromised. \\
+\addlinespace
+\texttt{single\_key} & Above, plus: key holder is honest & Complete shard compromise (after visible freeze) & Key holder freezes, upgrades, unfreezes. \\
+\addlinespace
+\texttt{multisig} ($M$-of-$N$) & Above, plus: $< M$ keys compromised & Complete shard compromise (after visible freeze) & $M$-of-$N$ freeze, upgrade, unfreeze. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}
+The ``max damage'' column (\Cref{prop:gov-upgrade}) is bounded by the observable freeze requirement: users have a window to exit before an upgraded covenant takes effect. The practical damage depends on how quickly users react to a freeze event.
+\end{remark}
+
+
+%% ============================================================
+\section{Scope and Limitations}\label{sec:scope}
+%% ============================================================
+
+The validity proof guarantees \emph{computational integrity}: the EVM executed the deployed bytecode correctly on the committed inputs.
+
+The system guarantees (after $k$ confirmations):
+\begin{enumerate}[nosep]
+    \item Correctness of execution (every opcode, every state access).
+    \item Integrity of state transitions (no invalid advance is confirmable).
+    \item Conservation of bridged assets (at the covenant level, with double-withdrawal prevention).
+    \item Permanent data availability (batch data on-chain, cryptographically bound to proof).
+    \item Cross-shard isolation (conditional on BSV consensus safety).
+\end{enumerate}
+
+The system does \emph{not} guarantee:
+\begin{enumerate}[nosep]
+    \item Correctness of deployed contract logic (a Solidity bug is faithfully proven).
+    \item Ordering fairness (MEV is redistributed, not eliminated; \Cref{def:fairness}).
+    \item Perpetual liveness absent economic incentive.
+    \item Recovery from verifier bugs in \texttt{none} governance mode.
+    \item Security during the pre-confirmation window (depth $< k$).
+    \item Resistance to base-layer compromise (51\% attack on BSV).
+    \item Resistance to governance upgrade attacks (for governed shards, bounded by visible freeze; \Cref{rem:gov-scope}).
+    \item Uniform admissibility of all valid transitions (subject to Script resource limits; \Cref{ass:runar}).
+    \item (Modes 2/3) Soundness without an honest BN254 trusted-setup contribution (\Cref{ass:groth}).
+    \item (Modes 2/3) Soundness if the build pipeline is subverted to ship an attacker-chosen $\vkSP$ (\Cref{ass:vkpin}).
+\end{enumerate}
+
+Any violation of system security reduces to one of: (i) breaking composed STARK soundness, (ii) [Modes 2/3] breaking Groth16/BN254 soundness or subverting the BN254 ceremony, (iii) [Modes 2/3] bypassing VK pinning, (iv) \Runar{} compiler defect, (v) \revm{}/RISC-V compilation divergence, (vi) hash collision, (vii) base-layer consensus violation, (viii) Script evaluation error, or (ix) proof malleability.
+
+
+\begin{thebibliography}{9}
+\bibitem{wood2014ethereum}
+G.~Wood, ``Ethereum: A secure decentralised generalised transaction ledger,'' \emph{Ethereum Project Yellow Paper}, 2014.
+
+\bibitem{bensasson2018stark}
+E.~Ben-Sasson, I.~Bentov, Y.~Horesh, and M.~Riabzev, ``Scalable, transparent, and post-quantum secure computational integrity,'' \emph{IACR Cryptology ePrint Archive}, Report 2018/046, 2018.
+
+\bibitem{bensasson2018fri}
+E.~Ben-Sasson, I.~Bentov, Y.~Horesh, and M.~Riabzev, ``Fast Reed-Solomon interactive oracle proofs of proximity,'' in \emph{Proc.\ ICALP}, vol.~107, 2018, pp.~14:1--14:17.
+
+\bibitem{groth2016}
+J.~Groth, ``On the size of pairing-based non-interactive arguments,'' in \emph{Proc.\ EUROCRYPT}, 2016, pp.~305--326.
+
+\bibitem{nakamoto2008}
+S.~Nakamoto, ``Bitcoin: A peer-to-peer electronic cash system,'' 2008.
+
+\bibitem{sp1}
+Succinct Labs, ``SP1: A zero-knowledge virtual machine,'' 2024. Available: \url{https://github.com/succinctlabs/sp1}
+
+\bibitem{revm}
+Paradigm, ``revm: Rust Ethereum Virtual Machine,'' 2023. Available: \url{https://github.com/bluealloy/revm}
+\end{thebibliography}
+
+\end{document}

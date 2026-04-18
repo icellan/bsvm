@@ -57,7 +57,7 @@ Siggi \'{O}skarsson \\
 \begin{@twocolumnfalse}
 \maketitle
 \begin{abstract}
-We present BSVM, a Layer~2 Ethereum Virtual Machine that runs on Bitcoin~SV (BSV) as its settlement and data availability layer. BSVM achieves full EVM bytecode compatibility while anchoring every state transition to BSV through a novel \emph{covenant UTXO chain} architecture. Each L2 state advance is a BSV transaction that spends a covenant-locked UTXO and creates a new one, forming a chain of state commitments enforced by Bitcoin Script. State transition correctness is guaranteed by STARK validity proofs generated via the SP1 zero-knowledge virtual machine, which proves the execution of a Rust EVM interpreter (revm) compiled to RISC-V. The covenant verifies the STARK proof on-chain using a FRI verifier compiled to Bitcoin Script via the R\'{u}nar multi-language Bitcoin Script compiler. The system requires no privileged sequencer key---the proof alone authorizes state advances, meaning anyone with a valid proof can advance the chain. BSVM supports an ecosystem of independent EVM instances (\emph{shards}), each with its own covenant chain and node network. At a BSV fee rate of 100~sat/KB, a 128-transaction batch costs approximately 21,600~satoshis to post on-chain ($\approx$\$0.0065), yielding a per-transaction L1 cost of 169~satoshis ($\approx$\$0.00005). We describe the architecture, proof pipeline, fee model, bridge design, and security properties in full.
+We present BSVM, a Layer~2 Ethereum Virtual Machine that runs on Bitcoin~SV (BSV) as its settlement and data availability layer. BSVM achieves full EVM bytecode compatibility while anchoring every state transition to BSV through a novel \emph{covenant UTXO chain} architecture. Each L2 state advance is a BSV transaction that spends a covenant-locked UTXO and creates a new one, forming a chain of state commitments enforced by Bitcoin Script. State transition correctness is guaranteed by STARK validity proofs generated via the SP1 zero-knowledge virtual machine, which proves the execution of a Rust EVM interpreter (revm) compiled to RISC-V. The covenant verifies the proof on-chain via one of three R\'{u}nar-compiled modes: native STARK verification using a FRI verifier over the Baby Bear field (Mode~1, transparent, no trusted setup, $\sim$1.2\,MB proof), or SP1's Groth16/BN254 wrap verified via on-chain BN254 pairing (Modes~2 and 3, $\sim$256-byte proof, $\sim$400\,ms verification); Mode~3 uses a witness-assisted verifier with the SP1 verifying key baked into an inlined preamble and is the recommended production target. The system requires no privileged sequencer key---the proof alone authorizes state advances, meaning anyone with a valid proof can advance the chain. BSVM supports an ecosystem of independent EVM instances (\emph{shards}), each with its own covenant chain and node network. At a BSV fee rate of 100~sat/KB, a 128-transaction batch under Mode~3 costs approximately 21,600~satoshis to post on-chain ($\approx$\$0.0065), yielding a per-transaction L1 cost of 169~satoshis ($\approx$\$0.00005); Modes~1 and 2 carry larger per-advance footprints and correspondingly higher L1 cost. We describe the architecture, proof pipeline, fee model, bridge design, and security properties in full.
 \end{abstract}
 \vspace{1em}
 \end{@twocolumnfalse}
@@ -109,7 +109,7 @@ A \emph{covenant} is a Bitcoin locking script that constrains how the output may
 
 \subsection{STARK Proofs}
 
-Scalable Transparent Arguments of Knowledge (STARKs)~\cite{ben_sasson_stark} are proof systems based on hash functions and polynomial commitments via the FRI protocol~\cite{ben_sasson_fri}. Unlike SNARKs~\cite{groth16}, STARKs require no trusted setup and are conjectured post-quantum secure. STARK verification involves checking polynomial evaluations against Merkle commitments---operations that decompose into hash computations and field arithmetic, making them amenable to verification in resource-constrained environments such as Bitcoin Script.
+Scalable Transparent Arguments of Knowledge (STARKs)~\cite{ben_sasson_stark} are proof systems based on hash functions and polynomial commitments via the FRI protocol~\cite{ben_sasson_fri}. Unlike SNARKs~\cite{groth16}, STARKs require no trusted setup and are conjectured post-quantum secure. STARK verification involves checking polynomial evaluations against Merkle commitments---operations that decompose into hash computations and field arithmetic, making them amenable to verification in resource-constrained environments such as Bitcoin Script. SP1 additionally offers an optional Groth16 \emph{wrapper}: the STARK is recursively verified inside a BN254 Groth16 circuit, producing a $\sim$256-byte SNARK proof that can be checked by a single BN254 pairing equation~\cite{groth16}. The wrapper reintroduces a BN254 trusted-setup assumption but dramatically reduces on-chain verification cost relative to native FRI verification, and BSVM exposes both options as separate covenant modes.
 
 \subsection{Zero-Knowledge Virtual Machines}
 
@@ -159,7 +159,7 @@ The core data structure is a chain of BSV transactions, each spending the previo
 \end{tikzpicture}
 \end{center}
 
-\noindent Each UTXO$_i$ carries the full state tuple in its locking script: the EVM state root $r_i$, block number $i$, chain ID, withdrawal Merkle root, cumulative deposit counter, and bridge nonce (for withdrawal replay protection). The state root $r_i$ is the Merkle Patricia Trie root of the EVM world state; the remaining fields track bridge commitments and shard identity. The locking script is a R\'{u}nar-compiled covenant that verifies a STARK proof before allowing the spend. BSV's unlimited unconfirmed chain depth allows hundreds or thousands of covenant advances between BSV blocks. When a block is mined, the entire chain is confirmed atomically.
+\noindent Each UTXO$_i$ carries a compact 41-byte state tuple in its locking script: the 32-byte EVM state root $r_i$ (Merkle Patricia Trie root of the EVM world state), the 8-byte block number $i$, and a 1-byte frozen flag used by governance (see \S\ref{sec:security}). Bridge-specific commitments---cumulative deposit counter, withdrawal-nullifier commitment chain, and bridge nonce for replay protection---live in independent sub-covenant UTXOs (\S\ref{sec:bridge}) rather than the state covenant, keeping the per-advance hot path small. The chain ID is baked into the locking script as a compile-time constant so every advance is implicitly shard-scoped. The locking script is a R\'{u}nar-compiled covenant that verifies a validity proof before allowing the spend, and emits the batch data in an OP\_RETURN output whose inclusion is cryptographically enforced by the covenant's continuation-hash commitment (\S\ref{sec:covenant}). BSV's unlimited unconfirmed chain depth allows hundreds or thousands of covenant advances between BSV blocks. When a block is mined, the entire chain is confirmed atomically.
 
 \subsection{Transaction Flow}
 
@@ -294,17 +294,39 @@ Since execution runs ahead of proving (the Go EVM returns receipts immediately),
 The covenant is written using R\'{u}nar's Go DSL and compiled to Bitcoin Script. It enforces four properties:
 
 \begin{enumerate}[nosep,leftmargin=1.5em]
-\item \textbf{Valid STARK proof}: The FRI-based STARK proof verifies correctly.
+\item \textbf{Valid validity proof}: The SP1 proof verifies correctly against the covenant's pinned SP1 verifying key (see \S\ref{sec:verification-modes} for the three supported verifier constructions and \S\ref{sec:vk-pinning} for how the key is pinned).
 \item \textbf{Block number increment}: The new block number is exactly the previous plus one.
 \item \textbf{State continuity}: The proof's committed pre-state root matches the covenant's current state root.
-\item \textbf{Data availability}: The transaction's outputs match the expected structure (covenant output + OP\_RETURN batch data), verified via \texttt{hashOutputs} from the sighash preimage.
+\item \textbf{Data availability}: The transaction's outputs match the expected structure (covenant output + OP\_RETURN batch data), verified via \texttt{hashOutputs} from the sighash preimage (\S\ref{sec:da-binding}).
 \end{enumerate}
 
-\noindent Crucially, there is \emph{no signature check}. The proof is the sole authorization. The covenant also includes an \texttt{emergencyUpgrade} method requiring a governance multisig (e.g., 3-of-5), which can upgrade the covenant script but cannot advance state or access bridge funds.
+\noindent Crucially, there is \emph{no signature check on the advance path}. The proof is the sole authorization. Governance methods---\texttt{freeze}, \texttt{unfreeze}, and \texttt{upgrade}---are exposed on a separate, signature-gated path whose trust model is configurable per-shard at genesis (\S\ref{sec:security}); governance keys cannot advance state or access bridge funds.
 
-\subsection{FRI Verification in Bitcoin Script}
+\subsection{Verification Modes}
+\label{sec:verification-modes}
 
-The STARK verification algorithm (FRI protocol) requires:
+BSVM supports three mutually-exclusive verification modes, selected per-shard at genesis. All three share the same SP1 proving pipeline (\S\ref{sec:proofs}); they differ only in how the resulting proof is checked on-chain.
+
+\begin{table}[h]
+\centering  
+\caption{Covenant verification modes}
+\label{tab:modes}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Mode} & \textbf{Proof} & \textbf{Check} & \textbf{Script} \\
+\midrule
+1 Basefold  & STARK, $\sim$1.2\,MB & FRI + Poseidon2 & 1--5\,MB \\
+2 Groth16   & SNARK, $\sim$256\,B  & BN254 pairing   & $\sim$5.6\,MB \\
+3 Groth16-WA & SNARK, $\sim$256\,B & BN254 pairing   & 50--700\,KB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Mode 1: Native STARK Verification (Basefold)}
+\label{sec:mode-basefold}
+
+Mode~1 verifies the raw SP1 STARK proof on-chain via a FRI verifier compiled to Bitcoin Script. The STARK verification algorithm requires:
 
 \begin{itemize}[nosep,leftmargin=1.5em]
 \item Poseidon2 permutation over the Baby Bear field (SP1's hash function for FRI Merkle commitments and Fiat-Shamir challenges). Poseidon2 is an algebraic hash---it operates entirely on field elements using multiplications and additions, making it implementable with BSV's arithmetic opcodes.
@@ -312,21 +334,43 @@ The STARK verification algorithm (FRI protocol) requires:
 \item Poseidon2-based Merkle proof verification (repeated Poseidon2 compression).
 \end{itemize}
 
-\noindent Note: BSV's native \texttt{OP\_HASH256} (double SHA-256) is used for BSVM-specific data bindings (batch data hash verification, hashOutputs introspection, withdrawal Merkle trees) but \emph{not} for STARK proof verification. SP1 exclusively uses Poseidon2 over Baby Bear for all internal STARK operations.
+\noindent Mode~1 requires \emph{no trusted setup}---it is the transparent fallback for shards whose threat model rejects the BN254 ceremony assumption of Modes~2 and~3. No elliptic curve operations are required, in contrast to SNARK verifiers which need expensive pairing computations. All FRI building blocks have been implemented in R\'{u}nar and validated on BSV regtest against 1,326 Plonky3-generated test vectors. Measured locking script sizes are compact: Baby Bear field addition and multiplication compile to 9~bytes each, field inversion to 477~bytes, and a full FRI colinearity check (the core folding equation over the Baby Bear quartic extension field) to 1,742~bytes. The Poseidon2 permutation subroutine is estimated at 30--50\,KB of compiled Script; Gate~0a will validate the full assembled verifier size. The trade-off is a larger proof ($\sim$1.2\,MB raw STARK) and a larger locking script (1--5\,MB) than the Groth16 modes.
 
-No elliptic curve operations are required, in contrast to SNARK verifiers which need expensive pairing computations. All FRI building blocks have been implemented in R\'{u}nar and validated on BSV regtest against 1,326 Plonky3-generated test vectors. Measured locking script sizes are compact: Baby Bear field addition and multiplication compile to 9~bytes each, field inversion to 477~bytes, and a full FRI colinearity check (the core folding equation over the Baby Bear quartic extension field) to 1,742~bytes. The Poseidon2 permutation subroutine is estimated at 30--50\,KB of compiled Script; Gate~0a will validate the full assembled verifier size.
+\subsubsection{Mode 2: Generic Groth16 Wrapping}
+\label{sec:mode-groth16}
+
+Mode~2 consumes SP1's optional Groth16 wrapper: the STARK is recursively verified inside a BN254 Groth16 circuit at prove time, producing a $\sim$256-byte SNARK proof. The covenant verifies this proof by computing the BN254 multi-pairing equation $e(-A, B) \cdot e(L, \gamma) \cdot e(C, \delta) \cdot e(\alpha, -\beta) = 1$ where $L$ is the multi-scalar-multiplication of the circuit's input-commitment ($IC$) points against the five SP1 public inputs. The verifying key components---$\alpha_{G_1}$, $\beta_{G_2}$, $\gamma_{G_2}$, $\delta_{G_2}$, and $IC_{0..5}$---are carried as readonly fields baked into the locking script at compile time, producing an on-chain verifier of $\sim$5.6\,MB. Mode~2 is architecturally complete but its script size makes it economically unattractive compared to Mode~3.
+
+\subsubsection{Mode 3: Witness-Assisted Groth16 (Production Target)}
+\label{sec:mode-groth16-wa}
+
+Mode~3 is the production target. It uses the same $\sim$256-byte Groth16 proof as Mode~2 but moves the verifier preamble---the on-curve checks, the $IC$ MSM, the $-A$ / $-\beta$ field negations, and the pairing equation---into a compile-time inlined code block emitted by the R\'{u}nar Groth16 codegen. The SP1 verifying key is baked into this preamble as pushdata; the prover supplies a BN254 witness bundle (the Groth16 proof plus an $\alpha\cdot\beta$ Fp12 constant that short-circuits one of the four pairings) at spend time as stack pushes. The resulting locking script is 50--700\,KB depending on optimization level---roughly an order of magnitude smaller than Mode~2 and comparable to or smaller than Mode~1 in the best case---and verifies in $\sim$400\,ms on commodity hardware. Because the preamble is emitted at compile time with a specific SP1 verifying key baked in, Mode~3 enforces VK pinning structurally (see \S\ref{sec:vk-pinning}).
 
 \subsection{Batch Data Binding}
+\label{sec:da-binding}
 
-A critical security property is that the batch data published in the OP\_RETURN must be the same data the STARK proof covers. The covenant enforces this via two checks:
+A critical security property is that the batch data published in the OP\_RETURN must be the same data the proof covers. The covenant enforces this via three layered checks:
 
 \begin{enumerate}[nosep,leftmargin=1.5em]
-\item The SP1 guest commits $h = \texttt{hash256}(\text{batchData})$ as a public value.
-\item The covenant computes $\texttt{OP\_HASH256}(\text{batchData})$ and verifies it equals $h$.
-\item The covenant extracts \texttt{hashOutputs} from the sighash preimage (via OP\_PUSH\_TX) and verifies the transaction's actual outputs match the expected covenant output + OP\_RETURN output.
+\item The SP1 guest commits $h = \texttt{hash256}(\text{batchData})$ as the batch-hash slot of the proof's public-value tuple $(r_i, r_{i+1}, h_B, h_{\text{receipts}}, \text{gas}, \text{cid}, W)$; the covenant extracts $h_B$ from this tuple via the public-values commitment.
+\item The covenant computes $\texttt{OP\_HASH256}(\text{batchData})$ at spend time and verifies it equals $h$.
+\item The covenant emits, via R\'{u}nar's \texttt{AddDataOutput} intrinsic, a standard DA output with the layout $\texttt{OP\_FALSE}\;\texttt{OP\_RETURN}\;\texttt{OP\_PUSHDATA4}\;\langle \text{len} \rangle\;\texttt{"BSVM\textbackslash x02"}\;\langle \text{batchData} \rangle$. Because \texttt{AddDataOutput} contributes to the covenant's continuation-hash commitment, the spending BSV transaction is cryptographically required to carry this exact script verbatim---omitting it invalidates the sighash-preimage check and the advance fails on-chain. The \texttt{"BSVM\textbackslash x02"} magic lets indexers distinguish covenant-advance OP\_RETURNs from unrelated BSV traffic and mirrors the \texttt{"BSVM\textbackslash x01"} genesis marker.
 \end{enumerate}
 
-This closes the data availability gap: a malicious prover cannot publish garbage batch data alongside a valid proof, because the proof commits to the batch hash and the covenant independently verifies it.
+This closes the data availability gap: a malicious prover cannot publish garbage batch data alongside a valid proof, because the proof commits to the batch hash and the covenant independently re-hashes it \emph{and} forces the correctly-formed OP\_RETURN into the transaction.
+
+\subsection{SP1 Verifying Key Pinning}
+\label{sec:vk-pinning}
+
+Binding the proof to the correct \emph{guest program} is as important as binding it to the correct \emph{state}. A malicious build system that compiles a covenant against an attacker-controlled SP1 verifying key could ship an otherwise-correct locking script that accepts proofs for an attacker-chosen guest. BSVM mitigates this at compile time via a three-policy VK-pinning system:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item \textbf{Mainnet}: the SHA-256 of the SP1 VK must match an entry in a curated allowlist; mismatches fail compilation before any Bitcoin Script is emitted. Every mainnet shard uses this policy.
+\item \textbf{Gate-0 fixture}: a fixed test VK from the project's proving-system-feasibility gate; used by regtest/integration tests only.
+\item \textbf{Allow-unpinned}: explicitly permissive; used only by unit tests that construct VKs on the fly.
+\end{itemize}
+
+Mode~3 further strengthens this by baking the VK into the inlined verifier preamble, so tampering with the VK after compilation produces a covenant whose VK-hash commitment (asserted against the covenant's first SP1 public input on every advance) would no longer match SP1's proof, causing every advance to fail. The combination of compile-time pinning and public-input binding makes a malicious-VK substitution detectable before mainnet launch and unusable after.
 
 % ─────────────────────────────────────────────
 \section{Fee Model and Prover Economics}
@@ -340,35 +384,37 @@ The EVM layer is 100\% Ethereum-compatible. Users pay gas in wBSV from their L2 
 
 The prover sets their L2 address as the block's \texttt{Coinbase}. Gas fees from all transactions are credited to the coinbase address via the EVM's standard fee mechanism. This is identical to how Ethereum validators earn fees.
 
-The prover's cost is the BSV mining fee for the covenant-advance transaction. Table~\ref{tab:costs} shows the BSV transaction composition at the target batch size of 128~transactions.
+The prover's cost is the BSV mining fee for the covenant-advance transaction. The BSV transaction composition depends on the verification mode (\S\ref{sec:verification-modes}): Mode~1 carries a large STARK proof with a modest locking script, Mode~2 carries a tiny SNARK proof with a large locking script, and Mode~3 balances a tiny SNARK with a medium locking script. Table~\ref{tab:costs} shows per-mode sizes at the target batch size of 128~transactions.
 
 \begin{table}[h]
 \centering
-\caption{BSV covenant-advance transaction size (128-tx batch)}
+\caption{BSV covenant-advance size by mode (128-tx batch)}
 \label{tab:costs}
-\begin{tabular}{@{}lr@{}}
+\small
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-\textbf{Component} & \textbf{Size} \\
+\textbf{Component} & \textbf{Mode 1} & \textbf{Mode 2} & \textbf{Mode 3} \\
 \midrule
-SP1 STARK proof & $\sim$165 KB \\
-Batch data (128 txs, uncompressed) & $\sim$20 KB \\
-Covenant locking script + state & $\sim$30 KB \\
-Transaction overhead & $\sim$1 KB \\
+Proof (witness)          & $\sim$1.2\,MB   & $\sim$256\,B    & $\sim$2--10\,KB \\
+Batch data (OP\_RETURN)  & $\sim$20\,KB    & $\sim$20\,KB    & $\sim$20\,KB \\
+Locking script + state   & $\sim$1--5\,MB  & $\sim$5.6\,MB   & 50--700\,KB \\
+Tx overhead              & $\sim$1\,KB     & $\sim$1\,KB     & $\sim$1\,KB \\
 \midrule
-\textbf{Total} & \textbf{$\sim$216 KB} \\
+\textbf{Total}           & $\sim$2--6\,MB  & $\sim$5.6\,MB   & $\sim$75--735\,KB \\
+\textbf{L1 cost}         & $\sim$0.2--0.6\,M sats & $\sim$0.56\,M sats & $\sim$7.5--73.5\,K sats \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-At 100~sat/KB: $\sim$21,600~sats per batch ($\approx$\$0.0065 at \$30/BSV). Per EVM transaction: $\sim$169~sats ($\approx$\$0.00005).
+Mode~3 is the production target because its per-advance footprint is an order of magnitude smaller than Modes~1 and~2. At an upper-bound locking-script size of $\sim$216\,KB (well within the band in Table~\ref{tab:costs}) the total advance is $\sim$216\,KB, costing $\sim$21,600~sats at 100~sat/KB ($\approx$\$0.0065 at \$30/BSV) and yielding a per-EVM-transaction cost of $\sim$169~sats ($\approx$\$0.00005). The numbers that follow use this Mode~3 reference point; Modes~1 and~2 have meaningfully higher L1 cost and correspondingly narrower prover margins.
 
 \subsection{Profitability Analysis}
 
-Table~\ref{tab:profit} shows prover profitability at two gas price points.
+Table~\ref{tab:profit} shows prover profitability at two gas price points under the Mode~3 reference footprint. Modes~1 and~2 produce lower margins for the same gas price and are not included here; see Table~\ref{tab:costs} for the absolute cost deltas.
 
 \begin{table}[h]
 \centering
-\caption{Prover profitability per 128-tx batch}
+\caption{Prover profitability per 128-tx batch (Mode~3)}
 \label{tab:profit}
 \begin{tabular}{@{}lrrr@{}}
 \toprule
@@ -385,7 +431,7 @@ Table~\ref{tab:profit} shows prover profitability at two gas price points.
 \end{tabular}
 \end{table}
 
-The break-even gas price for 128 simple transfers is $\approx$0.08~gwei---roughly 60$\times$ cheaper than Ethereum mainnet. Even at 0.1~gwei (cheaper than any existing L2), the prover is profitable.
+The break-even gas price for 128 simple transfers under Mode~3 is $\approx$0.08~gwei---roughly 60$\times$ cheaper than Ethereum mainnet. Even at 0.1~gwei (cheaper than any existing L2), the prover is profitable.
 
 \subsection{Adaptive Batching}
 
@@ -397,7 +443,7 @@ The overlay node uses adaptive batching: accumulate transactions up to 128, then
 \item At 1~tx/sec: batch flushes with $\sim$2~txs (marginal; prover may wait).
 \end{itemize}
 
-STARK proof size grows logarithmically with batch size, so the marginal L1 cost of adding transactions to a batch is dominated by the linear growth of batch data, not the proof.
+Proof size grows logarithmically with batch size for both Mode~1 (STARK) and Modes~2/3 (Groth16 wrap over a STARK of logarithmic size). In every mode, the marginal L1 cost of adding transactions to a batch is dominated by the linear growth of batch data, not the proof; the locking-script portion of the advance is fixed per shard.
 
 % ─────────────────────────────────────────────
 \section{Bridge Design}
@@ -471,13 +517,29 @@ We consider adversaries who may:
 
 \subsection{State Transition Integrity}
 
-The STARK proof guarantees computational integrity: the proof is sound under standard cryptographic assumptions (collision-resistant hash functions). A forged proof that passes FRI verification would constitute a break of the hash function. Additionally, SP1 has been audited by four independent firms~\cite{sp1}.
+The SP1 proof guarantees computational integrity: the proof is sound under standard cryptographic assumptions---collision-resistant hash functions for Modes~1 (FRI/STARK) and, additionally, the BN254 trusted-setup assumption and the generic-group / random-oracle discrete-log heuristics for Modes~2 and~3 (Groth16 wrap). A forged proof that passes FRI verification under Mode~1 would constitute a break of the underlying hash function; a forged proof that passes the BN254 pairing check under Modes~2 or 3 would constitute a break of Groth16 soundness. SP1 has been audited by four independent firms~\cite{sp1}.
 
-The covenant verifies the proof on-chain via R\'{u}nar-compiled FRI verification. The correctness of the R\'{u}nar compiler is assured by multi-implementation conformance: the Go, Rust, TypeScript, and Python compilers all produce byte-identical Script output. A shared compiler bug across four independent implementations is extremely unlikely.
+The covenant verifies the proof on-chain via a R\'{u}nar-compiled verifier---either a native FRI verifier (Mode~1) or a BN254 Groth16 verifier, optionally witness-assisted (Modes~2 and~3). The correctness of the R\'{u}nar compiler is assured by multi-implementation conformance: the Go, Rust, TypeScript, and Python compilers all produce byte-identical Script output. A shared compiler bug across four independent implementations is extremely unlikely.
+
+\subsection{Adversarial Review of the Covenant}
+\label{sec:adversarial-review}
+
+The covenant-advance critical path in Modes~2 and~3 has undergone a targeted adversarial review covering the covenant contract, the Groth16 verifier embedding, and the BSV transaction structure. The review identified---and fixes now enforce---several soundness-bearing invariants that are not obvious from the high-level architecture but are load-bearing in practice:
+
+\begin{itemize}[nosep,leftmargin=1.5em]
+\item \textbf{Public-input binding.} Each of SP1's five Groth16 public inputs is bound to a domain value: input~0 to the pinned SP1 verifying-key scalar (preventing substitution of an attacker-chosen guest program), input~1 to the on-chain-reduced SHA-256 of the committed \texttt{publicValues} (preventing decoupling of the public values from the proof), input~2 to zero (the SP1 exit-code slot; rejecting failed-guest proofs), and input~4 to zero (the SP1 vkRoot slot; single-program mode only). Input~3 (SP1's proofNonce) is deliberately left unconstrained per SP1 convention.
+\item \textbf{Scalar-range enforcement.} Each public input is range-checked against the BN254 scalar order $r$ before entering the multi-scalar-multiplication, matching SP1's Solidity/in-circuit reference verifiers and preventing differential-oracle divergence.
+\item \textbf{VK pinning.} The SP1 verifying-key SHA-256 is matched against a policy-specific allowlist at compile time (\S\ref{sec:vk-pinning}); mainnet builds refuse to emit a locking script for a non-allowlisted VK.
+\item \textbf{Data-availability binding.} The batch data is emitted as a \texttt{"BSVM\textbackslash x02"}-prefixed OP\_RETURN output inside the covenant's continuation-hash commitment (\S\ref{sec:da-binding}), making DA inclusion cryptographically enforced rather than convention-dependent.
+\item \textbf{Governance-path isolation.} Public-input and VK-pinning invariants are enforced on the \texttt{upgrade} paths as well as on \texttt{advanceState}, preventing a compromised governance set from tunnelling a proof for a different SP1 guest program through an upgrade.
+\item \textbf{Governance-key shape validation.} Governance pubkeys are required at compile time to be non-zero-prefixed, rejecting keys that would compile into a valid locking script but could never accept a signature under BSV Script's \texttt{OP\_CHECKSIG} semantics. This prevents a misconfigured or maliciously seeded governance set from shipping a shard whose freeze/upgrade path is structurally unreachable.
+\end{itemize}
+
+Each invariant is covered by adversarial tests that flip the expected value away from the pinned one and confirm the covenant rejects the advance. These tests exercise the full 254-bit BN254 scalar field so that high-bit-only attack patterns (indistinguishable under a naive 64-bit harness) are caught at the contract level.
 
 \subsection{Data Availability}
 
-Batch data is published in the OP\_RETURN output of every covenant-advance transaction. The STARK proof commits to the hash of the batch data, and the covenant independently verifies this hash on-chain. This guarantees that the data needed to replay and verify the state transition is permanently available on BSV.
+Batch data is published in the OP\_RETURN output of every covenant-advance transaction, with the format $\texttt{OP\_FALSE}\;\texttt{OP\_RETURN}\;\texttt{OP\_PUSHDATA4}\;\langle \text{len} \rangle\;\texttt{"BSVM\textbackslash x02"}\;\langle \text{batchData} \rangle$. The SP1 proof commits to \texttt{hash256(batchData)} as a public value, the covenant re-hashes the data on-chain to verify the commitment, and R\'{u}nar's continuation-hash mechanism forces the OP\_RETURN script into the spending transaction verbatim (\S\ref{sec:da-binding}). This guarantees that the data needed to replay and verify the state transition is both permanently available on BSV and cryptographically bound to the verified proof.
 
 \subsection{Censorship Resistance}
 
@@ -493,7 +555,7 @@ The governance model is configurable per-shard at genesis. Three modes are suppo
 
 \subsection{Recovery from Covenant Bugs}
 
-For shards with governance enabled (\texttt{single\_key} or \texttt{multisig}), a bug in the FRI verifier can be recovered from: the governance keys freeze the shard, upgrade the covenant to a fixed version, and unfreeze. For fully trustless shards (\texttt{none}), there is no recovery path from a verifier bug---the shard is permanently compromised. This trade-off is by design: maximum trustlessness in exchange for zero recoverability. Shard creators choose based on their risk tolerance and the maturity of the covenant code.
+For shards with governance enabled (\texttt{single\_key} or \texttt{multisig}), a bug in the on-chain verifier---whether the FRI verifier of Mode~1 or the Groth16 pairing verifier of Modes~2 and~3---can be recovered from: the governance keys freeze the shard, upgrade the covenant to a fixed version (with an upgrade-migration-hash binding enforcing that the signed new script and the deployed new script agree), and unfreeze. For fully trustless shards (\texttt{none}), there is no recovery path from a verifier bug---the shard is permanently compromised. This trade-off is by design: maximum trustlessness in exchange for zero recoverability. Shard creators choose based on their risk tolerance and the maturity of the covenant code. Because the verifier in Modes~2 and~3 is a small on-chain BN254 pairing check plus a readonly verifying key rather than a full FRI implementation, the Mode~3 verifier has substantially less on-chain code surface---and therefore a smaller bug-attack surface---than the Mode~1 verifier.
 
 \subsection{Comparison with Existing L2 Security}
 
@@ -535,7 +597,7 @@ Stable L1 fees & \checkmark & -- & -- \\
 
 BSVM demonstrates that BSV's unique properties---unbounded block size, stable low fees, unlimited unconfirmed chain depth, and expressive Script---make it an ideal settlement layer for a validity-proven EVM L2. The covenant UTXO chain provides a natural state commitment mechanism that eliminates the need for a centralized sequencer. The SP1 zkVM enables full EVM execution proofs without custom circuit engineering. And BSV's fee structure makes the economics dramatically better than any Ethereum-based L2: per-transaction L1 costs of $\approx$\$0.00005 with 12$\times$ prover margins at 1~gwei gas price.
 
-The system provides security properties that match or exceed existing L2s: validity proofs (no 7-day challenge period), no privileged sequencer key (proof is the sole authorization), multi-node liveness (no single point of failure), configurable governance (from fully trustless to multisig-governed), and a forced-inclusion inbox (censorship resistance). The FRI verifier---the critical on-chain component that validates STARK proofs in Bitcoin Script---has been prototyped via R\'{u}nar and validated on BSV regtest, confirming the feasibility of on-chain proof verification within BSV's Script constraints. The verifier must be designed to verify all valid proofs within Script resource limits uniformly; if resource costs vary by proof structure, only a subset of valid transitions may be admissible on-chain, which does not compromise safety but may constrain reachable states. The trust assumptions for normal operation reduce to the soundness of the STARK proof system and the correctness of the R\'{u}nar-compiled verifier, both of which are amenable to formal verification and multi-implementation conformance testing.
+The system provides security properties that match or exceed existing L2s: validity proofs (no 7-day challenge period), no privileged sequencer key (proof is the sole authorization), multi-node liveness (no single point of failure), configurable governance (from fully trustless to multisig-governed), and a forced-inclusion inbox (censorship resistance). Three on-chain verifier constructions have been implemented via R\'{u}nar---a native FRI verifier (Mode~1, validated on BSV regtest against 1,326 Plonky3-generated test vectors) and two BN254 Groth16 verifiers (Modes~2 and~3) including the witness-assisted variant that is our production target---confirming the feasibility of on-chain proof verification within BSV's Script constraints. The verifier must be designed to verify all valid proofs within Script resource limits uniformly; if resource costs vary by proof structure, only a subset of valid transitions may be admissible on-chain, which does not compromise safety but may constrain reachable states. The trust assumptions for normal operation reduce to the soundness of the SP1 proof system (plus, in Modes~2 and~3, the BN254 trusted setup), the correctness of the R\'{u}nar-compiled verifier, and the integrity of the pinned SP1 verifying key---all of which are amenable to formal verification, multi-implementation conformance testing, and public allowlist review.
 
 BSVM opens a new design space: general-purpose smart contract execution with validity proofs on a UTXO blockchain. We believe this combination---EVM compatibility, STARK validity proofs, BSV data availability, and covenant-enforced state---represents a compelling alternative to the Ethereum-centric L2 landscape.
 
