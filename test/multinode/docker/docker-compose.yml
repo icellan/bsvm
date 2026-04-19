@@ -19,7 +19,7 @@ x-bsvm-common: &bsvm-common
 services:
   node1:
     <<: *bsvm-common
-    container_name: bsvm-test-node1
+    container_name: bsvm-test-mn-node1
     hostname: node1
     networks:
       bsvm-test-net:
@@ -28,12 +28,12 @@ services:
       - bsvm-node1-data:/data
       - ./config/node1.toml:/etc/bsvm/node.toml:ro
     ports:
-      - "18545:8545"
+      - "28545:8545"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         if [ ! -f /data/shard.json ]; then
-          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+          bsvm init --datadir /data --chain-id 8453111 --verification fri --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
         fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
@@ -45,7 +45,7 @@ services:
 
   node2:
     <<: *bsvm-common
-    container_name: bsvm-test-node2
+    container_name: bsvm-test-mn-node2
     hostname: node2
     networks:
       bsvm-test-net:
@@ -54,12 +54,12 @@ services:
       - bsvm-node2-data:/data
       - ./config/node2.toml:/etc/bsvm/node.toml:ro
     ports:
-      - "18546:8545"
+      - "28546:8545"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         if [ ! -f /data/shard.json ]; then
-          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+          bsvm init --datadir /data --chain-id 8453111 --verification fri --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
         fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
@@ -71,7 +71,7 @@ services:
 
   node3:
     <<: *bsvm-common
-    container_name: bsvm-test-node3
+    container_name: bsvm-test-mn-node3
     hostname: node3
     networks:
       bsvm-test-net:
@@ -80,12 +80,12 @@ services:
       - bsvm-node3-data:/data
       - ./config/node3.toml:/etc/bsvm/node.toml:ro
     ports:
-      - "18547:8545"
+      - "28547:8545"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         if [ ! -f /data/shard.json ]; then
-          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+          bsvm init --datadir /data --chain-id 8453111 --verification fri --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
         fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:

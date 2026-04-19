@@ -64,7 +64,7 @@ func (dc *DockerCluster) NodeRPC(nodeIndex int) string {
 	if nodeIndex < 1 || nodeIndex > dc.nodeCount {
 		dc.t.Fatalf("node index %d out of range [1, %d]", nodeIndex, dc.nodeCount)
 	}
-	port := 18544 + nodeIndex // node1=18545, node2=18546, node3=18547
+	port := 28544 + nodeIndex // node1=28545, node2=28546, node3=28547
 	return fmt.Sprintf("http://localhost:%d", port)
 }
 
@@ -116,14 +116,24 @@ func (dc *DockerCluster) WaitAllNodesReady(ctx context.Context) error {
 	}
 }
 
+// projectName is the Docker Compose project name. Using an explicit name
+// prevents collision with other compose stacks (e.g. the bsv-evm devnet
+// stack whose default project name is also directory-derived).
+const projectName = "bsvm-test-multinode"
+
 // composeCmd constructs a docker compose command targeting the cluster's
-// compose directory.
+// compose directory with an explicit project name.
 func (dc *DockerCluster) composeCmd(ctx context.Context, args ...string) *exec.Cmd {
-	fullArgs := append([]string{"compose", "-f", filepath.Join(dc.composeDir, "docker-compose.yml")}, args...)
+	fullArgs := append([]string{
+		"compose",
+		"-p", projectName,
+		"-f", filepath.Join(dc.composeDir, "docker-compose.yml"),
+	}, args...)
 	return exec.CommandContext(ctx, "docker", fullArgs...)
 }
 
 // containerName returns the Docker container name for a given node index.
+// Matches the container_name in docker-compose.yml.
 func (dc *DockerCluster) containerName(nodeIndex int) string {
-	return fmt.Sprintf("bsvm-test-node%d", nodeIndex)
+	return fmt.Sprintf("bsvm-test-mn-node%d", nodeIndex)
 }
