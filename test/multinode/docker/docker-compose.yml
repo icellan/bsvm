@@ -1,0 +1,90 @@
+networks:
+  bsvm-test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.40.0.0/24
+
+volumes:
+  bsvm-node1-data:
+  bsvm-node2-data:
+  bsvm-node3-data:
+
+x-bsvm-common: &bsvm-common
+  image: bsvm:test
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+
+services:
+  node1:
+    <<: *bsvm-common
+    container_name: bsvm-test-node1
+    hostname: node1
+    networks:
+      bsvm-test-net:
+        ipv4_address: 172.40.0.11
+    volumes:
+      - bsvm-node1-data:/data
+      - ./config/node1.toml:/etc/bsvm/node.toml:ro
+    ports:
+      - "18545:8545"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        exec bsvm run --datadir /data --config /etc/bsvm/node.toml
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
+
+  node2:
+    <<: *bsvm-common
+    container_name: bsvm-test-node2
+    hostname: node2
+    networks:
+      bsvm-test-net:
+        ipv4_address: 172.40.0.12
+    volumes:
+      - bsvm-node2-data:/data
+      - ./config/node2.toml:/etc/bsvm/node.toml:ro
+    ports:
+      - "18546:8545"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        exec bsvm run --datadir /data --config /etc/bsvm/node.toml
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
+
+  node3:
+    <<: *bsvm-common
+    container_name: bsvm-test-node3
+    hostname: node3
+    networks:
+      bsvm-test-net:
+        ipv4_address: 172.40.0.13
+    volumes:
+      - bsvm-node3-data:/data
+      - ./config/node3.toml:/etc/bsvm/node.toml:ro
+    ports:
+      - "18547:8545"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        exec bsvm run --datadir /data --config /etc/bsvm/node.toml
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+      start_period: 10s

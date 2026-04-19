@@ -1,0 +1,29 @@
+datadir = "/data"
+log_level = "debug"
+log_format = "json"
+
+[overlay]
+coinbase = "0x0000000000000000000000000000000000000001"
+block_gas_limit = 30000000
+batch_size = 128
+max_batch_flush_delay = "2s"
+min_gas_price = "1000000000"
+
+[rpc]
+http_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+cors_origins = ["*"]
+
+[prover]
+mode = "mock"
+
+[network]
+listen_addr = "/ip4/0.0.0.0/tcp/9945"
+bootstrap_peers = [
+  "/ip4/172.40.0.12/tcp/9945",
+  "/ip4/172.40.0.13/tcp/9945",
+]
+max_peers = 50
+
+[bsv]
+network = "regtest"

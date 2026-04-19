@@ -13,7 +13,7 @@ RUN CGO_ENABLED=1 go build -o /build/bsvm ./cmd/bsvm
 # Runtime stage
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates iproute2
 
 COPY --from=builder /build/bsvm /usr/local/bin/bsvm
 
