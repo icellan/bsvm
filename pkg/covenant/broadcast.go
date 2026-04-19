@@ -22,7 +22,7 @@ type ProofMode = proofmode.ProofMode
 
 // Re-exported ProofMode constants.
 const (
-	ProofModeBasefold       = proofmode.Basefold
+	ProofModeFRI            = proofmode.FRI
 	ProofModeGroth16Generic = proofmode.Groth16Generic
 	ProofModeGroth16Witness = proofmode.Groth16Witness
 )
@@ -54,7 +54,7 @@ type BroadcastClient interface {
 //
 // The BatchData / PublicValues / ProofBlob accessors exist so that
 // CovenantManager.BroadcastAdvance can validate the underlying data via
-// BuildAdvanceData without caring which concrete proof it was handed.
+// ValidateAdvanceData without caring which concrete proof it was handed.
 type AdvanceProof interface {
 	// Mode returns the proof mode this advance proof targets.
 	Mode() ProofMode
@@ -78,48 +78,38 @@ type AdvanceProof interface {
 	ContractCallArgs(req BroadcastRequest) ([]interface{}, error)
 }
 
-// BasefoldProof carries the proof data for ProofModeBasefold. Its
-// ContractCallArgs method produces the 11-arg slice expected by
-// contracts.BasefoldRollupContract.AdvanceState.
-type BasefoldProof struct {
+// FRIProof carries the proof data for ProofModeFRI (Mode 1, trust-
+// minimized FRI bridge). Its ContractCallArgs method produces the 5-arg
+// slice expected by contracts.FRIRollupContract.AdvanceState. There are
+// no FRI-specific arguments because Mode 1 does not verify the proof
+// on-chain; the Blob field is passed through for off-chain verification
+// and future-upgrade ABI stability.
+type FRIProof struct {
 	// SP1 envelope.
 	Values []byte
 	Batch  []byte
 	Blob   []byte
-
-	// Basefold KoalaBear field elements (synthetic in the mock prover,
-	// real values in CPU / network prover binaries).
-	ProofA int64
-	ProofB int64
-	ProofC int64
-
-	// FRI Merkle proof against the rollup contract's SP1VerifyingKeyHash.
-	MerkleLeafHex   string
-	MerkleProofHex  string
-	MerkleLeafIndex int64
 }
 
-// Mode returns ProofModeBasefold.
-func (p *BasefoldProof) Mode() ProofMode { return ProofModeBasefold }
+// Mode returns ProofModeFRI.
+func (p *FRIProof) Mode() ProofMode { return ProofModeFRI }
 
 // BatchData returns the canonical batch encoding.
-func (p *BasefoldProof) BatchData() []byte { return p.Batch }
+func (p *FRIProof) BatchData() []byte { return p.Batch }
 
 // PublicValues returns the raw SP1 public values blob.
-func (p *BasefoldProof) PublicValues() []byte { return p.Values }
+func (p *FRIProof) PublicValues() []byte { return p.Values }
 
 // ProofBlob returns the raw SP1 proof bytes.
-func (p *BasefoldProof) ProofBlob() []byte { return p.Blob }
+func (p *FRIProof) ProofBlob() []byte { return p.Blob }
 
 // ContractCallArgs returns the argument slice for
-// BasefoldRollupContract.AdvanceState in the order:
+// FRIRollupContract.AdvanceState in the order:
 //
-//	newStateRoot, newBlockNumber, publicValues, batchData, proofBlob,
-//	proofFieldA, proofFieldB, proofFieldC,
-//	merkleLeaf, merkleProof, merkleIndex.
-func (p *BasefoldProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
+//	newStateRoot, newBlockNumber, publicValues, batchData, proofBlob.
+func (p *FRIProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
 	if p == nil {
-		return nil, errors.New("nil basefold proof")
+		return nil, errors.New("nil FRI proof")
 	}
 	newStateRootHex := hex.EncodeToString(req.NewState.StateRoot[:])
 	publicValuesHex := hex.EncodeToString(p.Values)
@@ -131,12 +121,6 @@ func (p *BasefoldProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, e
 		publicValuesHex,
 		batchDataHex,
 		proofBlobHex,
-		p.ProofA,
-		p.ProofB,
-		p.ProofC,
-		p.MerkleLeafHex,
-		p.MerkleProofHex,
-		p.MerkleLeafIndex,
 	}, nil
 }
 

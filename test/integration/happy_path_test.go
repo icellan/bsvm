@@ -5,12 +5,12 @@
 // These tests are Phase 1 of the BSVM-INTEGRATION-TESTS-PROMPT.md attack-
 // vector suite. They establish the pattern every subsequent phase will
 // reuse: deterministic per-test seeds feed regtestharness.Build, each test
-// deploys its own BasefoldRollupContract, drives bundle.Node.ProcessBatch,
+// deploys its own FRIRollupContract, drives bundle.Node.ProcessBatch,
 // and asserts on tips, receipts, and state. No tampered-args negative
 // tests, bridge tests, or multi-node tests appear here — those ship in
 // Phase 2.
 //
-// All tests run on ProofModeBasefold because it has the smallest locking
+// All tests run on ProofModeFRI because it has the smallest locking
 // script and the fastest per-advance broadcast time; proof-mode
 // parameterisation arrives in Phase 2 with the state-integrity rejection
 // tests where mode coverage actually matters.
@@ -114,7 +114,7 @@ func erc20BalanceSlot(addr types.Address) types.Hash {
 	return types.BytesToHash(crypto.Keccak256(key))
 }
 
-// happyPathSetup deploys a fresh BasefoldRollupContract, builds a bundle
+// happyPathSetup deploys a fresh FRIRollupContract, builds a bundle
 // against it, starts the confirmation watcher, and registers a t.Cleanup
 // that stops the overlay node. Per-test seed derivation from t.Name()
 // guarantees distinct funding wallets and distinct L2 coinbase keys so
@@ -128,7 +128,7 @@ func happyPathSetup(t *testing.T) *regtestharness.Bundle {
 		ChainID:      chainID,
 		TxKeySeed:    txSeed,
 		CoinbaseSeed: cbSeed,
-		ProofMode:    covenant.ProofModeBasefold,
+		ProofMode:    covenant.ProofModeFRI,
 	}
 	root, err := regtestharness.ComputeGenesisStateRoot(cfg)
 	if err != nil {
@@ -136,7 +136,7 @@ func happyPathSetup(t *testing.T) *regtestharness.Bundle {
 	}
 	rootHex := hex.EncodeToString(root[:])
 
-	contract, provider, signer, _ := deployBasefoldRollupWithStateRoot(t, rootHex)
+	contract, provider, signer, _ := deployFRIRollupWithStateRoot(t, rootHex)
 	if err := helpers.Mine(1); err != nil {
 		t.Fatalf("mine deploy: %v", err)
 	}

@@ -9,7 +9,7 @@ import (
 // ProverMode determines how proofs are generated (who computes the proof).
 // This is orthogonal to ProofMode: ProverMode picks the execution backend
 // (local subprocess / network / mock), while ProofMode picks the
-// verification math (Basefold / Groth16-generic / Groth16-witness).
+// verification math (FRI / Groth16-generic / Groth16-witness).
 type ProverMode int
 
 const (
@@ -42,7 +42,7 @@ type ProofMode = proofmode.ProofMode
 
 // Re-exported ProofMode constants.
 const (
-	ProofModeBasefold       = proofmode.Basefold
+	ProofModeFRI            = proofmode.FRI
 	ProofModeGroth16Generic = proofmode.Groth16Generic
 	ProofModeGroth16Witness = proofmode.Groth16Witness
 )
@@ -53,7 +53,7 @@ type Config struct {
 	Mode ProverMode
 
 	// ProofMode determines which on-chain verification path the produced
-	// proofs target (Basefold, Groth16-generic, Groth16-witness). This is
+	// proofs target (FRI, Groth16-generic, Groth16-witness). This is
 	// orthogonal to Mode: Mode picks the backend, ProofMode picks the math.
 	ProofMode ProofMode
 
@@ -81,7 +81,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Mode:         ProverMock,
-		ProofMode:    ProofModeBasefold,
+		ProofMode:    ProofModeFRI,
 		Timeout:      10 * time.Minute,
 		SP1ProofMode: "compressed",
 	}

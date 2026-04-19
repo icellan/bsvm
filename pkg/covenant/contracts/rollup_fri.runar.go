@@ -2,33 +2,56 @@ package contracts
 
 import runar "github.com/icellan/runar/packages/runar-go"
 
-// BasefoldRollupContract is the Basefold-only variant of the stateful rollup
-// covenant. It verifies SP1 proofs natively on-chain using KoalaBear field
-// arithmetic plus a Poseidon2 Merkle inclusion proof — no trusted setup.
+// FRIRollupContract is Mode 1 of the BSVM rollup covenant: the
+// trust-minimized FRI bridge.
 //
-// This file was split out of the original dual-mode rollup.runar.go contract
-// so each compiled script carries only the verification logic it actually
-// needs. The dual-mode contract compiled to ~5.8 MB and tripped the Rúnar
-// `Invalid OP_SPLIT range` bug on regtest; splitting by mode reduces the
-// readonly / argument surface dramatically.
+// # Security model
 //
-// Mode 2 (generic Groth16) lives in rollup_groth16.runar.go and Mode 3
-// (witness-assisted Groth16) in rollup_groth16_wa.runar.go. Do NOT add
-// other verification modes to this file — keep each variant in its own
-// source so the compiled locking script carries only its own logic.
+// Mode 1 does NOT verify the SP1 FRI proof on-chain. The covenant binds
+// state transitions (block+1, state roots, batch hash, chain id) but
+// performs no STARK arithmetic. Any prover can advance the state with a
+// well-formed public-values blob and matching batchData — a malicious
+// prover can therefore commit an invalid state transition.
 //
-// State fields (persisted across UTXO spends via OP_PUSH_TX):
+// The safety model rests on two off-chain layers:
+//
+//  1. Nodes re-execute every batch locally and verify the SP1 FRI proof
+//     (SP1 v6.0.2, KoalaBear field, SHA-256 outer Merkle hashing — see
+//     spec 12). A node that observes an invalid advance can trigger the
+//     on-chain governance freeze path (FreezeSingleKey / FreezeMultiSig*).
+//  2. Governance freeze is the only recourse against a bad advance. Mode
+//     1 shards MUST be configured with non-trivial governance (mode
+//     single_key or multisig). A GovernanceNone shard in Mode 1 has no
+//     safety backstop at all.
+//
+// Mode 1 is NOT mainnet-eligible. PrepareGenesis rejects a mainnet
+// shard configured with VerifyFRI regardless of the VK trust policy.
+// For mainnet, use Mode 2 (Groth16) or Mode 3 (Groth16-WA) which
+// perform full BN254 pairing verification on-chain.
+//
+// # Future path
+//
+// A full on-chain FRI verifier using the primitives validated by Gate
+// 0a (Baby Bear / KoalaBear field arithmetic, SHA-256 Merkle paths,
+// colinearity checks, proof-of-work) is tracked as Gate 0a Full in
+// spec 9 and spec 13. When that lands, Mode 1 upgrades from a bridge
+// to a fully self-verifying rollup and the mainnet guardrail is
+// lifted. Until then Mode 1 is testnet / experimental only.
+//
+// # State fields (persisted across UTXO spends via OP_PUSH_TX)
+//
 //   - StateRoot:   32-byte hash of current L2 state
 //   - BlockNumber: monotonically increasing block counter
 //   - Frozen:      0 = active, 1 = frozen by governance
 //
-// Readonly properties baked into the locking script at compile time:
-//   - SP1VerifyingKeyHash: sha256(SP1 verifying key); in Basefold mode this
-//     also doubles as the root of the Poseidon2 Merkle tree that the on-chain
-//     leaf/proof/index must reconstruct to.
+// # Readonly properties baked into the locking script
+//
+//   - SP1VerifyingKeyHash: sha256(SP1 verifying key). Recorded for
+//     indexing and future-upgrade continuity; the on-chain script
+//     does NOT consult it in Mode 1 because there is no proof check.
 //   - ChainId:             shard chain ID for cross-shard replay prevention
 //   - Governance*:         freeze / unfreeze / upgrade authorization
-type BasefoldRollupContract struct {
+type FRIRollupContract struct {
 	runar.StatefulSmartContract
 
 	// ---- Mutable state ----
@@ -36,8 +59,8 @@ type BasefoldRollupContract struct {
 	BlockNumber runar.Bigint     // monotonically increasing block counter
 	Frozen      runar.Bigint     // 0=active, 1=frozen by governance
 
-	// ---- Readonly: shared with the Groth16 variant ----
-	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey) / Merkle root
+	// ---- Readonly ----
+	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey); reserved for future FRI verifier
 	ChainId             runar.Bigint     `runar:"readonly"` // shard chain ID
 
 	// ---- Readonly: governance ----
@@ -48,47 +71,35 @@ type BasefoldRollupContract struct {
 	GovernanceKey3      runar.PubKey `runar:"readonly"` // multisig key 3 (zeros if unused)
 }
 
-// AdvanceState advances the covenant state with a Basefold-verified proof.
-// Invariants enforced (in order):
+// AdvanceState advances the covenant state in Mode 1 (trust-minimized
+// FRI bridge). No SP1 STARK verification is performed on-chain.
+//
+// On-chain invariants enforced (in order):
 //  1. Shard must not be frozen.
 //  2. New block number must be exactly previous + 1.
-//  3. Basefold proof: KoalaBear field product check + Poseidon2 Merkle
-//     inclusion of the provided leaf at the given index must reconstruct to
-//     the SP1VerifyingKeyHash stored in the readonly property.
-//  4. Public values offsets 0/32/104/136 must match StateRoot / newStateRoot
-//     / hash256(batchData) / ChainId (little-endian 8 bytes) respectively.
+//  3. Public-value offsets bind to their inputs:
+//     [0..32)   preStateRoot  == c.StateRoot
+//     [32..64)  postStateRoot == newStateRoot
+//     [104..136) batchDataHash == hash256(batchData)
+//     [136..144) chainId       == c.ChainId (little-endian 8 bytes)
 //
-// Note: the tautological `publicValues[64..96] == hash256(proofBlob)` check
-// present before 2026-04-18 was removed (finding F04). That slot holds
-// receiptsHash per spec 12 and is intentionally unverified by the covenant
-// (nodes check it during batch replay); the prior assertion was either
-// unsatisfiable by an honest prover (if publicValues came straight from
-// the guest) or tautological (if the prover controlled publicValues).
-func (c *BasefoldRollupContract) AdvanceState(
+// Spec-12 OP_RETURN data-availability output is emitted with the
+// `BSVM\x02` magic. The continuation-hash binding ensures the on-chain
+// tx carries batchData verbatim.
+//
+// proofBlob is accepted as a parameter so the ABI is stable against the
+// future on-chain FRI verifier upgrade (Gate 0a Full). It is not
+// consumed on-chain in Mode 1.
+func (c *FRIRollupContract) AdvanceState(
 	newStateRoot runar.ByteString,
 	newBlockNumber runar.Bigint,
 	publicValues runar.ByteString,
 	batchData runar.ByteString,
 	proofBlob runar.ByteString,
-	proofFieldA runar.Bigint,
-	proofFieldB runar.Bigint,
-	proofFieldC runar.Bigint,
-	merkleLeaf runar.ByteString,
-	merkleProof runar.ByteString,
-	merkleIndex runar.Bigint,
 ) {
-	// 0. Reject if shard is frozen by governance.
 	runar.Assert(c.Frozen == 0)
-
-	// 1. Block number must be exactly previous + 1.
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
-	// 2. Basefold proof: KoalaBear field check + Poseidon2 Merkle verification.
-	runar.Assert(runar.KbFieldMul(proofFieldA, proofFieldB) == proofFieldC)
-	computedRoot := runar.MerkleRootSha256(merkleLeaf, merkleProof, merkleIndex, 20)
-	runar.Assert(computedRoot == c.SP1VerifyingKeyHash)
-
-	// 3. Extract and verify public values at spec offsets.
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
@@ -98,6 +109,18 @@ func (c *BasefoldRollupContract) AdvanceState(
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
+
+	// Spec-12 OP_RETURN data-availability output:
+	//   OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4> "BSVM\x02" <batchData>
+	// The continuation-hash check (Rúnar-injected) binds this output to
+	// the tx so an on-chain observer can always read batchData without
+	// parsing the covenant input script.
+	opReturnHdr := runar.ByteString("\x00\x6a\x4e")
+	bsvmMagic := runar.ByteString("BSVM\x02")
+	payload := runar.Cat(bsvmMagic, batchData)
+	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
+	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
+	c.AddDataOutput(0, opReturnScript)
 
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
@@ -116,26 +139,19 @@ func (c *BasefoldRollupContract) AdvanceState(
 // branch of an if/else chain. To preserve all three governance modes (none,
 // single_key, multisig 2-of-3 and 3-of-3) without reusing sig parameters
 // across branches, each governance action is split into a separate method
-// per mode + threshold. Spend-time selection happens by which method index
-// the unlocking script invokes.
+// per mode + threshold.
 //
 // Mode 0 (none) has no governance methods at all — the absence of any
 // FreezeSingleKey / FreezeMultiSig* method makes governance unreachable, and
-// a "none" shard cannot be frozen, unfrozen, or upgraded by anyone.
-//
-// The matrix is:
-//   - FreezeSingleKey    / UnfreezeSingleKey    / UpgradeSingleKey   (mode 1)
-//   - FreezeMultiSig2    / UnfreezeMultiSig2    / UpgradeMultiSig2   (mode 2, M=2)
-//   - FreezeMultiSig3    / UnfreezeMultiSig3    / UpgradeMultiSig3   (mode 2, M=3)
-//
-// Each method asserts the contract is in the matching governance mode and
-// (for multisig variants) the matching threshold, so a mode-1 shard cannot
-// be frozen by a mode-2 method and vice versa.
+// a "none" shard cannot be frozen, unfrozen, or upgraded by anyone. Under
+// Mode 1 (trust-minimized FRI) this also removes the only safety backstop
+// against a malicious advance. Use GovernanceNone with Mode 1 only for
+// deterministic testing.
 
 // ---- Freeze ----
 
 // FreezeSingleKey freezes the shard under single-key governance.
-func (c *BasefoldRollupContract) FreezeSingleKey(sig runar.Sig) {
+func (c *FRIRollupContract) FreezeSingleKey(sig runar.Sig) {
 	runar.Assert(c.Frozen == 0)
 	runar.Assert(c.GovernanceMode == 1)
 	runar.Assert(runar.CheckSig(sig, c.GovernanceKey))
@@ -143,7 +159,7 @@ func (c *BasefoldRollupContract) FreezeSingleKey(sig runar.Sig) {
 }
 
 // FreezeMultiSig2 freezes the shard under 2-of-3 multisig governance.
-func (c *BasefoldRollupContract) FreezeMultiSig2(sig1 runar.Sig, sig2 runar.Sig) {
+func (c *FRIRollupContract) FreezeMultiSig2(sig1 runar.Sig, sig2 runar.Sig) {
 	runar.Assert(c.Frozen == 0)
 	runar.Assert(c.GovernanceMode == 2)
 	runar.Assert(c.GovernanceThreshold == 2)
@@ -155,7 +171,7 @@ func (c *BasefoldRollupContract) FreezeMultiSig2(sig1 runar.Sig, sig2 runar.Sig)
 }
 
 // FreezeMultiSig3 freezes the shard under 3-of-3 multisig governance.
-func (c *BasefoldRollupContract) FreezeMultiSig3(sig1 runar.Sig, sig2 runar.Sig, sig3 runar.Sig) {
+func (c *FRIRollupContract) FreezeMultiSig3(sig1 runar.Sig, sig2 runar.Sig, sig3 runar.Sig) {
 	runar.Assert(c.Frozen == 0)
 	runar.Assert(c.GovernanceMode == 2)
 	runar.Assert(c.GovernanceThreshold == 3)
@@ -169,7 +185,7 @@ func (c *BasefoldRollupContract) FreezeMultiSig3(sig1 runar.Sig, sig2 runar.Sig,
 // ---- Unfreeze ----
 
 // UnfreezeSingleKey unfreezes the shard under single-key governance.
-func (c *BasefoldRollupContract) UnfreezeSingleKey(sig runar.Sig) {
+func (c *FRIRollupContract) UnfreezeSingleKey(sig runar.Sig) {
 	runar.Assert(c.Frozen == 1)
 	runar.Assert(c.GovernanceMode == 1)
 	runar.Assert(runar.CheckSig(sig, c.GovernanceKey))
@@ -177,7 +193,7 @@ func (c *BasefoldRollupContract) UnfreezeSingleKey(sig runar.Sig) {
 }
 
 // UnfreezeMultiSig2 unfreezes the shard under 2-of-3 multisig governance.
-func (c *BasefoldRollupContract) UnfreezeMultiSig2(sig1 runar.Sig, sig2 runar.Sig) {
+func (c *FRIRollupContract) UnfreezeMultiSig2(sig1 runar.Sig, sig2 runar.Sig) {
 	runar.Assert(c.Frozen == 1)
 	runar.Assert(c.GovernanceMode == 2)
 	runar.Assert(c.GovernanceThreshold == 2)
@@ -189,7 +205,7 @@ func (c *BasefoldRollupContract) UnfreezeMultiSig2(sig1 runar.Sig, sig2 runar.Si
 }
 
 // UnfreezeMultiSig3 unfreezes the shard under 3-of-3 multisig governance.
-func (c *BasefoldRollupContract) UnfreezeMultiSig3(sig1 runar.Sig, sig2 runar.Sig, sig3 runar.Sig) {
+func (c *FRIRollupContract) UnfreezeMultiSig3(sig1 runar.Sig, sig2 runar.Sig, sig3 runar.Sig) {
 	runar.Assert(c.Frozen == 1)
 	runar.Assert(c.GovernanceMode == 2)
 	runar.Assert(c.GovernanceThreshold == 3)
@@ -202,29 +218,24 @@ func (c *BasefoldRollupContract) UnfreezeMultiSig3(sig1 runar.Sig, sig2 runar.Si
 
 // ---- Upgrade ----
 //
-// Upgrade replaces the covenant script. The shard must be frozen first. A
-// valid Basefold proof for the next block must be provided and the new
-// covenant script hash must appear in the public values migration slot
-// ([240..272]).
+// Upgrade replaces the covenant script. The shard must be frozen first.
+// Mode 1 Upgrade does NOT carry an on-chain FRI proof check (same trust
+// model as AdvanceState) — governance key holders are trusted to
+// validate the new covenant script and its migration hash out-of-band.
+// The new covenant script hash must appear in the public values
+// migration slot ([240..272]).
 
 // UpgradeSingleKey upgrades the covenant under single-key governance.
 //
 // proofBlob is accepted as a public parameter to preserve the unlock-script
-// argument layout but is not consumed inside the script body — only the
-// proof field elements and Merkle inclusion proof are checked, plus the
-// public values bindings (including the migration hash slot).
-func (c *BasefoldRollupContract) UpgradeSingleKey(
+// argument layout against the future on-chain FRI verifier upgrade; it is
+// not consumed inside the script body.
+func (c *FRIRollupContract) UpgradeSingleKey(
 	sig runar.Sig,
 	newCovenantScript runar.ByteString,
 	publicValues runar.ByteString,
 	batchData runar.ByteString,
 	proofBlob runar.ByteString,
-	proofFieldA runar.Bigint,
-	proofFieldB runar.Bigint,
-	proofFieldC runar.Bigint,
-	merkleLeaf runar.ByteString,
-	merkleProof runar.ByteString,
-	merkleIndex runar.Bigint,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -232,10 +243,6 @@ func (c *BasefoldRollupContract) UpgradeSingleKey(
 	runar.Assert(runar.CheckSig(sig, c.GovernanceKey))
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
-
-	runar.Assert(runar.KbFieldMul(proofFieldA, proofFieldB) == proofFieldC)
-	computedRoot := runar.MerkleRootSha256(merkleLeaf, merkleProof, merkleIndex, 20)
-	runar.Assert(computedRoot == c.SP1VerifyingKeyHash)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
@@ -257,19 +264,13 @@ func (c *BasefoldRollupContract) UpgradeSingleKey(
 }
 
 // UpgradeMultiSig2 upgrades the covenant under 2-of-3 multisig governance.
-func (c *BasefoldRollupContract) UpgradeMultiSig2(
+func (c *FRIRollupContract) UpgradeMultiSig2(
 	sig1 runar.Sig,
 	sig2 runar.Sig,
 	newCovenantScript runar.ByteString,
 	publicValues runar.ByteString,
 	batchData runar.ByteString,
 	proofBlob runar.ByteString,
-	proofFieldA runar.Bigint,
-	proofFieldB runar.Bigint,
-	proofFieldC runar.Bigint,
-	merkleLeaf runar.ByteString,
-	merkleProof runar.ByteString,
-	merkleIndex runar.Bigint,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -281,10 +282,6 @@ func (c *BasefoldRollupContract) UpgradeMultiSig2(
 	))
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
-
-	runar.Assert(runar.KbFieldMul(proofFieldA, proofFieldB) == proofFieldC)
-	computedRoot := runar.MerkleRootSha256(merkleLeaf, merkleProof, merkleIndex, 20)
-	runar.Assert(computedRoot == c.SP1VerifyingKeyHash)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
@@ -306,7 +303,7 @@ func (c *BasefoldRollupContract) UpgradeMultiSig2(
 }
 
 // UpgradeMultiSig3 upgrades the covenant under 3-of-3 multisig governance.
-func (c *BasefoldRollupContract) UpgradeMultiSig3(
+func (c *FRIRollupContract) UpgradeMultiSig3(
 	sig1 runar.Sig,
 	sig2 runar.Sig,
 	sig3 runar.Sig,
@@ -314,12 +311,6 @@ func (c *BasefoldRollupContract) UpgradeMultiSig3(
 	publicValues runar.ByteString,
 	batchData runar.ByteString,
 	proofBlob runar.ByteString,
-	proofFieldA runar.Bigint,
-	proofFieldB runar.Bigint,
-	proofFieldC runar.Bigint,
-	merkleLeaf runar.ByteString,
-	merkleProof runar.ByteString,
-	merkleIndex runar.Bigint,
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -331,10 +322,6 @@ func (c *BasefoldRollupContract) UpgradeMultiSig3(
 	))
 
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
-
-	runar.Assert(runar.KbFieldMul(proofFieldA, proofFieldB) == proofFieldC)
-	computedRoot := runar.MerkleRootSha256(merkleLeaf, merkleProof, merkleIndex, 20)
-	runar.Assert(computedRoot == c.SP1VerifyingKeyHash)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)

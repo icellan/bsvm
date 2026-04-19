@@ -8,7 +8,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Tests: BasefoldRollupContract state fields
+// Tests: FRIRollupContract state fields
 // ---------------------------------------------------------------------------
 
 // sharedRollupMutableFields lists the state fields that BOTH rollup contract
@@ -52,16 +52,15 @@ func assertFieldsHaveTag(t *testing.T, rt reflect.Type, names []string, want str
 	}
 }
 
-func TestBasefoldRollupContract_StateFields(t *testing.T) {
-	rt := reflect.TypeOf(BasefoldRollupContract{})
+func TestFRIRollupContract_StateFields(t *testing.T) {
+	rt := reflect.TypeOf(FRIRollupContract{})
 	assertFieldsHaveTag(t, rt, sharedRollupMutableFields, "")
 	assertFieldsHaveTag(t, rt, sharedRollupReadonlyFields, "readonly")
 
-	// The Basefold variant must NOT carry any Groth16 VK readonly fields —
-	// that's the whole point of the split.
+	// Mode 1 must NOT carry any Groth16 VK readonly fields.
 	for _, name := range groth16ExtraReadonlyFields {
 		if _, ok := rt.FieldByName(name); ok {
-			t.Errorf("BasefoldRollupContract should not carry Groth16 VK field %s", name)
+			t.Errorf("FRIRollupContract should not carry Groth16 VK field %s", name)
 		}
 	}
 }
@@ -91,17 +90,18 @@ func TestGroth16WARollupContract_StateFields(t *testing.T) {
 // Tests: rollup variants expose AdvanceState with the correct arity
 // ---------------------------------------------------------------------------
 
-func TestBasefoldRollupContract_AdvanceStateParamCount(t *testing.T) {
-	// Receiver + 11 args: newStateRoot, newBlockNumber, publicValues,
-	// batchData, proofBlob, proofFieldA/B/C, merkleLeaf, merkleProof,
-	// merkleIndex. Total = 12.
-	rt := reflect.TypeOf(&BasefoldRollupContract{})
+func TestFRIRollupContract_AdvanceStateParamCount(t *testing.T) {
+	// Receiver + 5 args: newStateRoot, newBlockNumber, publicValues,
+	// batchData, proofBlob. Mode 1 does NOT verify the FRI proof
+	// on-chain (trust-minimized bridge) so it carries no proof-field /
+	// Merkle-path positional args. Total = 6.
+	rt := reflect.TypeOf(&FRIRollupContract{})
 	m, ok := rt.MethodByName("AdvanceState")
 	if !ok {
-		t.Fatal("BasefoldRollupContract missing method AdvanceState")
+		t.Fatal("FRIRollupContract missing method AdvanceState")
 	}
-	if got := m.Type.NumIn(); got != 12 {
-		t.Errorf("BasefoldRollupContract.AdvanceState: expected 12 params (incl receiver), got %d", got)
+	if got := m.Type.NumIn(); got != 6 {
+		t.Errorf("FRIRollupContract.AdvanceState: expected 6 params (incl receiver), got %d", got)
 	}
 }
 
@@ -162,8 +162,8 @@ func requireMethodArity(t *testing.T, rt reflect.Type, name string, wantParams i
 	}
 }
 
-func TestBasefoldRollupContract_FreezeMethods(t *testing.T) {
-	rt := reflect.TypeOf(&BasefoldRollupContract{})
+func TestFRIRollupContract_FreezeMethods(t *testing.T) {
+	rt := reflect.TypeOf(&FRIRollupContract{})
 	// FreezeSingleKey: receiver + sig                   = 2
 	// FreezeMultiSig2: receiver + sig1, sig2            = 3
 	// FreezeMultiSig3: receiver + sig1, sig2, sig3      = 4
@@ -172,22 +172,22 @@ func TestBasefoldRollupContract_FreezeMethods(t *testing.T) {
 	requireMethodArity(t, rt, "FreezeMultiSig3", 4)
 }
 
-func TestBasefoldRollupContract_UnfreezeMethods(t *testing.T) {
-	rt := reflect.TypeOf(&BasefoldRollupContract{})
+func TestFRIRollupContract_UnfreezeMethods(t *testing.T) {
+	rt := reflect.TypeOf(&FRIRollupContract{})
 	requireMethodArity(t, rt, "UnfreezeSingleKey", 2)
 	requireMethodArity(t, rt, "UnfreezeMultiSig2", 3)
 	requireMethodArity(t, rt, "UnfreezeMultiSig3", 4)
 }
 
-func TestBasefoldRollupContract_UpgradeMethods(t *testing.T) {
-	// Common upgrade payload (excluding sigs) for Basefold is 12 args:
-	// newCovenantScript, publicValues, batchData, proofBlob,
-	// proofFieldA/B/C, merkleLeaf, merkleProof, merkleIndex, newBlockNumber.
-	// + receiver + sigs.
-	rt := reflect.TypeOf(&BasefoldRollupContract{})
-	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+11) // receiver + sig + 11 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+11) // receiver + 2 sigs + 11 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+11) // receiver + 3 sigs + 11 payload
+func TestFRIRollupContract_UpgradeMethods(t *testing.T) {
+	// Mode 1 Upgrade does NOT carry an on-chain proof check (same trust
+	// model as AdvanceState). Common upgrade payload (excluding sigs) is
+	// 5 args: newCovenantScript, publicValues, batchData, proofBlob,
+	// newBlockNumber.
+	rt := reflect.TypeOf(&FRIRollupContract{})
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+5) // receiver + sig + 5 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+5) // receiver + 2 sigs + 5 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+5) // receiver + 3 sigs + 5 payload
 }
 
 func TestGroth16RollupContract_FreezeMethods(t *testing.T) {

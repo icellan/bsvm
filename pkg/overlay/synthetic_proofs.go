@@ -1,10 +1,8 @@
 package overlay
 
 import (
-	"crypto/sha256"
 	_ "embed"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
@@ -17,49 +15,25 @@ import (
 	"github.com/icellan/runar/packages/runar-go/bn254witness"
 )
 
-// syntheticBasefoldMerkleDepth matches the Basefold rollup contract's fixed
-// Merkle depth (20). The synthetic leaf/proof scaffolding below produces a
-// depth-20 inclusion proof that reconstructs to a deterministic root.
-const syntheticBasefoldMerkleDepth = 20
-
-// syntheticBasefoldKBPrime is the KoalaBear prime used by BasefoldRollup
-// Contract's proof field check (proofA * proofB == proofC mod p).
-const syntheticBasefoldKBPrime int64 = 2130706433
-
-// syntheticBasefoldProof returns a BasefoldProof populated with the
-// deterministic mock values used by the hermetic test suite. Real prover
-// binaries replace these with values extracted from the SP1 proof envelope.
+// syntheticFRIProof returns a FRIProof populated with the deterministic
+// mock values used by the hermetic test suite. Real prover binaries
+// replace these with values extracted from the SP1 proof envelope.
 //
-// The publicValues field is REBUILT in the Basefold contract's expected
-// layout rather than re-using the prover's PublicValues.Encode() blob. The
-// prover's layout places receipts hash / gas used at offsets that conflict
-// with the contract's proofBlobHash / chainId-LE expectations, so when
-// targeting the Basefold contract the mode-specific proof generator owns
-// the public values serialization itself.
+// Mode 1 (FRIRollupContract) does not verify the SP1 FRI proof on-chain,
+// so no KoalaBear field elements or Merkle authentication paths are
+// required — the 5-arg advanceState call just forwards the proof blob
+// for off-chain verification.
 //
-// The layout reconstructed here is the same one that
-// test/integration/fixtures.go::buildFullPV produces, which matches the
-// checks in pkg/covenant/contracts/rollup_basefold.runar.go::AdvanceState:
-//
-//	[0..32)    preStateRoot
-//	[32..64)   postStateRoot
-//	[64..96)   hash256(proofBlob)
-//	[96..104)  zero padding
-//	[104..136) hash256(batchData)
-//	[136..144) chainId (little-endian, 8 bytes)
-//	[144..272) four 32-byte zero slots (reserved: withdrawal root,
-//	           migration script hash, inbox roots, etc.)
-func syntheticBasefoldProof(proverValues, batch, blob []byte) *covenant.BasefoldProof {
-	const leafIndex = 7
-	leafHex := hexSha256Once("00")
-	proofHex, _ := buildSyntheticDepth20Proof(leafHex, leafIndex)
-	const proofA int64 = 1_000_000
-	const proofB int64 = 2_000_000
-	proofC := (proofA * proofB) % syntheticBasefoldKBPrime
-
-	// Parse the pre/post state roots and chain ID from the prover's 272-byte
-	// PublicValues blob so we can re-serialise them in the Basefold layout.
-	// The prover writes:
+// The publicValues field is REBUILT in the rollup contract's expected
+// layout rather than re-using the prover's PublicValues.Encode() blob:
+// the prover's raw layout places receipts hash / gas used at offsets
+// that conflict with the contract's batchDataHash / chainId-LE
+// expectations. Mode 1, Mode 2, and Mode 3 all share the same layout,
+// assembled by buildAdvancePublicValues below.
+func syntheticFRIProof(proverValues, batch, blob []byte) *covenant.FRIProof {
+	// Parse the pre/post state roots and chain ID from the prover's
+	// 272-byte PublicValues blob so we can re-serialise them in the
+	// rollup contract layout. The prover writes:
 	//   [0..32]   PreStateRoot
 	//   [32..64]  PostStateRoot
 	//   [136..144] ChainID (big-endian uint64)
@@ -71,28 +45,22 @@ func syntheticBasefoldProof(proverValues, batch, blob []byte) *covenant.Basefold
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
 
-	basefoldPV := buildBasefoldPublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
 
-	return &covenant.BasefoldProof{
-		Values:          basefoldPV,
-		Batch:           batch,
-		Blob:            blob,
-		ProofA:          proofA,
-		ProofB:          proofB,
-		ProofC:          proofC,
-		MerkleLeafHex:   leafHex,
-		MerkleProofHex:  proofHex,
-		MerkleLeafIndex: int64(leafIndex),
+	return &covenant.FRIProof{
+		Values: pv,
+		Batch:  batch,
+		Blob:   blob,
 	}
 }
 
-// buildBasefoldPublicValues returns the 272-byte public-values blob expected
-// by the BasefoldRollupContract.AdvanceState on-chain checks. chainID is
-// serialised as 8 little-endian bytes to match runar.Num2Bin(chainId, 8).
-// The hash256 helper is shared with pkg/overlay/inbox_monitor.go and
-// implements Bitcoin's OP_HASH256 (sha256(sha256(data))) matching
-// runar.Hash256 on the contract side.
-func buildBasefoldPublicValues(preStateRoot, postStateRoot, batchData, proofBlob []byte, chainID uint64) []byte {
+// buildAdvancePublicValues returns the 272-byte public-values blob
+// expected by every rollup contract's AdvanceState on-chain checks.
+// chainID is serialised as 8 little-endian bytes to match
+// runar.Num2Bin(chainId, 8). The hash256 helper implements Bitcoin's
+// OP_HASH256 (sha256(sha256(data))) matching runar.Hash256 on the
+// contract side.
+func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob []byte, chainID uint64) []byte {
 	buf := make([]byte, 272)
 	copy(buf[0:32], preStateRoot)
 	copy(buf[32:64], postStateRoot)
@@ -135,7 +103,7 @@ func syntheticGroth16GenericProof(proverValues, batch, blob []byte) (*covenant.G
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
 
-	pv := buildBasefoldPublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
 
 	return &covenant.Groth16GenericProof{
 		Values:   pv,
@@ -362,7 +330,7 @@ func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth1
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
 
-	pv := buildBasefoldPublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
 
 	return &covenant.Groth16WitnessProof{
 		Values:  pv,
@@ -380,8 +348,8 @@ func BuildAdvanceProofForOutput(
 	batch []byte,
 ) (covenant.AdvanceProof, error) {
 	switch out.Mode {
-	case prover.ProofModeBasefold:
-		return syntheticBasefoldProof(out.PublicValues, batch, out.Proof), nil
+	case prover.ProofModeFRI:
+		return syntheticFRIProof(out.PublicValues, batch, out.Proof), nil
 	case prover.ProofModeGroth16Generic:
 		return syntheticGroth16GenericProof(out.PublicValues, batch, out.Proof)
 	case prover.ProofModeGroth16Witness:
@@ -397,38 +365,3 @@ func (e unknownProofModeError) Error() string {
 	return "overlay: unknown proof mode " + prover.ProofMode(e).String()
 }
 
-// ---------------------------------------------------------------------------
-// Hashing helpers used by the synthetic Basefold Merkle scaffolding. These
-// mirror the helpers in pkg/covenant/runar_broadcast.go so the hermetic
-// test suite and the integration broadcast client agree on the mock root
-// value.
-// ---------------------------------------------------------------------------
-
-func hexSha256Once(h string) string {
-	data, _ := hex.DecodeString(h)
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-// buildSyntheticDepth20Proof replicates buildHexDepth20Proof from
-// test/integration/rollup_full_test.go for a given leaf index.
-func buildSyntheticDepth20Proof(leafHex string, index int) (proofHex, rootHex string) {
-	var siblings []string
-	current := leafHex
-	idx := index
-	for d := 0; d < syntheticBasefoldMerkleDepth; d++ {
-		sibling := hexSha256Once(hex.EncodeToString([]byte{byte(d), byte(idx ^ 1)}))
-		siblings = append(siblings, sibling)
-		if idx&1 == 0 {
-			current = hexSha256Once(current + sibling)
-		} else {
-			current = hexSha256Once(sibling + current)
-		}
-		idx >>= 1
-	}
-	p := ""
-	for _, s := range siblings {
-		p += s
-	}
-	return p, current
-}

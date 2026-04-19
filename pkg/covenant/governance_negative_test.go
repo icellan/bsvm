@@ -13,15 +13,15 @@ import (
 //
 //    The only authorization for covenant advance is the SP1 STARK proof.
 //    Governance keys can freeze/unfreeze/upgrade only. At the Go-manager
-//    layer this is enforced structurally: BuildAdvanceData / AdvanceState
-//    do NOT accept any signature parameter. These tests prove that contract
-//    AND prove that frozen-state + proof bytes are the sole advance inputs.
+//    layer this is enforced structurally: ValidateAdvanceData /
+//    BroadcastAdvance do NOT accept any signature parameter. These tests
+//    prove that frozen-state + proof bytes are the sole advance inputs.
 // ---------------------------------------------------------------------------
 
 // TestGovernanceNeg_AdvanceAPIHasNoSignatureParam locks in the API contract
 // that governance signatures MUST NOT be an input to covenant state
 // advancement. If someone adds a Sig/Signature/PubKey parameter to
-// BuildAdvanceData or AdvanceState in the future, this test fails.
+// ValidateAdvanceData or BroadcastAdvance in the future, this test fails.
 func TestGovernanceNeg_AdvanceAPIHasNoSignatureParam(t *testing.T) {
 	cm := newTestManager(t, 0, 0, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
@@ -29,18 +29,18 @@ func TestGovernanceNeg_AdvanceAPIHasNoSignatureParam(t *testing.T) {
 		Threshold: 3,
 	})
 
-	// Reflect on BuildAdvanceData's method type.
-	buildAdv := reflect.ValueOf(cm).MethodByName("BuildAdvanceData")
+	// Reflect on ValidateAdvanceData's method type.
+	buildAdv := reflect.ValueOf(cm).MethodByName("ValidateAdvanceData")
 	if !buildAdv.IsValid() {
-		t.Fatal("CovenantManager.BuildAdvanceData not found")
+		t.Fatal("CovenantManager.ValidateAdvanceData not found")
 	}
-	assertNoSignatureParam(t, "BuildAdvanceData", buildAdv.Type())
+	assertNoSignatureParam(t, "ValidateAdvanceData", buildAdv.Type())
 
-	adv := reflect.ValueOf(cm).MethodByName("AdvanceState")
+	adv := reflect.ValueOf(cm).MethodByName("BroadcastAdvance")
 	if !adv.IsValid() {
-		t.Fatal("CovenantManager.AdvanceState not found")
+		t.Fatal("CovenantManager.BroadcastAdvance not found")
 	}
-	assertNoSignatureParam(t, "AdvanceState", adv.Type())
+	assertNoSignatureParam(t, "BroadcastAdvance", adv.Type())
 }
 
 // assertNoSignatureParam fails the test if any parameter of the method
@@ -67,7 +67,7 @@ func assertNoSignatureParam(t *testing.T, method string, mt reflect.Type) {
 // produce a CovenantState advance by signing — the only accepted inputs
 // are a proof, public values, and batch data. Supplying "signatures" as
 // proof/public-values bytes does not help: the advance still goes through
-// BuildAdvanceData which only gates on frozen flag and block-number
+// ValidateAdvanceData which only gates on frozen flag and block-number
 // increment, and the Rúnar script-level STARK check (exercised elsewhere)
 // rejects anything that isn't a real proof. Here we verify the Go layer
 // behaviour: even with governance fully configured, the only way for the
@@ -92,24 +92,24 @@ func TestGovernanceNeg_MultisigHoldersCannotAdvance(t *testing.T) {
 
 	// Attempting to advance with EMPTY proof bytes fails — the signatures
 	// from the governance holders are not accepted as an advance proof.
-	if _, err := cm.BuildAdvanceData(newState, []byte("batch"), nil, []byte("pv")); err == nil {
+	if err := cm.ValidateAdvanceData(newState, []byte("batch"), nil, []byte("pv")); err == nil {
 		t.Fatal("advance with empty proof must be rejected even under full multisig control")
 	}
 
 	// Attempting to advance with empty public values fails — again,
 	// governance signatures do not substitute for the SP1 proof bundle.
-	if _, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), nil); err == nil {
+	if err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), nil); err == nil {
 		t.Fatal("advance with empty public values must be rejected")
 	}
 
 	// Attempting to advance with no batch data fails.
-	if _, err := cm.BuildAdvanceData(newState, nil, []byte("proof"), []byte("pv")); err == nil {
+	if err := cm.ValidateAdvanceData(newState, nil, []byte("proof"), []byte("pv")); err == nil {
 		t.Fatal("advance with empty batch data must be rejected")
 	}
 
 	// The only way the manager accepts an advance is with non-empty
 	// proof/pv/batch. That is the SP1-proof path — not a governance path.
-	if _, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv")); err != nil {
+	if err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv")); err != nil {
 		t.Fatalf("advance with proof should succeed (governance keys are irrelevant here): %v", err)
 	}
 }
@@ -204,7 +204,7 @@ func TestGovernanceNeg_Multisig3of5_DuplicateKeysFlagged(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestGovernanceNeg_Frozen3of5_AdvanceBlocked asserts that when a 3-of-5
-// multisig shard is frozen, AdvanceState / BuildAdvanceData are rejected
+// multisig shard is frozen, advance validation is rejected
 // regardless of proof validity. Freeze/unfreeze is simulated by directly
 // applying the state transition — the real freeze is signed on-chain by
 // three governance holders (exercised in the contracts package tests).
@@ -233,14 +233,14 @@ func TestGovernanceNeg_Frozen3of5_AdvanceBlocked(t *testing.T) {
 		t.Fatal("shard must be frozen after apply")
 	}
 
-	// AdvanceState while frozen MUST be rejected, even with a non-empty
+	// Advance validation while frozen MUST be rejected, even with a non-empty
 	// proof (the frozen guard runs before proof-shape checks).
-	_, err := cm.BuildAdvanceData(
+	err := cm.ValidateAdvanceData(
 		CovenantState{StateRoot: testStateRoot(8), BlockNumber: 8, Frozen: 0},
 		[]byte("batch"), []byte("proof"), []byte("pv"),
 	)
 	if err == nil {
-		t.Fatal("frozen shard must reject BuildAdvanceData")
+		t.Fatal("frozen shard must reject ValidateAdvanceData")
 	}
 	if !strings.Contains(err.Error(), "frozen") {
 		t.Errorf("expected frozen-related error, got %v", err)
@@ -257,7 +257,7 @@ func TestGovernanceNeg_Frozen3of5_AdvanceBlocked(t *testing.T) {
 	}
 
 	// After unfreeze, a valid-shape advance succeeds.
-	if _, err := cm.BuildAdvanceData(
+	if err := cm.ValidateAdvanceData(
 		CovenantState{StateRoot: testStateRoot(8), BlockNumber: 8, Frozen: 0},
 		[]byte("batch"), []byte("proof"), []byte("pv"),
 	); err != nil {
@@ -266,13 +266,12 @@ func TestGovernanceNeg_Frozen3of5_AdvanceBlocked(t *testing.T) {
 }
 
 // TestGovernanceNeg_UpgradeRequiresFrozen locks in the manager-level
-// contract that upgrade scripts are only meaningful when the shard is
+// contract that upgrade semantics are only meaningful when the shard is
 // frozen. The actual "must be frozen" check is enforced by the on-chain
 // Rúnar script (see UpgradeSingleKey/UpgradeMultiSig* in
 // rollup_basefold.runar.go which all assert c.Frozen == 1). At the Go
-// layer we verify that BuildUpgradeUnlockScript produces a script even
-// when the shard is active — the enforcement is script-level — and that
-// the manager itself correctly reports frozen status.
+// layer we verify only the manager's frozen-state reporting and advance
+// validation behaviour.
 func TestGovernanceNeg_UpgradeRequiresFrozen(t *testing.T) {
 	cm := newTestManager(t, 0, 10, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
@@ -283,18 +282,7 @@ func TestGovernanceNeg_UpgradeRequiresFrozen(t *testing.T) {
 		t.Fatal("expected active shard")
 	}
 
-	// Upgrade script-building does not check frozen status (that's on-chain).
-	// Here we just verify it produces a script structure; the actual frozen
-	// guard is enforced by the runar contract.
-	script, err := BuildUpgradeUnlockScript([]byte("gov-sig"), []byte("new-covenant-v2"))
-	if err != nil {
-		t.Fatalf("BuildUpgradeUnlockScript failed: %v", err)
-	}
-	if len(script) == 0 {
-		t.Fatal("upgrade script must not be empty")
-	}
-
-	// But a BuildAdvanceData call on an active shard still must reject
+	// But a ValidateAdvanceData call on an active shard still must reject
 	// anything that would install an upgrade — at the Go layer we can't
 	// distinguish upgrade vs advance payloads, but we CAN assert that
 	// frozen-state blocks the advance API entirely once frozen.
@@ -303,7 +291,7 @@ func TestGovernanceNeg_UpgradeRequiresFrozen(t *testing.T) {
 	if err := cm.ApplyAdvance(types.BytesToHash([]byte{0xF2}), frozen); err != nil {
 		t.Fatalf("freeze apply failed: %v", err)
 	}
-	if _, err := cm.BuildAdvanceData(
+	if err := cm.ValidateAdvanceData(
 		CovenantState{StateRoot: testStateRoot(11), BlockNumber: 11},
 		[]byte("batch"), []byte("proof"), []byte("pv"),
 	); err == nil {

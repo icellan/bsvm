@@ -47,7 +47,7 @@ type ShardConfig struct {
 	GovernanceThreshold int `json:"governanceThreshold,omitempty"`
 
 	// VerificationMode selects the on-chain proof verification strategy:
-	// "groth16" or "basefold".
+	// "groth16" or "fri".
 	VerificationMode string `json:"verificationMode"`
 
 	// GenesisStateRoot is the hex-encoded state root after genesis
@@ -114,8 +114,8 @@ func (c *ShardConfig) Validate() error {
 	if c.VerificationMode == "" {
 		return fmt.Errorf("verification mode must not be empty")
 	}
-	if c.VerificationMode != "groth16" && c.VerificationMode != "basefold" {
-		return fmt.Errorf("verification mode must be groth16 or basefold, got %q", c.VerificationMode)
+	if c.VerificationMode != "groth16" && c.VerificationMode != "fri" {
+		return fmt.Errorf("verification mode must be groth16 or fri, got %q", c.VerificationMode)
 	}
 	if c.HashFunction == "" {
 		return fmt.Errorf("hash function must not be empty")

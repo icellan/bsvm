@@ -4,17 +4,23 @@ import runar "github.com/icellan/runar/packages/runar-go"
 
 // SP1 v6.0.2 proof verification subroutines for the BSVM rollup covenant.
 //
-// This file defines the KoalaBear field arithmetic and Poseidon2 hash
-// operations needed by the rollup covenant's proof verification. Two
-// verification paths are supported:
+// This file defines the KoalaBear field arithmetic, Ext4 arithmetic, and
+// Poseidon2 hash operations that the future on-chain FRI verifier (Gate
+// 0a Full, see spec 12 / 13) will consume. The current Mode 1 covenant
+// (rollup_fri.runar.go) does NOT consult any of these helpers — Mode 1
+// is the trust-minimized FRI bridge, not the on-chain verifier.
 //
-//   - Basefold (mode 0): Native KoalaBear + Poseidon2 Merkle verification
-//     in Bitcoin Script. No trusted setup.
-//   - Groth16 (mode 1): BN254 pairing verification of a ~256-byte wrapped
-//     proof. Requires trusted setup (BN254 CRS from SP1).
+// The helpers are retained in-tree as building blocks ready for the
+// Gate 0a Full implementation. If that path is abandoned or replaced
+// with a different PCS, this file can be deleted without affecting the
+// compiled covenants.
 //
-// The rollup covenant (rollup.runar.go) calls these functions during
-// AdvanceState to verify the SP1 STARK proof.
+// Verification paths currently implemented:
+//
+//   - Mode 1 (FRI bridge, VerifyFRI): no on-chain proof check.
+//   - Mode 2 (Groth16):   BN254 pairing of a ~256-byte wrapped proof.
+//   - Mode 3 (Groth16-WA): witness-assisted Groth16 via compile-time
+//     inlined verifier preamble.
 
 // ---------------------------------------------------------------------------
 // KoalaBear Field Constants
@@ -263,17 +269,18 @@ func Poseidon2Compress(left, right [Poseidon2DigestSize]runar.Bigint) [Poseidon2
 }
 
 // ---------------------------------------------------------------------------
-// Basefold Verification (Path 1)
+// FRI Verification primitives (reserved for Gate 0a Full)
 // ---------------------------------------------------------------------------
 //
-// VerifyBasefoldQuery verifies a single Basefold query by checking:
-//   1. The folding equation (KoalaBear field arithmetic)
-//   2. The Poseidon2 Merkle authentication path
-//
-// In the rollup covenant, this is called for each of the 124 (core) or
-// 94 (shrink/wrap) queries. The Rúnar compiler unrolls the query loop.
+// These helpers implement the FRI query / folding / Merkle primitives
+// that a full on-chain FRI verifier (Gate 0a Full) will compose into a
+// production Mode 1 AdvanceState body. They are currently unused by the
+// compiled covenant — Mode 1 is the trust-minimized FRI bridge. Naming
+// retains "Basefold" where callers from future revisions may expect it;
+// it is a misnomer (SP1 uses FRI, not Basefold), and these identifiers
+// may be renamed when the full verifier is wired up.
 
-// BasefoldFoldingCheck verifies the Basefold folding equation for one layer.
+// BasefoldFoldingCheck verifies one FRI folding layer's equation.
 // Given evaluations at positions q and q+half, the folding challenge alpha,
 // and the twiddle factor omega^q, it computes the expected next-layer value.
 //

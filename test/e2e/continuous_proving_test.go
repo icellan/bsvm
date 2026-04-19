@@ -151,7 +151,7 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 // It runs with the default Basefold proof mode and asserts the broadcast
 // carries a non-nil AdvanceProof plus the usual state/confirmation shape.
 func TestContinuousProvingLoop(t *testing.T) {
-	cs := newContinuousSetup(t, 1, prover.ProofModeBasefold)
+	cs := newContinuousSetup(t, 1, prover.ProofModeFRI)
 	defer cs.node.Stop()
 
 	cs.node.StartConfirmationWatcher(cs.fake, 50*time.Millisecond)
@@ -182,7 +182,7 @@ func TestContinuousProvingLoop(t *testing.T) {
 		if req.Proof == nil {
 			t.Fatalf("batch %d: advance proof must not be nil", i+1)
 		}
-		if got := req.Proof.Mode(); got != covenant.ProofModeBasefold {
+		if got := req.Proof.Mode(); got != covenant.ProofModeFRI {
 			t.Errorf("batch %d: advance proof mode = %s, want basefold", i+1, got)
 		}
 		if len(req.Proof.ProofBlob()) == 0 {
@@ -231,7 +231,7 @@ func TestContinuousProvingLoop(t *testing.T) {
 // broadcast leaves provenTip advanced (block committed locally) but never
 // advances confirmedTip or finalizedTip, and that no broadcast is tracked.
 func TestContinuousProvingLoop_BroadcastRejection(t *testing.T) {
-	cs := newContinuousSetup(t, 3, prover.ProofModeBasefold)
+	cs := newContinuousSetup(t, 3, prover.ProofModeFRI)
 	defer cs.node.Stop()
 
 	cs.fake.RejectBroadcast = true
@@ -269,11 +269,11 @@ func TestContinuousProvingLoop_BroadcastRejection(t *testing.T) {
 }
 
 // TestContinuousProvingLoop_Basefold drives the overlay with the Basefold
-// proof mode and asserts that every broadcast carries a BasefoldProof whose
+// proof mode and asserts that every broadcast carries a FRIProof whose
 // ContractCallArgs produces the 11-arg slice expected by
-// BasefoldRollupContract.AdvanceState.
+// FRIRollupContract.AdvanceState.
 func TestContinuousProvingLoop_Basefold(t *testing.T) {
-	cs := newContinuousSetup(t, 5, prover.ProofModeBasefold)
+	cs := newContinuousSetup(t, 5, prover.ProofModeFRI)
 	defer cs.node.Stop()
 
 	recipient := types.HexToAddress("0x00000000000000000000000000000000000000cc")
@@ -296,11 +296,11 @@ func TestContinuousProvingLoop_Basefold(t *testing.T) {
 		if req.Proof == nil {
 			t.Fatalf("batch %d: advance proof must not be nil", i+1)
 		}
-		if got := req.Proof.Mode(); got != covenant.ProofModeBasefold {
+		if got := req.Proof.Mode(); got != covenant.ProofModeFRI {
 			t.Errorf("batch %d: mode = %s, want basefold", i+1, got)
 		}
-		if _, ok := req.Proof.(*covenant.BasefoldProof); !ok {
-			t.Errorf("batch %d: proof concrete type = %T, want *covenant.BasefoldProof", i+1, req.Proof)
+		if _, ok := req.Proof.(*covenant.FRIProof); !ok {
+			t.Errorf("batch %d: proof concrete type = %T, want *covenant.FRIProof", i+1, req.Proof)
 		}
 		args, err := req.Proof.ContractCallArgs(req)
 		if err != nil {

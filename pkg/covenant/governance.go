@@ -17,12 +17,15 @@ const (
 	// witness-assisted technique minimizes script size.
 	VerifyGroth16 VerificationMode = iota
 
-	// VerifyBasefold verifies the SP1 STARK proof natively using KoalaBear
-	// field arithmetic and Poseidon2 Merkle verification in Bitcoin Script.
-	// No trusted setup required (fully transparent). Larger proof (~1.2 MB)
-	// and larger script (1-5 MB estimated). Use when the BN254 trusted
-	// setup is unacceptable for the shard's threat model.
-	VerifyBasefold
+	// VerifyFRI is the trust-minimized SP1 FRI bridge mode (Mode 1). The
+	// covenant binds state transitions (block+1, state roots, batch hash,
+	// chain id) but does NOT verify the SP1 FRI proof on-chain. Off-chain
+	// nodes verify the proof; governance freeze is the only recourse
+	// against a malicious advance. NOT mainnet-eligible — PrepareGenesis
+	// rejects Mainnet=true with this mode. Use only for testnet /
+	// experimental shards until Gate 0a Full replaces this with a fully
+	// on-chain FRI verifier. See rollup_fri.runar.go and spec 12.
+	VerifyFRI
 
 	// VerifyGroth16WA uses SP1's Groth16/BN254 wrapping combined with the
 	// witness-assisted Rúnar verifier. The SP1 VK is baked into a compile-
@@ -38,8 +41,8 @@ func (m VerificationMode) String() string {
 	switch m {
 	case VerifyGroth16:
 		return "groth16"
-	case VerifyBasefold:
-		return "basefold"
+	case VerifyFRI:
+		return "fri"
 	case VerifyGroth16WA:
 		return "groth16-wa"
 	default:

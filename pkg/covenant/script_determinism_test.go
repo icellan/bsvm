@@ -24,11 +24,11 @@ func TestScriptDeterminism_Basefold(t *testing.T) {
 		Threshold: 2,
 	}
 
-	a, err := CompileBasefoldRollup(vk, chainID, gov)
+	a, err := CompileFRIRollup(vk, chainID, gov)
 	if err != nil {
 		t.Fatalf("first Basefold compile failed: %v", err)
 	}
-	b, err := CompileBasefoldRollup(vk, chainID, gov)
+	b, err := CompileFRIRollup(vk, chainID, gov)
 	if err != nil {
 		t.Fatalf("second Basefold compile failed: %v", err)
 	}

@@ -50,8 +50,8 @@ func TestGovernanceStateMachine_ActiveToFrozen(t *testing.T) {
 	}
 
 	// Simulate freeze: governance key holder applies a state transition
-	// that sets Frozen=1. On-chain this is done via BuildFreezeUnlockScript;
-	// here we simulate the result by applying the frozen state.
+	// that sets Frozen=1. Here we simulate the result by applying the
+	// frozen state directly.
 	frozenState := CovenantState{
 		StateRoot:   cm.CurrentState().StateRoot, // state root unchanged during freeze
 		BlockNumber: cm.CurrentState().BlockNumber,
@@ -112,7 +112,7 @@ func TestGovernanceStateMachine_FrozenToActive(t *testing.T) {
 		BlockNumber: 11,
 		Frozen:      0,
 	}
-	_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err != nil {
 		t.Fatalf("advance after unfreeze should succeed: %v", err)
 	}
@@ -130,17 +130,6 @@ func TestGovernanceStateMachine_FrozenToUpgrade(t *testing.T) {
 	// Verify shard is frozen.
 	if cm.CurrentState().Frozen != 1 {
 		t.Fatal("expected shard to be frozen (Frozen=1)")
-	}
-
-	// Build the upgrade unlock script. This requires the shard to be frozen.
-	sig := []byte("governance-signature")
-	newScript := []byte("new-covenant-script-v2")
-	upgradeScript, err := BuildUpgradeUnlockScript(sig, newScript)
-	if err != nil {
-		t.Fatalf("BuildUpgradeUnlockScript failed: %v", err)
-	}
-	if len(upgradeScript) == 0 {
-		t.Fatal("upgrade unlock script should not be empty")
 	}
 
 	// Simulate the upgrade result: the covenant UTXO transitions to a
@@ -182,7 +171,7 @@ func TestGovernanceStateMachine_FrozenToUpgrade(t *testing.T) {
 		BlockNumber: 21,
 		Frozen:      0,
 	}
-	_, err = cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err != nil {
 		t.Fatalf("advance after upgrade+unfreeze should succeed: %v", err)
 	}
@@ -198,15 +187,11 @@ func TestGovernanceStateMachine_ActiveToUpgradeRejected(t *testing.T) {
 		Keys: [][]byte{testKey(1)},
 	})
 
-	// Attempting to build an upgrade unlock script is allowed (it just
-	// builds the script data), but the on-chain covenant would reject
-	// the transaction because the shard is not frozen.
-	//
 	// At the manager level, we verify that the shard is active and
-	// BuildAdvanceData works normally. The state machine constraint
+	// ValidateAdvanceData works normally. The state machine constraint
 	// "upgrade only when frozen" is enforced by the on-chain script,
 	// but the manager-level test validates that the freeze guard on
-	// BuildAdvanceData is working by confirming advances still work
+	// ValidateAdvanceData is working by confirming advances still work
 	// while active.
 	if cm.CurrentState().Frozen != 0 {
 		t.Fatal("expected shard to be active")
@@ -218,7 +203,7 @@ func TestGovernanceStateMachine_ActiveToUpgradeRejected(t *testing.T) {
 		BlockNumber: 31,
 		Frozen:      0,
 	}
-	_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err != nil {
 		t.Fatalf("advance while active should succeed: %v", err)
 	}
@@ -230,7 +215,7 @@ func TestGovernanceStateMachine_ActiveToUpgradeRejected(t *testing.T) {
 	// at the script level. At the manager level, we just verify the
 	// manager's state is correct.
 	//
-	// The key constraint: if frozen=0, BuildAdvanceData succeeds normally.
+	// The key constraint: if frozen=0, ValidateAdvanceData succeeds normally.
 	// The upgrade-requires-frozen constraint is enforced on-chain.
 	if cm.CurrentState().Frozen != 0 {
 		t.Fatal("shard should still be active after successful advance")
@@ -256,7 +241,7 @@ func TestGovernanceStateMachine_AdvanceWhileFrozen(t *testing.T) {
 		BlockNumber: 41,
 		Frozen:      0,
 	}
-	_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err == nil {
 		t.Fatal("advance while frozen should be rejected")
 	}
@@ -273,7 +258,7 @@ func TestGovernanceStateMachine_AdvanceWhileFrozen(t *testing.T) {
 		BlockNumber: 41,
 		Frozen:      1,
 	}
-	_, err = cm.BuildAdvanceData(frozenNewState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err = cm.ValidateAdvanceData(frozenNewState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err == nil {
 		t.Fatal("advance while frozen should be rejected regardless of new state frozen flag")
 	}
@@ -322,7 +307,7 @@ func TestGovernanceStateMachine_NoneHasNoGovernanceMethods(t *testing.T) {
 		BlockNumber: 1,
 		Frozen:      0,
 	}
-	_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err != nil {
 		t.Fatalf("advance with GovernanceNone should succeed: %v", err)
 	}
@@ -408,7 +393,7 @@ func TestGovernanceStateMachine_MultisigThreshold(t *testing.T) {
 		BlockNumber: 1,
 		Frozen:      0,
 	}
-	_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 	if err != nil {
 		t.Fatalf("advance with valid multisig should succeed: %v", err)
 	}

@@ -179,7 +179,7 @@ func TestShardConfigValidation(t *testing.T) {
 		{
 			name:    "invalid verification mode",
 			modify:  func(c *ShardConfig) { c.VerificationMode = "blake3" },
-			wantErr: "verification mode must be groth16 or basefold",
+			wantErr: "verification mode must be groth16 or fri",
 		},
 		{
 			name:    "missing hash function",
@@ -391,7 +391,7 @@ func TestInitShard(t *testing.T) {
 			},
 		},
 		Governance:      covenant.GovernanceConfig{Mode: covenant.GovernanceNone},
-		Verification:    covenant.VerifyBasefold,
+		Verification:    covenant.VerifyFRI,
 		SP1VerifyingKey: []byte("test-verifying-key"),
 	})
 	if err != nil {
@@ -422,8 +422,8 @@ func TestInitShard(t *testing.T) {
 	if cfg.GovernanceMode != "none" {
 		t.Errorf("GovernanceMode: got %q, want %q", cfg.GovernanceMode, "none")
 	}
-	if cfg.VerificationMode != "basefold" {
-		t.Errorf("VerificationMode: got %q, want %q", cfg.VerificationMode, "basefold")
+	if cfg.VerificationMode != "fri" {
+		t.Errorf("VerificationMode: got %q, want %q", cfg.VerificationMode, "fri")
 	}
 	if cfg.HashFunction != "keccak256" {
 		t.Errorf("HashFunction: got %q, want %q", cfg.HashFunction, "keccak256")
@@ -455,7 +455,7 @@ func TestInitShardDefaultGasLimit(t *testing.T) {
 		GasLimit:        0, // Should default to 30M.
 		Alloc:           nil,
 		Governance:      covenant.GovernanceConfig{Mode: covenant.GovernanceNone},
-		Verification:    covenant.VerifyBasefold,
+		Verification:    covenant.VerifyFRI,
 		SP1VerifyingKey: []byte("test-vk"),
 	})
 	if err != nil {

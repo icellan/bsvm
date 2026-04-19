@@ -25,10 +25,10 @@ import (
 // It:
 //  1. Computes the deterministic genesis state root that the overlay will
 //     initialise from (via regtestharness.ComputeGenesisStateRoot).
-//  2. Deploys a BasefoldRollupContract whose initial stateRoot field equals
+//  2. Deploys a FRIRollupContract whose initial stateRoot field equals
 //     that root (so the first advance's preStateRoot check passes).
 //  3. Builds an OverlayNode bound to the deployed contract via a real
-//     RunarBroadcastClient configured for ProofModeBasefold.
+//     RunarBroadcastClient configured for ProofModeFRI.
 //  4. Submits 3 transaction batches through the overlay pipeline,
 //     verifying that each one lands on-chain and the contract's covenant
 //     UTXO advances.
@@ -58,7 +58,7 @@ func TestContinuousProvingLoop_Basefold_Regtest(t *testing.T) {
 
 	// 2. Compile and deploy the Basefold rollup contract with the overlay's
 	//    genesis state root as its initial stateRoot field.
-	contract, provider, signer, _ := deployBasefoldRollupWithStateRoot(t, genesisStateRootHex)
+	contract, provider, signer, _ := deployFRIRollupWithStateRoot(t, genesisStateRootHex)
 	deployUtxo := contract.GetCurrentUtxo()
 	if deployUtxo == nil {
 		t.Fatalf("contract.GetCurrentUtxo() == nil after deploy")
@@ -164,19 +164,19 @@ func TestContinuousProvingLoop_Basefold_Regtest(t *testing.T) {
 	t.Logf("================================================================")
 }
 
-// deployBasefoldRollupWithStateRoot compiles and deploys the Basefold rollup
+// deployFRIRollupWithStateRoot compiles and deploys the Basefold rollup
 // covenant with a caller-supplied initial stateRoot hex. This differs from
-// deployBasefoldRollupLifecycle (in rollup_basefold_test.go, which is locked)
+// deployFRIRollupLifecycle (in rollup_basefold_test.go, which is locked)
 // only in that it lets the test supply the pre-state root so it can be
 // aligned with an external overlay's genesis state root.
 //
-// Every other constructor argument mirrors deployBasefoldRollupLifecycle
+// Every other constructor argument mirrors deployFRIRollupLifecycle
 // one-for-one: same merkle-root readonly, same single-key governance, same
 // chain ID, same KoalaBear field check.
-func deployBasefoldRollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.RunarContract, runar.Provider, runar.Signer, *helpers.Wallet) {
+func deployFRIRollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.RunarContract, runar.Provider, runar.Signer, *helpers.Wallet) {
 	t.Helper()
 
-	artifact, err := compileContract(basefoldRollupContractPath)
+	artifact, err := compileContract(friRollupContractPath)
 	if err != nil {
 		t.Fatalf("compile Basefold contract: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestContinuousProvingLoop_Groth16WA_Regtest(t *testing.T) {
 
 // deployGroth16WARollupWithStateRoot compiles and deploys the Mode 3
 // (witness-assisted Groth16) rollup covenant with a caller-supplied initial
-// stateRoot hex. Mirrors deployBasefoldRollupWithStateRoot one-for-one
+// stateRoot hex. Mirrors deployFRIRollupWithStateRoot one-for-one
 // except for the compile path (uses compileContractGroth16WA with the
 // Gate 0b vk.json baked into the preamble).
 func deployGroth16WARollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.RunarContract, runar.Provider, runar.Signer, *helpers.Wallet) {

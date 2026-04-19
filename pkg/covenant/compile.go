@@ -42,16 +42,25 @@ type Groth16VK struct {
 	IC5     []byte    // 64 bytes: G1 point (PUB_4)
 }
 
-// CompileBasefoldRollup compiles the Basefold-only rollup covenant contract.
+// CompileFRIRollup compiles the Mode 1 rollup covenant contract (trust-
+// minimized FRI bridge).
 //
-// The Basefold variant verifies SP1 proofs natively on-chain using KoalaBear
-// field arithmetic plus a Poseidon2 Merkle inclusion proof. No trusted setup
-// is required. Larger proof and larger script than the Groth16 variant.
+// Mode 1 does NOT verify the SP1 FRI proof on-chain. The covenant binds
+// state transitions (block+1, state roots, batch hash, chain id) via
+// public-value offset checks and emits the spec-12 OP_RETURN batch-data
+// output, but performs no STARK arithmetic. Off-chain nodes verify the
+// proof and trigger governance freeze on an invalid advance. See
+// rollup_fri.runar.go for the full security model and Gate 0a Full
+// upgrade path. Mode 1 is NOT mainnet-eligible — PrepareGenesis rejects
+// Mainnet=true with VerifyFRI.
 //
 // The sp1VerifyingKey, chainID, and governanceConfig are parameterized as
 // readonly properties on the contract via ConstructorArgs. The Rúnar
 // compiler bakes these into the locking script as compile-time constants.
-func CompileBasefoldRollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (*CompiledCovenant, error) {
+// SP1VerifyingKeyHash is recorded as a readonly property for indexing and
+// future-upgrade continuity; the Mode 1 locking script does not consult
+// it because there is no on-chain proof check.
+func CompileFRIRollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (*CompiledCovenant, error) {
 	if err := governanceConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid governance config: %w", err)
 	}
@@ -62,13 +71,13 @@ func CompileBasefoldRollup(sp1VerifyingKey []byte, chainID uint64, governanceCon
 		return nil, fmt.Errorf("chain ID must not be zero")
 	}
 
-	contractPath := findBasefoldContractSource()
-	args, err := buildBasefoldConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	contractPath := findFRIContractSource()
+	args, err := buildFRIConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
 	if err != nil {
-		return nil, fmt.Errorf("building basefold constructor args: %w", err)
+		return nil, fmt.Errorf("building FRI constructor args: %w", err)
 	}
 
-	return compileRollupContract(contractPath, args, "", sp1VerifyingKey, chainID, governanceConfig, VerifyBasefold)
+	return compileRollupContract(contractPath, args, "", sp1VerifyingKey, chainID, governanceConfig, VerifyFRI)
 }
 
 // CompileGroth16Rollup compiles the Groth16-generic rollup covenant contract.
@@ -304,10 +313,10 @@ func assertGovernanceKeysShape(governanceConfig GovernanceConfig) error {
 	}
 }
 
-// buildBasefoldConstructorArgs creates the ConstructorArgs map for the
-// Basefold rollup contract. Only the shared readonly fields are populated —
-// the Basefold variant has no mode-specific readonly properties.
-func buildBasefoldConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
+// buildFRIConstructorArgs creates the ConstructorArgs map for the Mode 1
+// FRI rollup contract. Only the shared readonly fields are populated —
+// Mode 1 has no mode-specific readonly properties.
+func buildFRIConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
 	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
 }
 
@@ -435,9 +444,9 @@ func buildGroth16WAConstructorArgs(sp1VerifyingKey []byte, chainID uint64, gover
 	return args, nil
 }
 
-// findBasefoldContractSource locates the Basefold rollup source file.
-func findBasefoldContractSource() string {
-	return findContractSourceNamed("rollup_basefold.runar.go")
+// findFRIContractSource locates the Mode 1 FRI rollup source file.
+func findFRIContractSource() string {
+	return findContractSourceNamed("rollup_fri.runar.go")
 }
 
 // findGroth16ContractSource locates the Groth16 rollup source file.

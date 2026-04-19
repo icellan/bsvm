@@ -63,7 +63,7 @@ func newGroth16Rollup(stateRoot string, blockNumber, frozen int64) *Groth16Rollu
 		StateRoot:              runar.ByteString(stateRoot),
 		BlockNumber:            blockNumber,
 		Frozen:                 frozen,
-		SP1VerifyingKeyHash:    runar.ByteString(testMerkleRoot),
+		SP1VerifyingKeyHash:    runar.ByteString(testVKHash),
 		ChainId:                chainId,
 		Bn254ScalarOrder:       testBn254ScalarOrder,
 		SP1ProgramVkHashScalar: testSP1ProgramVkHashScalar,

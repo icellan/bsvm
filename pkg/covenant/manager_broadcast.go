@@ -18,7 +18,7 @@ func (cm *CovenantManager) BroadcastClient() BroadcastClient {
 }
 
 // BroadcastAdvance broadcasts a covenant advance via the configured
-// BroadcastClient. It validates the new state via BuildAdvanceData,
+// BroadcastClient. It validates the new state via ValidateAdvanceData,
 // constructs a BroadcastRequest from the manager's current UTXO state,
 // dispatches the broadcast, and on success calls ApplyAdvance to update
 // the manager's tracked state.
@@ -44,7 +44,7 @@ func (cm *CovenantManager) BroadcastAdvance(
 	proofBlob := proof.ProofBlob()
 	publicValues := proof.PublicValues()
 
-	if _, err := cm.BuildAdvanceData(newState, batchData, proofBlob, publicValues); err != nil {
+	if err := cm.ValidateAdvanceData(newState, batchData, proofBlob, publicValues); err != nil {
 		return nil, err
 	}
 

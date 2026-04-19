@@ -66,7 +66,7 @@ type Config struct {
 	CoinbaseSeed byte
 	// ProofMode selects which on-chain verification path the overlay's
 	// mock prover produces advance proofs for AND which ProofMode the
-	// RunarBroadcastClient is bound to. Defaults to ProofModeBasefold so
+	// RunarBroadcastClient is bound to. Defaults to ProofModeFRI so
 	// existing tests that only set the three seed fields keep working.
 	ProofMode covenant.ProofMode
 	// NoBroadcast skips wiring the broadcast client into the covenant
@@ -137,10 +137,10 @@ func Build(cfg Config) (*Bundle, error) {
 		return nil, fmt.Errorf("parsing deploy txid %q: %w", cu.Txid, err)
 	}
 
-	verificationMode := covenant.VerifyBasefold
+	verificationMode := covenant.VerifyFRI
 	switch cfg.ProofMode {
-	case covenant.ProofModeBasefold:
-		verificationMode = covenant.VerifyBasefold
+	case covenant.ProofModeFRI:
+		verificationMode = covenant.VerifyFRI
 	case covenant.ProofModeGroth16Generic:
 		verificationMode = covenant.VerifyGroth16
 	case covenant.ProofModeGroth16Witness:

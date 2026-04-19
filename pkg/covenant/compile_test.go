@@ -79,22 +79,22 @@ func TestCompiledCovenant_ScriptHash(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildBasefoldConstructorArgs
+// TestBuildFRIConstructorArgs
 // ---------------------------------------------------------------------------
 
-// TestBuildBasefoldConstructorArgs verifies that buildBasefoldConstructorArgs
+// TestBuildFRIConstructorArgs verifies that buildFRIConstructorArgs
 // produces the expected ConstructorArgs map for the Rúnar compiler. The
 // Basefold variant has no mode-specific readonly properties, only the shared
 // ones (vkHash, chainId, governance).
-func TestBuildBasefoldConstructorArgs(t *testing.T) {
+func TestBuildFRIConstructorArgs(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	vkHash := sha256.Sum256(vk)
 
-	args, err := buildBasefoldConstructorArgs(vk, 42, GovernanceConfig{
+	args, err := buildFRIConstructorArgs(vk, 42, GovernanceConfig{
 		Mode: GovernanceNone,
 	})
 	if err != nil {
-		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+		t.Fatalf("buildFRIConstructorArgs: %v", err)
 	}
 
 	// sP1VerifyingKeyHash: hex of SHA256(vk)
@@ -147,23 +147,23 @@ func TestBuildBasefoldConstructorArgs(t *testing.T) {
 	}
 	for _, k := range groth16Keys {
 		if _, ok := args[k]; ok {
-			t.Errorf("basefold args should not include Groth16 VK key %q", k)
+			t.Errorf("fri args should not include Groth16 VK key %q", k)
 		}
 	}
 }
 
-// TestBuildBasefoldConstructorArgs_SingleKey verifies constructor args for
+// TestBuildFRIConstructorArgs_SingleKey verifies constructor args for
 // single-key governance mode.
-func TestBuildBasefoldConstructorArgs_SingleKey(t *testing.T) {
+func TestBuildFRIConstructorArgs_SingleKey(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	key := testKey(1)
 
-	args, err := buildBasefoldConstructorArgs(vk, 100, GovernanceConfig{
+	args, err := buildFRIConstructorArgs(vk, 100, GovernanceConfig{
 		Mode: GovernanceSingleKey,
 		Keys: [][]byte{key},
 	})
 	if err != nil {
-		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+		t.Fatalf("buildFRIConstructorArgs: %v", err)
 	}
 
 	// governanceMode: float64(1) for GovernanceSingleKey
@@ -177,19 +177,19 @@ func TestBuildBasefoldConstructorArgs_SingleKey(t *testing.T) {
 	}
 }
 
-// TestBuildBasefoldConstructorArgs_MultiSig verifies constructor args for
+// TestBuildFRIConstructorArgs_MultiSig verifies constructor args for
 // multi-sig governance mode.
-func TestBuildBasefoldConstructorArgs_MultiSig(t *testing.T) {
+func TestBuildFRIConstructorArgs_MultiSig(t *testing.T) {
 	vk := []byte("test-verifying-key-32bytes-long!")
 	keys := [][]byte{testKey(1), testKey(2), testKey(3)}
 
-	args, err := buildBasefoldConstructorArgs(vk, 200, GovernanceConfig{
+	args, err := buildFRIConstructorArgs(vk, 200, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
 		Keys:      keys,
 		Threshold: 2,
 	})
 	if err != nil {
-		t.Fatalf("buildBasefoldConstructorArgs: %v", err)
+		t.Fatalf("buildFRIConstructorArgs: %v", err)
 	}
 
 	// governanceMode: float64(2)
@@ -316,26 +316,26 @@ func TestBuildGroth16ConstructorArgs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileBasefoldRollup_DifferentParams
+// TestCompileFRIRollup_DifferentParams
 // ---------------------------------------------------------------------------
 
-// TestCompileBasefoldRollup_DifferentParams compiles the Basefold covenant
+// TestCompileFRIRollup_DifferentParams compiles the Basefold covenant
 // with two different chain IDs and verifies the resulting scripts differ.
-func TestCompileBasefoldRollup_DifferentParams(t *testing.T) {
+func TestCompileFRIRollup_DifferentParams(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
 
 	vk := []byte("test-sp1-verifying-key-for-compilation")
 
-	compiled1, err := CompileBasefoldRollup(vk, 1001, GovernanceConfig{Mode: GovernanceNone})
+	compiled1, err := CompileFRIRollup(vk, 1001, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup chainID=1001 failed: %v", err)
+		t.Fatalf("CompileFRIRollup chainID=1001 failed: %v", err)
 	}
 
-	compiled2, err := CompileBasefoldRollup(vk, 2002, GovernanceConfig{Mode: GovernanceNone})
+	compiled2, err := CompileFRIRollup(vk, 2002, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup chainID=2002 failed: %v", err)
+		t.Fatalf("CompileFRIRollup chainID=2002 failed: %v", err)
 	}
 
 	if bytes.Equal(compiled1.LockingScript, compiled2.LockingScript) {
@@ -355,19 +355,25 @@ func TestCompileBasefoldRollup_DifferentParams(t *testing.T) {
 	if compiled2.ChainID != 2002 {
 		t.Errorf("compiled2.ChainID = %d, want 2002", compiled2.ChainID)
 	}
-	if compiled1.Mode != VerifyBasefold {
-		t.Errorf("compiled1.Mode = %s, want basefold", compiled1.Mode)
+	if compiled1.Mode != VerifyFRI {
+		t.Errorf("compiled1.Mode = %s, want fri", compiled1.Mode)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileBasefoldRollup_WithVerifyingKey
+// TestCompileFRIRollup_WithVerifyingKey
 // ---------------------------------------------------------------------------
 
-// TestCompileBasefoldRollup_WithVerifyingKey compiles the Basefold covenant
-// with a verifying key and verifies the VK hash is embedded in the compiled
-// artifact.
-func TestCompileBasefoldRollup_WithVerifyingKey(t *testing.T) {
+// TestCompileFRIRollup_WithVerifyingKey verifies that CompileFRIRollup
+// records the VK hash on the compiled covenant metadata. The hash is
+// NOT embedded as a baked-in constant in the Mode 1 locking script —
+// the trust-minimized FRI bridge does not consult the VK on-chain, so
+// the Rúnar compiler constant-folds the readonly property out. When
+// Gate 0a Full lands the locking script will consult SP1VerifyingKeyHash
+// inside `advanceState` (Merkle-root check against transcoded FRI
+// commitments) and this test should be re-tightened to re-assert the
+// baked-in-script invariant.
+func TestCompileFRIRollup_WithVerifyingKey(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
@@ -375,63 +381,49 @@ func TestCompileBasefoldRollup_WithVerifyingKey(t *testing.T) {
 	vk := []byte("unique-sp1-verifying-key-bytes-for-test")
 	vkHash := sha256.Sum256(vk)
 
-	compiled, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
+	compiled, err := CompileFRIRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup failed: %v", err)
+		t.Fatalf("CompileFRIRollup failed: %v", err)
 	}
 
 	if compiled.SP1VerifyingKeyHash != vkHash {
 		t.Errorf("VK hash mismatch:\n  got  %x\n  want %x", compiled.SP1VerifyingKeyHash, vkHash)
 	}
-
-	if !bytes.Contains(compiled.LockingScript, vkHash[:]) {
-		t.Error("locking script should contain the VK hash as a baked-in constant")
-	}
-
-	vk2 := []byte("different-sp1-verifying-key-bytes!!!!!!")
-	compiled2, err := CompileBasefoldRollup(vk2, 42, GovernanceConfig{Mode: GovernanceNone})
-	if err != nil {
-		t.Fatalf("CompileBasefoldRollup with different VK failed: %v", err)
-	}
-
-	if bytes.Equal(compiled.LockingScript, compiled2.LockingScript) {
-		t.Error("scripts with different VKs should differ")
-	}
 }
 
 // ---------------------------------------------------------------------------
-// TestCompileBasefoldRollup_GovernanceModes
+// TestCompileFRIRollup_GovernanceModes
 // ---------------------------------------------------------------------------
 
-// TestCompileBasefoldRollup_GovernanceModes compiles the Basefold covenant
+// TestCompileFRIRollup_GovernanceModes compiles the Basefold covenant
 // with different governance modes and verifies the resulting scripts differ.
-func TestCompileBasefoldRollup_GovernanceModes(t *testing.T) {
+func TestCompileFRIRollup_GovernanceModes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")
 	}
 
 	vk := []byte("test-sp1-verifying-key-for-governance")
 
-	compiledNone, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
+	compiledNone, err := CompileFRIRollup(vk, 42, GovernanceConfig{Mode: GovernanceNone})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup GovernanceNone failed: %v", err)
+		t.Fatalf("CompileFRIRollup GovernanceNone failed: %v", err)
 	}
 
-	compiledSingle, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{
+	compiledSingle, err := CompileFRIRollup(vk, 42, GovernanceConfig{
 		Mode: GovernanceSingleKey,
 		Keys: [][]byte{testKey(1)},
 	})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup GovernanceSingleKey failed: %v", err)
+		t.Fatalf("CompileFRIRollup GovernanceSingleKey failed: %v", err)
 	}
 
-	compiledMulti, err := CompileBasefoldRollup(vk, 42, GovernanceConfig{
+	compiledMulti, err := CompileFRIRollup(vk, 42, GovernanceConfig{
 		Mode:      GovernanceMultiSig,
 		Keys:      [][]byte{testKey(1), testKey(2), testKey(3)},
 		Threshold: 2,
 	})
 	if err != nil {
-		t.Fatalf("CompileBasefoldRollup GovernanceMultiSig failed: %v", err)
+		t.Fatalf("CompileFRIRollup GovernanceMultiSig failed: %v", err)
 	}
 
 	if bytes.Equal(compiledNone.LockingScript, compiledSingle.LockingScript) {
@@ -462,7 +454,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: nil verifying key",
 			run: func() error {
-				_, err := CompileBasefoldRollup(nil, 42, GovernanceConfig{Mode: GovernanceNone})
+				_, err := CompileFRIRollup(nil, 42, GovernanceConfig{Mode: GovernanceNone})
 				return err
 			},
 			wantErr: "sp1 verifying key must not be empty",
@@ -470,7 +462,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: empty verifying key",
 			run: func() error {
-				_, err := CompileBasefoldRollup([]byte{}, 42, GovernanceConfig{Mode: GovernanceNone})
+				_, err := CompileFRIRollup([]byte{}, 42, GovernanceConfig{Mode: GovernanceNone})
 				return err
 			},
 			wantErr: "sp1 verifying key must not be empty",
@@ -478,7 +470,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: zero chain ID",
 			run: func() error {
-				_, err := CompileBasefoldRollup(validVK, 0, GovernanceConfig{Mode: GovernanceNone})
+				_, err := CompileFRIRollup(validVK, 0, GovernanceConfig{Mode: GovernanceNone})
 				return err
 			},
 			wantErr: "chain ID must not be zero",
@@ -486,7 +478,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: invalid governance (single key, no keys)",
 			run: func() error {
-				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+				_, err := CompileFRIRollup(validVK, 42, GovernanceConfig{
 					Mode: GovernanceSingleKey,
 					Keys: nil,
 				})
@@ -497,7 +489,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: invalid governance (multisig threshold 0)",
 			run: func() error {
-				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+				_, err := CompileFRIRollup(validVK, 42, GovernanceConfig{
 					Mode:      GovernanceMultiSig,
 					Keys:      [][]byte{testKey(1), testKey(2)},
 					Threshold: 0,
@@ -509,7 +501,7 @@ func TestCompileRollupParamsValidation(t *testing.T) {
 		{
 			name: "basefold: invalid governance (none with keys)",
 			run: func() error {
-				_, err := CompileBasefoldRollup(validVK, 42, GovernanceConfig{
+				_, err := CompileFRIRollup(validVK, 42, GovernanceConfig{
 					Mode: GovernanceNone,
 					Keys: [][]byte{testKey(1)},
 				})

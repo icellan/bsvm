@@ -29,7 +29,7 @@ import (
 	"runar-integration/helpers"
 )
 
-// stateIntegritySetup deploys a fresh BasefoldRollupContract with the
+// stateIntegritySetup deploys a fresh FRIRollupContract with the
 // harness's deterministic genesis state root, builds a no-broadcast bundle,
 // and returns handles for plan-and-tamper tests. Each test gets distinct
 // seeds derived from t.Name() so tests are parallel-safe.
@@ -45,14 +45,14 @@ func stateIntegritySetup(t *testing.T) (
 		ChainID:      chainID,
 		TxKeySeed:    txSeed,
 		CoinbaseSeed: cbSeed,
-		ProofMode:    covenant.ProofModeBasefold,
+		ProofMode:    covenant.ProofModeFRI,
 	}
 	root, err := regtestharness.ComputeGenesisStateRoot(cfg)
 	if err != nil {
 		t.Fatalf("ComputeGenesisStateRoot: %v", err)
 	}
 	rootHex := hex.EncodeToString(root[:])
-	contract, provider, signer, _ = deployBasefoldRollupWithStateRoot(t, rootHex)
+	contract, provider, signer, _ = deployFRIRollupWithStateRoot(t, rootHex)
 	if err := helpers.Mine(1); err != nil {
 		t.Fatalf("mine deploy: %v", err)
 	}

@@ -36,7 +36,7 @@ import (
 // helpers still compile against this package-level root accessor. A follow-up
 // sub-agent will rewrite the regtest harness to build proofs directly; until
 // then, expose the same depth-20 SHA-256 Merkle root that the synthetic
-// BasefoldProof in the overlay uses, so the deploy-time VerifyingKeyHash
+// FRIProof in the overlay uses, so the deploy-time VerifyingKeyHash
 // constructor argument stays consistent with the client's advance args.
 // ---------------------------------------------------------------------------
 
@@ -55,7 +55,7 @@ func init() {
 
 // RunarBroadcastMerkleRootHex returns the verifying-key-hash value that
 // deployers must supply as the rollup contract's VerifyingKeyHash constructor
-// argument so advances produced by the overlay's synthetic BasefoldProof
+// argument so advances produced by the overlay's synthetic FRIProof
 // pass the Merkle-root check.
 func RunarBroadcastMerkleRootHex() string { return runarBroadcastMerkleRootHex }
 

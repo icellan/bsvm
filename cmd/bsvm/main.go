@@ -46,7 +46,7 @@ func main() {
 					&cli.Int64Flag{Name: "chain-id", Required: true, Usage: "shard chain ID"},
 					&cli.Uint64Flag{Name: "gas-limit", Value: 0, Usage: "genesis block gas limit (default: 30000000)"},
 					&cli.StringFlag{Name: "governance", Value: "none", Usage: "governance mode: none, single_key, or multisig"},
-					&cli.StringFlag{Name: "verification", Value: "groth16", Usage: "verification mode: groth16 or basefold"},
+					&cli.StringFlag{Name: "verification", Value: "groth16", Usage: "verification mode: groth16 or fri"},
 					&cli.StringFlag{Name: "sp1-vk", Value: "", Usage: "hex-encoded SP1 verifying key (optional for testing)"},
 					&cli.StringSliceFlag{Name: "alloc", Usage: "genesis alloc: address=balance_wei (repeatable)"},
 				},
@@ -116,8 +116,8 @@ func cmdInit(ctx *cli.Context) error {
 	switch verification {
 	case "groth16":
 		verifyMode = covenant.VerifyGroth16
-	case "basefold":
-		verifyMode = covenant.VerifyBasefold
+	case "fri":
+		verifyMode = covenant.VerifyFRI
 	default:
 		return fmt.Errorf("invalid verification mode: %s", verification)
 	}
@@ -243,8 +243,8 @@ func cmdRun(ctx *cli.Context) error {
 
 	var verifyMode covenant.VerificationMode
 	switch shardCfg.VerificationMode {
-	case "basefold":
-		verifyMode = covenant.VerifyBasefold
+	case "fri":
+		verifyMode = covenant.VerifyFRI
 	default:
 		verifyMode = covenant.VerifyGroth16
 	}

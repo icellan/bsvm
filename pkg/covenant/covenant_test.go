@@ -360,31 +360,8 @@ func TestCovenantManagerState(t *testing.T) {
 	proof := []byte("stark-proof-data")
 	publicValues := []byte("public-values-data")
 
-	advData, err := cm.BuildAdvanceData(newState, batchData, proof, publicValues)
-	if err != nil {
-		t.Fatalf("BuildAdvanceData failed: %v", err)
-	}
-
-	if advData.PrevTxID != genesisTxID {
-		t.Errorf("prev txid mismatch")
-	}
-	if advData.PrevVout != 0 {
-		t.Errorf("prev vout mismatch")
-	}
-	if advData.NewState.BlockNumber != 1 {
-		t.Errorf("new state block number mismatch")
-	}
-	if !bytes.Equal(advData.BatchData, batchData) {
-		t.Errorf("batch data mismatch")
-	}
-	if !bytes.Equal(advData.Proof, proof) {
-		t.Errorf("proof mismatch")
-	}
-	if !bytes.Equal(advData.PublicValues, publicValues) {
-		t.Errorf("public values mismatch")
-	}
-	if advData.CovenantSats != DefaultCovenantSats {
-		t.Errorf("covenant sats mismatch: got %d, want %d", advData.CovenantSats, DefaultCovenantSats)
+	if err := cm.ValidateAdvanceData(newState, batchData, proof, publicValues); err != nil {
+		t.Fatalf("ValidateAdvanceData failed: %v", err)
 	}
 
 	// Apply advance
@@ -443,16 +420,16 @@ func TestCovenantManagerBlockNumberIncrement(t *testing.T) {
 				StateRoot:   testStateRoot(tt.newBlockNum),
 				BlockNumber: tt.newBlockNum,
 			}
-			_, err := cm.BuildAdvanceData(newState, batchData, proof, publicValues)
+			err := cm.ValidateAdvanceData(newState, batchData, proof, publicValues)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("BuildAdvanceData() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateAdvanceData() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 
 	// Advance to block 1
 	newState1 := CovenantState{StateRoot: testStateRoot(1), BlockNumber: 1}
-	_, err := cm.BuildAdvanceData(newState1, batchData, proof, publicValues)
+	err := cm.ValidateAdvanceData(newState1, batchData, proof, publicValues)
 	if err != nil {
 		t.Fatalf("advance to block 1 failed: %v", err)
 	}
@@ -462,13 +439,13 @@ func TestCovenantManagerBlockNumberIncrement(t *testing.T) {
 
 	// Now block 2 should work, block 3 should not
 	newState2 := CovenantState{StateRoot: testStateRoot(2), BlockNumber: 2}
-	_, err = cm.BuildAdvanceData(newState2, batchData, proof, publicValues)
+	err = cm.ValidateAdvanceData(newState2, batchData, proof, publicValues)
 	if err != nil {
 		t.Errorf("advance to block 2 should succeed: %v", err)
 	}
 
 	newState3 := CovenantState{StateRoot: testStateRoot(3), BlockNumber: 3}
-	_, err = cm.BuildAdvanceData(newState3, batchData, proof, publicValues)
+	err = cm.ValidateAdvanceData(newState3, batchData, proof, publicValues)
 	if err == nil {
 		t.Error("advance to block 3 from block 1 should fail")
 	}
@@ -488,7 +465,7 @@ func TestCovenantManagerRejectFrozen(t *testing.T) {
 	cm := NewCovenantManager(covenant, types.Hash{}, 0, DefaultCovenantSats, frozenState, 1, VerifyGroth16)
 
 	newState := CovenantState{StateRoot: testStateRoot(6), BlockNumber: 6}
-	_, err := cm.BuildAdvanceData(newState, []byte("b"), []byte("p"), []byte("pv"))
+	err := cm.ValidateAdvanceData(newState, []byte("b"), []byte("p"), []byte("pv"))
 	if err == nil {
 		t.Fatal("expected error when covenant is frozen")
 	}
@@ -531,7 +508,7 @@ func TestPrepareGenesis(t *testing.T) {
 				SP1VerifyingKey:  []byte("test-sp1-vk-data"),
 				InitialStateRoot: testStateRoot(0),
 				Governance:       tt.gov,
-				Verification:     VerifyBasefold, // Basefold path compiles; Groth16 requires BN254 pairing support not yet in Rúnar
+				Verification:     VerifyFRI, // Basefold path compiles; Groth16 requires BN254 pairing support not yet in Rúnar
 				CovenantSats:     DefaultCovenantSats,
 			}
 
@@ -607,7 +584,7 @@ func TestPrepareGenesisDefaultSats(t *testing.T) {
 		SP1VerifyingKey:  []byte("vk"),
 		InitialStateRoot: testStateRoot(0),
 		Governance:       GovernanceConfig{Mode: GovernanceNone},
-		Verification:     VerifyBasefold, // Basefold compiles; Groth16 needs BN254 not yet in Rúnar
+		Verification:     VerifyFRI, // Basefold compiles; Groth16 needs BN254 not yet in Rúnar
 		CovenantSats:     0,              // Should default to DefaultCovenantSats
 	}
 
@@ -617,177 +594,6 @@ func TestPrepareGenesisDefaultSats(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("result is nil")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestBuildUnlockScript
-// ---------------------------------------------------------------------------
-
-func TestBuildUnlockScript(t *testing.T) {
-	advance := &AdvanceData{
-		PrevTxID: types.BytesToHash([]byte{0xaa}),
-		PrevVout: 0,
-		NewState: CovenantState{
-			StateRoot:   testStateRoot(1),
-			BlockNumber: 1,
-			Frozen:      0,
-		},
-		BatchData:    []byte("batch-data"),
-		Proof:        []byte("proof-data"),
-		PublicValues: []byte("public-values"),
-		CovenantSats: DefaultCovenantSats,
-	}
-
-	script, err := BuildUnlockScript(advance)
-	if err != nil {
-		t.Fatalf("BuildUnlockScript failed: %v", err)
-	}
-
-	if len(script) == 0 {
-		t.Fatal("unlock script is empty")
-	}
-
-	// The unlock script should contain the encoded state, public values,
-	// batch data, and proof as push data elements.
-	stateBytes := advance.NewState.Encode()
-	if !bytes.Contains(script, stateBytes) {
-		t.Error("unlock script does not contain encoded state")
-	}
-	if !bytes.Contains(script, advance.PublicValues) {
-		t.Error("unlock script does not contain public values")
-	}
-	if !bytes.Contains(script, advance.BatchData) {
-		t.Error("unlock script does not contain batch data")
-	}
-	if !bytes.Contains(script, advance.Proof) {
-		t.Error("unlock script does not contain proof")
-	}
-}
-
-func TestBuildUnlockScriptErrors(t *testing.T) {
-	tests := []struct {
-		name    string
-		advance *AdvanceData
-	}{
-		{
-			name:    "nil advance",
-			advance: nil,
-		},
-		{
-			name: "empty proof",
-			advance: &AdvanceData{
-				BatchData:    []byte("b"),
-				PublicValues: []byte("pv"),
-			},
-		},
-		{
-			name: "empty public values",
-			advance: &AdvanceData{
-				BatchData: []byte("b"),
-				Proof:     []byte("p"),
-			},
-		},
-		{
-			name: "empty batch data",
-			advance: &AdvanceData{
-				Proof:        []byte("p"),
-				PublicValues: []byte("pv"),
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := BuildUnlockScript(tt.advance)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestBuildFreezeUnlockScript
-// ---------------------------------------------------------------------------
-
-func TestBuildFreezeUnlockScript(t *testing.T) {
-	sig := []byte("test-signature-data")
-	script, err := BuildFreezeUnlockScript(sig)
-	if err != nil {
-		t.Fatalf("BuildFreezeUnlockScript failed: %v", err)
-	}
-	if !bytes.Contains(script, sig) {
-		t.Error("freeze unlock script does not contain signature")
-	}
-}
-
-func TestBuildFreezeUnlockScriptEmpty(t *testing.T) {
-	_, err := BuildFreezeUnlockScript(nil)
-	if err == nil {
-		t.Fatal("expected error for empty signature")
-	}
-
-	_, err = BuildFreezeUnlockScript([]byte{})
-	if err == nil {
-		t.Fatal("expected error for empty signature")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestBuildUnfreezeUnlockScript
-// ---------------------------------------------------------------------------
-
-func TestBuildUnfreezeUnlockScript(t *testing.T) {
-	sig := []byte("test-unfreeze-signature")
-	script, err := BuildUnfreezeUnlockScript(sig)
-	if err != nil {
-		t.Fatalf("BuildUnfreezeUnlockScript failed: %v", err)
-	}
-	if !bytes.Contains(script, sig) {
-		t.Error("unfreeze unlock script does not contain signature")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestBuildUpgradeUnlockScript
-// ---------------------------------------------------------------------------
-
-func TestBuildUpgradeUnlockScript(t *testing.T) {
-	sig := []byte("governance-signature")
-	newScript := []byte("new-covenant-script-bytecode")
-
-	script, err := BuildUpgradeUnlockScript(sig, newScript)
-	if err != nil {
-		t.Fatalf("BuildUpgradeUnlockScript failed: %v", err)
-	}
-
-	if !bytes.Contains(script, sig) {
-		t.Error("upgrade unlock script does not contain signature")
-	}
-	if !bytes.Contains(script, newScript) {
-		t.Error("upgrade unlock script does not contain new covenant script")
-	}
-}
-
-func TestBuildUpgradeUnlockScriptErrors(t *testing.T) {
-	tests := []struct {
-		name      string
-		sig       []byte
-		newScript []byte
-	}{
-		{"empty signature", nil, []byte("script")},
-		{"empty new script", []byte("sig"), nil},
-		{"both empty", nil, nil},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := BuildUpgradeUnlockScript(tt.sig, tt.newScript)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-		})
 	}
 }
 
@@ -867,9 +673,9 @@ func TestAdvanceDataValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := cm.BuildAdvanceData(tt.newState, tt.batchData, tt.proof, tt.publicValues)
+			err := cm.ValidateAdvanceData(tt.newState, tt.batchData, tt.proof, tt.publicValues)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("BuildAdvanceData() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateAdvanceData() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -882,75 +688,6 @@ func TestAdvanceDataValidation(t *testing.T) {
 func TestDefaultCovenantSats(t *testing.T) {
 	if DefaultCovenantSats != 10000 {
 		t.Errorf("DefaultCovenantSats = %d, want 10000", DefaultCovenantSats)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestScriptPushData
-// ---------------------------------------------------------------------------
-
-func TestScriptPushData(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     []byte
-		wantOp   byte
-		wantSize int
-	}{
-		{
-			name:     "empty data",
-			data:     []byte{},
-			wantOp:   0x00, // OP_0
-			wantSize: 1,
-		},
-		{
-			name:     "1 byte",
-			data:     []byte{0x42},
-			wantOp:   0x01, // direct push length
-			wantSize: 2,
-		},
-		{
-			name:     "75 bytes",
-			data:     make([]byte, 75),
-			wantOp:   75,
-			wantSize: 76,
-		},
-		{
-			name:     "76 bytes uses OP_PUSHDATA1",
-			data:     make([]byte, 76),
-			wantOp:   0x4c,
-			wantSize: 78,
-		},
-		{
-			name:     "255 bytes uses OP_PUSHDATA1",
-			data:     make([]byte, 255),
-			wantOp:   0x4c,
-			wantSize: 257,
-		},
-		{
-			name:     "256 bytes uses OP_PUSHDATA2",
-			data:     make([]byte, 256),
-			wantOp:   0x4d,
-			wantSize: 259,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := scriptPushData(tt.data)
-			if len(result) != tt.wantSize {
-				t.Errorf("size = %d, want %d", len(result), tt.wantSize)
-			}
-			if result[0] != tt.wantOp {
-				t.Errorf("opcode = 0x%02x, want 0x%02x", result[0], tt.wantOp)
-			}
-			// For non-empty data, verify the data is in the result
-			if len(tt.data) > 0 {
-				dataStart := len(result) - len(tt.data)
-				if !bytes.Equal(result[dataStart:], tt.data) {
-					t.Error("push data content mismatch")
-				}
-			}
-		})
 	}
 }
 
@@ -977,7 +714,7 @@ func TestCovenantManagerChainedAdvances(t *testing.T) {
 			BlockNumber: block,
 			Frozen:      0,
 		}
-		_, err := cm.BuildAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
+		err := cm.ValidateAdvanceData(newState, []byte("batch"), []byte("proof"), []byte("pv"))
 		if err != nil {
 			t.Fatalf("advance to block %d failed: %v", block, err)
 		}
@@ -1032,7 +769,7 @@ func TestVerificationModeString(t *testing.T) {
 		want string
 	}{
 		{VerifyGroth16, "groth16"},
-		{VerifyBasefold, "basefold"},
+		{VerifyFRI, "fri"},
 		{VerificationMode(99), "unknown(99)"},
 	}
 	for _, tt := range tests {
@@ -1056,9 +793,9 @@ func TestCovenantManagerVerificationMode(t *testing.T) {
 	}
 
 	// Basefold mode
-	cm2 := NewCovenantManager(covenant, types.Hash{}, 0, DefaultCovenantSats, state, 1, VerifyBasefold)
-	if cm2.VerificationMode() != VerifyBasefold {
-		t.Errorf("expected VerifyBasefold, got %s", cm2.VerificationMode())
+	cm2 := NewCovenantManager(covenant, types.Hash{}, 0, DefaultCovenantSats, state, 1, VerifyFRI)
+	if cm2.VerificationMode() != VerifyFRI {
+		t.Errorf("expected VerifyFRI, got %s", cm2.VerificationMode())
 	}
 }
 
@@ -1075,8 +812,8 @@ func TestGenesisConfigVerificationMode(t *testing.T) {
 	}
 
 	// Explicit Basefold
-	config.Verification = VerifyBasefold
-	if config.Verification != VerifyBasefold {
-		t.Errorf("expected VerifyBasefold, got %s", config.Verification)
+	config.Verification = VerifyFRI
+	if config.Verification != VerifyFRI {
+		t.Errorf("expected VerifyFRI, got %s", config.Verification)
 	}
 }

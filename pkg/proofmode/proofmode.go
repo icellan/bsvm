@@ -14,10 +14,14 @@ package proofmode
 type ProofMode uint8
 
 const (
-	// Basefold is the native SP1 STARK verification path using KoalaBear
-	// field arithmetic and Poseidon2 Merkle inclusion. Corresponds to
-	// BasefoldRollupContract with an 11-arg advanceState method.
-	Basefold ProofMode = 0
+	// FRI is the trust-minimized SP1 FRI bridge mode. The covenant binds
+	// state transitions (block+1, state roots, batch hash, chain id) but
+	// does NOT verify the FRI proof on-chain. Off-chain nodes verify and
+	// governance freeze is the only recourse against a malicious advance.
+	// Corresponds to FRIRollupContract with a 5-arg advanceState method.
+	// NOT mainnet-eligible — see rollup_fri.runar.go and spec 12. Gate 0a
+	// Full will replace this with a fully on-chain FRI verifier.
+	FRI ProofMode = 0
 
 	// Groth16Generic is the BN254 multi-pairing verification path using
 	// the generic Bn254G1AddP / Bn254G1ScalarMulP / Bn254MultiPairing4
@@ -39,8 +43,8 @@ const (
 // String returns a human-readable name for the proof mode.
 func (m ProofMode) String() string {
 	switch m {
-	case Basefold:
-		return "basefold"
+	case FRI:
+		return "fri"
 	case Groth16Generic:
 		return "groth16-generic"
 	case Groth16Witness:
