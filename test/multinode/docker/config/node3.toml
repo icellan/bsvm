@@ -20,8 +20,8 @@ mode = "mock"
 [network]
 listen_addr = "/ip4/0.0.0.0/tcp/9945"
 bootstrap_peers = [
-  "/ip4/172.40.0.11/tcp/9945",
-  "/ip4/172.40.0.12/tcp/9945",
+  "/ip4/172.50.0.11/tcp/9945",
+  "/ip4/172.50.0.12/tcp/9945",
 ]
 max_peers = 50
 
