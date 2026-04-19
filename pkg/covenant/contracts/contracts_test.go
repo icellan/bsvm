@@ -72,6 +72,56 @@ func TestGroth16RollupContract_StateFields(t *testing.T) {
 	assertFieldsHaveTag(t, rt, groth16ExtraReadonlyFields, "readonly")
 }
 
+func TestDevKeyRollupContract_StateFields(t *testing.T) {
+	rt := reflect.TypeOf(DevKeyRollupContract{})
+	assertFieldsHaveTag(t, rt, sharedRollupMutableFields, "")
+	assertFieldsHaveTag(t, rt, sharedRollupReadonlyFields, "readonly")
+
+	// DevKey contract must NOT carry any Groth16 VK readonly fields —
+	// it reuses the shared governance readonly layout without Groth16
+	// additions.
+	for _, name := range groth16ExtraReadonlyFields {
+		if _, ok := rt.FieldByName(name); ok {
+			t.Errorf("DevKeyRollupContract should not carry Groth16 VK field %s", name)
+		}
+	}
+}
+
+func TestDevKeyRollupContract_AdvanceStateParamCount(t *testing.T) {
+	// Receiver + 6 args: sig, newStateRoot, newBlockNumber, publicValues,
+	// batchData, proofBlob. One more than FRI's AdvanceState because the
+	// devnet variant adds the leading CheckSig signature param.
+	rt := reflect.TypeOf(&DevKeyRollupContract{})
+	m, ok := rt.MethodByName("AdvanceState")
+	if !ok {
+		t.Fatal("DevKeyRollupContract missing method AdvanceState")
+	}
+	if got := m.Type.NumIn(); got != 7 {
+		t.Errorf("DevKeyRollupContract.AdvanceState: expected 7 params (incl receiver), got %d", got)
+	}
+}
+
+func TestDevKeyRollupContract_FreezeMethods(t *testing.T) {
+	rt := reflect.TypeOf(&DevKeyRollupContract{})
+	requireMethodArity(t, rt, "FreezeSingleKey", 2)
+	requireMethodArity(t, rt, "FreezeMultiSig2", 3)
+	requireMethodArity(t, rt, "FreezeMultiSig3", 4)
+}
+
+func TestDevKeyRollupContract_UnfreezeMethods(t *testing.T) {
+	rt := reflect.TypeOf(&DevKeyRollupContract{})
+	requireMethodArity(t, rt, "UnfreezeSingleKey", 2)
+	requireMethodArity(t, rt, "UnfreezeMultiSig2", 3)
+	requireMethodArity(t, rt, "UnfreezeMultiSig3", 4)
+}
+
+func TestDevKeyRollupContract_UpgradeMethods(t *testing.T) {
+	rt := reflect.TypeOf(&DevKeyRollupContract{})
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+5)
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+5)
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+5)
+}
+
 func TestGroth16WARollupContract_StateFields(t *testing.T) {
 	rt := reflect.TypeOf(Groth16WARollupContract{})
 	assertFieldsHaveTag(t, rt, sharedRollupMutableFields, "")

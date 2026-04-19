@@ -14,9 +14,12 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/overlay"
+	"github.com/icellan/bsvm/pkg/rpc/auth"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm"
+	"github.com/icellan/bsvm/pkg/webui"
 )
 
 // JSON-RPC error codes matching Ethereum conventions.
@@ -41,11 +44,45 @@ type RPCServer struct {
 	web3API    *Web3API
 	bsvAPI     *BsvAPI
 	debugAPI   *DebugAPI
+	adminAPI   *AdminAPI
 	overlay    *overlay.OverlayNode
 	wsManager  *WSManager
 	httpServer *http.Server
 	wsServer   *http.Server // separate WebSocket server on WSAddr
 	limiter    *rateLimiter // per-IP rate limiting
+	registry    *metrics.Registry
+	authConfig  auth.Config
+	logStreamer *LogStreamer
+}
+
+// SetAdminAuth configures the auth layer that guards /admin/rpc. Must
+// be called before Start(). When DevAuthSecret is empty AND
+// GovernanceChecker is nil, the admin endpoint is unmounted entirely —
+// a node with no admin credentials simply doesn't expose the surface.
+func (s *RPCServer) SetAdminAuth(cfg auth.Config) {
+	s.authConfig = cfg
+}
+
+// AdminAPI returns the admin JSON-RPC handler. Exposed so callers
+// outside pkg/rpc (e.g. cmd/bsvm) can inject cross-cutting
+// dependencies like the governance workflow without every handler
+// owning the full startup order.
+func (s *RPCServer) AdminAPI() *AdminAPI {
+	return s.adminAPI
+}
+
+// SetMetricsRegistry attaches a Prometheus registry. When set, the HTTP
+// handler exposes `GET /metrics` for scraping. Must be called before
+// Start(). Passing nil disables the scrape endpoint.
+func (s *RPCServer) SetMetricsRegistry(r *metrics.Registry) {
+	s.registry = r
+}
+
+// SetLogStreamer attaches the admin log streamer. The WebSocket
+// manager uses it to back adminLogs subscriptions (spec 15 A9). Must
+// be called before Start().
+func (s *RPCServer) SetLogStreamer(ls *LogStreamer) {
+	s.logStreamer = ls
 }
 
 // NewRPCServer creates a new JSON-RPC server with the given configuration and
@@ -74,6 +111,7 @@ func NewRPCServer(
 		web3API:  NewWeb3API(),
 		bsvAPI:   NewBsvAPI(overlayNode),
 		debugAPI: NewDebugAPI(ethAPI, overlayNode),
+		adminAPI: NewAdminAPI(overlayNode),
 		overlay:  overlayNode,
 	}
 }
@@ -99,6 +137,7 @@ func NewRPCServerWithConfig(
 		web3API:  NewWeb3API(),
 		bsvAPI:   NewBsvAPI(overlayNode),
 		debugAPI: NewDebugAPI(ethAPI, overlayNode),
+		adminAPI: NewAdminAPI(overlayNode),
 		overlay:  overlayNode,
 	}
 }
@@ -109,6 +148,9 @@ func NewRPCServerWithConfig(
 func (s *RPCServer) Start() error {
 	// Create and start the WebSocket subscription manager.
 	s.wsManager = NewWSManager(s, s.overlay.EventFeed())
+	if s.logStreamer != nil {
+		s.wsManager.SetLogStreamer(s.logStreamer)
+	}
 	s.wsManager.Start()
 
 	// Initialise rate limiter if configured.
@@ -116,9 +158,34 @@ func (s *RPCServer) Start() error {
 		s.limiter = newRateLimiter(s.config.RequestsPerSecond, s.config.BurstSize)
 	}
 
-	// HTTP server for JSON-RPC.
+	// HTTP server for JSON-RPC + static SPA.
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/", s.handleHTTP)
+	if s.registry != nil {
+		// Expose Prometheus scrape. Mounted before "/" so it bypasses
+		// the JSON-RPC dispatcher. OpenMetrics is negotiated via the
+		// Accept header by promhttp.
+		httpMux.Handle("/metrics", s.registry.HTTPHandler())
+	}
+	// /admin/rpc — authenticated admin JSON-RPC. Only mounted when
+	// admin auth has been configured; a node with no admin credentials
+	// simply doesn't expose the surface.
+	if s.authConfig.DevAuthSecret != "" || s.authConfig.GovernanceChecker != nil {
+		adminHandler := http.HandlerFunc(s.handleAdminRPC)
+		httpMux.Handle("/admin/rpc", s.authConfig.Middleware(adminHandler))
+	}
+
+	// /.well-known/auth — BRC-103 handshake endpoint. Required for
+	// admin wallets to open a session; gated on the same auth config
+	// so a node with no wallet-auth wiring returns 503 rather than
+	// silently missing the endpoint.
+	if s.authConfig.ServerIdentity != nil && s.authConfig.GovernanceChecker != nil && s.authConfig.SessionStore != nil {
+		httpMux.Handle("/.well-known/auth", s.authConfig.HandshakeHandler())
+	}
+
+	// Root handler: GET → embedded explorer SPA (spec 15), POST → JSON-RPC.
+	// webui.Handler delegates non-GET requests to the RPC handler, so the
+	// dispatcher still sees every JSON-RPC call exactly as before.
+	httpMux.Handle("/", webui.Handler(http.HandlerFunc(s.handleHTTP)))
 
 	var httpHandler http.Handler = httpMux
 	if s.limiter != nil {
@@ -508,6 +575,22 @@ func (s *RPCServer) dispatch(method string, params json.RawMessage) (interface{}
 	case "bsv_buildWithdrawalClaim":
 		return s.handleBsvBuildWithdrawalClaim(params)
 
+	// -- bsv_ namespace (spec 15 explorer surface) --
+	case "bsv_bridgeStatus":
+		return s.bsvAPI.BridgeStatus(), nil
+
+	case "bsv_getDeposits":
+		return s.handleBsvGetDeposits(params)
+
+	case "bsv_getWithdrawals":
+		return s.handleBsvGetWithdrawals(params)
+
+	case "bsv_networkHealth":
+		return s.bsvAPI.NetworkHealth(), nil
+
+	case "bsv_provingStatus":
+		return s.bsvAPI.ProvingStatus(), nil
+
 	default:
 		return nil, newRPCError(errCodeMethodNotFound, fmt.Sprintf("method %q not found", method))
 	}
@@ -879,6 +962,56 @@ func (s *RPCServer) handleBsvBuildWithdrawalClaim(params json.RawMessage) (inter
 		return nil, newRPCError(errCodeInvalidParams, "invalid nonce: "+err.Error())
 	}
 	return s.bsvAPI.BuildWithdrawalClaim(bsvAddress, satoshiAmount, nonce)
+}
+
+// handleBsvGetDeposits parses params for bsv_getDeposits.
+// Expects [fromBlock, toBlock] as hex-encoded uint64 strings. Both bounds
+// are inclusive; pass toBlock = "0x0" to mean "no upper bound".
+func (s *RPCServer) handleBsvGetDeposits(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 2 {
+		return nil, newRPCError(errCodeInvalidParams, "expected [fromBlock, toBlock]")
+	}
+	fromBlock, err := parseBlockNumberArg(args[0])
+	if err != nil {
+		return nil, newRPCError(errCodeInvalidParams, "invalid fromBlock: "+err.Error())
+	}
+	toBlock, err := parseBlockNumberArg(args[1])
+	if err != nil {
+		return nil, newRPCError(errCodeInvalidParams, "invalid toBlock: "+err.Error())
+	}
+	return s.bsvAPI.GetDeposits(fromBlock, toBlock), nil
+}
+
+// handleBsvGetWithdrawals parses params for bsv_getWithdrawals.
+// Expects [fromNonce, toNonce] as hex-encoded uint64 strings. The range
+// is half-open [fromNonce, toNonce); pass toNonce = "0x0" to mean "no
+// upper bound".
+func (s *RPCServer) handleBsvGetWithdrawals(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 2 {
+		return nil, newRPCError(errCodeInvalidParams, "expected [fromNonce, toNonce]")
+	}
+	fromNonce, err := parseBlockNumberArg(args[0])
+	if err != nil {
+		return nil, newRPCError(errCodeInvalidParams, "invalid fromNonce: "+err.Error())
+	}
+	toNonce, err := parseBlockNumberArg(args[1])
+	if err != nil {
+		return nil, newRPCError(errCodeInvalidParams, "invalid toNonce: "+err.Error())
+	}
+	return s.bsvAPI.GetWithdrawals(fromNonce, toNonce), nil
+}
+
+// parseBlockNumberArg decodes a hex-encoded uint64 wrapped in a JSON
+// string. Used by bsv_getDeposits / bsv_getWithdrawals for their
+// range-pair inputs.
+func parseBlockNumberArg(raw json.RawMessage) (uint64, error) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, err
+	}
+	return parseHexUint64(s)
 }
 
 // handleEthGetTransactionByBlockHashAndIndex parses params for

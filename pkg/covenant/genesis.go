@@ -93,6 +93,16 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 				"and has no on-chain proof check; use VerifyGroth16 or VerifyGroth16WA for mainnet")
 	}
 
+	// Devnet DevKey mainnet guardrail — the DevKey variant collapses the
+	// "prover authorization" and "governance" roles onto a single key. This
+	// is intentional for local development but unsafe for mainnet.
+	if config.Mainnet && config.Verification == VerifyDevKey {
+		return nil, fmt.Errorf(
+			"mainnet genesis rejects VerifyDevKey: devkey covenant is devnet-only " +
+				"(no on-chain proof check, governance key doubles as advance key); " +
+				"use VerifyGroth16 or VerifyGroth16WA for mainnet")
+	}
+
 	var compiled *CompiledCovenant
 	var err error
 	switch config.Verification {
@@ -102,6 +112,8 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 		compiled, err = CompileGroth16Rollup(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16VK)
 	case VerifyGroth16WA:
 		compiled, err = CompileGroth16WARollupPinned(config.SP1VerifyingKey, config.ChainID, config.Governance, config.Groth16WAVKPath, config.VKTrustPolicy)
+	case VerifyDevKey:
+		compiled, err = CompileDevKeyRollup(config.SP1VerifyingKey, config.ChainID, config.Governance)
 	default:
 		return nil, fmt.Errorf("unknown verification mode %d", int(config.Verification))
 	}

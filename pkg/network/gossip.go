@@ -224,6 +224,16 @@ func (g *GossipManager) BroadcastBlockAnnounce(parentHash types.Hash, stateRoot 
 	return g.broadcast(msg)
 }
 
+// BroadcastProposal gossips a governance proposal (spec 15 / A4).
+// Called on both initial announce and signature updates. Receivers
+// deduplicate by the content-addressed Proposal.ID and merge
+// signature sets. Payload is JSON-marshalled so the governance
+// package stays independent of the network layer.
+func (g *GossipManager) BroadcastProposal(payload []byte) error {
+	msg := &Message{Type: MsgProposal, Payload: payload}
+	return g.broadcast(msg)
+}
+
 // BroadcastCovenantAdvance broadcasts a covenant advance announcement
 // to all connected peers.
 func (g *GossipManager) BroadcastCovenantAdvance(bsvTxID types.Hash, l2BlockNum uint64, stateRoot types.Hash) error {

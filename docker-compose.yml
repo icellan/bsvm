@@ -1,0 +1,243 @@
+# Spec 16 BSVM developer devnet.
+#
+# One command: `docker compose up`.
+#
+# Brings up a BSV regtest node + auto-miner and a 3-node BSVM cluster
+# (two provers + one follower) with the Hardhat default test accounts
+# pre-funded. Chain ID 31337 matches the Hardhat / Foundry defaults so
+# existing Solidity tooling points at http://localhost:8545 without
+# reconfiguration.
+#
+# This file is the DEVELOPER-facing entry point. The Go test harness at
+# `test/multinode/docker/docker-compose.yml` is a separate file with
+# different chain ID (8453111), subnet, and ports — kept intentionally
+# distinct so `docker compose up` (dev) and `go test` (CI) can run
+# side-by-side on the same machine. See docker-compose.README.md.
+#
+# Prove modes (switch via BSVM_PROVE_MODE env var, default `mock`):
+#   mock    — devkey covenant, SP1 mock runtime, sub-second "proofs".
+#   execute — devkey covenant, SP1 execute runtime, dual-EVM check runs.
+#   prove   — production covenant (groth16-wa), real STARK proofs. Needs
+#             GPU; see docker-compose.proving.yml override.
+
+networks:
+  bsvm-devnet:
+    name: bsvm-devnet
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.60.0.0/24
+
+x-bsvm-common: &bsvm-common
+  image: bsvm:devnet
+  restart: unless-stopped
+  networks:
+    - bsvm-devnet
+  environment: &bsvm-env
+    BSVM_PROVE_MODE: ${BSVM_PROVE_MODE:-mock}
+    BSVM_CHAIN_ID: "31337"
+    BSVM_BSV_RPC: "http://devuser:devpass@bsv-regtest:18332"
+    BSVM_EXPLORER: "true"
+    BSVM_LOG_LEVEL: info
+    BSVM_GENESIS_DIR: /shared/genesis
+    BSVM_BATCH_SIZE: "16"
+    BSVM_FLUSH_DELAY: "1s"
+    BSVM_GAS_PRICE: "1"
+    BSVM_DEPOSIT_CONFIRMATIONS: "1"
+  depends_on:
+    bsv-regtest:
+      condition: service_healthy
+
+services:
+
+  # ─── BSV Regtest Node ─────────────────────────────────────────────
+  bsv-regtest:
+    image: bitcoinsv/bitcoin-sv:latest
+    container_name: bsvm-bsv-regtest
+    networks:
+      - bsvm-devnet
+    command: >
+      bitcoind
+        -regtest
+        -server
+        -rpcuser=devuser
+        -rpcpassword=devpass
+        -rpcallowip=0.0.0.0/0
+        -rpcbind=0.0.0.0
+        -port=18444
+        -rpcport=18332
+        -txindex=1
+        -excessiveblocksize=1000000000
+        -maxstackmemoryusageconsensus=100000000
+        -maxstackmemoryusagepolicy=100000000
+        -maxscriptsizepolicy=0
+        -maxscriptnumlengthpolicy=0
+        -maxtxsizepolicy=0
+        -genesisactivationheight=1
+        -chronicleactivationheight=1
+        -minminingtxfee=0.00000001
+        -acceptnonstdtxn=1
+    ports:
+      # Host port 18335 → container 18332. Avoids collisions with other
+      # regtest instances already mapped to 18332 (e.g. runar integration
+      # tests). Internal devnet traffic uses the service name
+      # "bsv-regtest" on the bsvm-devnet network, so this external
+      # remap is only for the developer's CLI convenience.
+      - "18335:18332"
+    volumes:
+      - bsv-data:/root/.bitcoin
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=devuser -rpcpassword=devpass getblockchaininfo"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  # ─── Auto-miner (mines a block every 10s) ─────────────────────────
+  bsv-miner:
+    image: bitcoinsv/bitcoin-sv:latest
+    container_name: bsvm-bsv-miner
+    networks:
+      - bsvm-devnet
+    depends_on:
+      bsv-regtest:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        ADDR=$$(bitcoin-cli -regtest -rpcconnect=bsv-regtest \
+          -rpcuser=devuser -rpcpassword=devpass getnewaddress)
+        echo "bsv-miner: mining to $$ADDR"
+        # Mine 150 blocks up front so coinbase is mature before
+        # bsvm-init runs. Subsequent blocks arrive every 10 seconds
+        # so BSV tip keeps moving while nodes are running.
+        bitcoin-cli -regtest -rpcconnect=bsv-regtest \
+          -rpcuser=devuser -rpcpassword=devpass \
+          generatetoaddress 150 $$ADDR > /dev/null
+        echo "bsv-miner: 150 primer blocks mined"
+        while true; do
+          bitcoin-cli -regtest -rpcconnect=bsv-regtest \
+            -rpcuser=devuser -rpcpassword=devpass \
+            generatetoaddress 1 $$ADDR > /dev/null 2>&1 || true
+          sleep 10
+        done
+
+  # ─── Node 1: Prover (primary) ─────────────────────────────────────
+  node1:
+    <<: *bsvm-common
+    container_name: bsvm-node1
+    hostname: node1
+    environment:
+      <<: *bsvm-env
+      BSVM_NODE_NAME: node1
+      BSVM_RPC_PORT: "8545"
+      BSVM_P2P_PORT: "9945"
+      BSVM_ROLE: prover
+      BSVM_COINBASE: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      BSVM_PEERS: "node2:9945,node3:9945"
+    ports:
+      - "8545:8545"   # JSON-RPC (HTTP) — matches spec 16 banner
+      - "18546:8546"  # JSON-RPC WebSocket
+      - "9945:9945"   # libp2p P2P
+    volumes:
+      - node1-data:/data/bsvm
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /data/bsvm/shard.json ]; then
+          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
+          bsvm init \
+            --datadir /data/bsvm \
+            --prove-mode $${BSVM_PROVE_MODE:-mock} \
+            --prefund-accounts hardhat
+        fi
+        exec bsvm run --datadir /data/bsvm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # ─── Node 2: Prover (competing) ───────────────────────────────────
+  node2:
+    <<: *bsvm-common
+    container_name: bsvm-node2
+    hostname: node2
+    environment:
+      <<: *bsvm-env
+      BSVM_NODE_NAME: node2
+      BSVM_RPC_PORT: "8545"
+      BSVM_P2P_PORT: "9945"
+      BSVM_ROLE: prover
+      BSVM_COINBASE: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+      BSVM_PEERS: "node1:9945,node3:9945"
+    ports:
+      - "8546:8545"   # JSON-RPC (HTTP)
+      - "18548:8546"  # JSON-RPC WebSocket
+      - "9946:9945"   # libp2p P2P
+    volumes:
+      - node2-data:/data/bsvm
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /data/bsvm/shard.json ]; then
+          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
+          bsvm init \
+            --datadir /data/bsvm \
+            --prove-mode $${BSVM_PROVE_MODE:-mock} \
+            --prefund-accounts hardhat
+        fi
+        exec bsvm run --datadir /data/bsvm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # ─── Node 3: Follower (read-only) ─────────────────────────────────
+  node3:
+    <<: *bsvm-common
+    container_name: bsvm-node3
+    hostname: node3
+    environment:
+      <<: *bsvm-env
+      BSVM_NODE_NAME: node3
+      BSVM_RPC_PORT: "8545"
+      BSVM_P2P_PORT: "9945"
+      BSVM_ROLE: follower
+      BSVM_PEERS: "node1:9945,node2:9945"
+    ports:
+      - "8547:8545"   # JSON-RPC (HTTP)
+      - "18550:8546"  # JSON-RPC WebSocket
+      - "9947:9945"   # libp2p P2P
+    volumes:
+      - node3-data:/data/bsvm
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /data/bsvm/shard.json ]; then
+          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
+          bsvm init \
+            --datadir /data/bsvm \
+            --prove-mode $${BSVM_PROVE_MODE:-mock} \
+            --prefund-accounts hardhat
+        fi
+        exec bsvm run --datadir /data/bsvm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  bsv-data:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -25,6 +25,12 @@ const (
 	MsgBatchResponse byte = 0x05
 	// MsgHeartbeat carries a peer liveness signal.
 	MsgHeartbeat byte = 0x06
+	// MsgProposal carries a governance proposal (spec 15 / A4). The
+	// payload is the JSON-marshalled governance.Proposal struct.
+	// Announcements AND signature updates share the same message
+	// type — the receiver deduplicates by proposal ID and merges
+	// signatures.
+	MsgProposal byte = 0x07
 )
 
 // Maximum payload sizes per message type. Messages exceeding these
@@ -36,6 +42,9 @@ var maxMessageSize = map[byte]int{
 	MsgBatchRequest:    40,         // 40B
 	MsgBatchResponse:   512 * 1024, // 512KB
 	MsgHeartbeat:       64,         // 64B
+	// Governance proposals carry at most a small JSON blob (action
+	// string, params hex, a handful of signatures); 64KB is ample.
+	MsgProposal: 64 * 1024,
 }
 
 // ProtocolID returns the libp2p protocol ID string for a given chain ID.

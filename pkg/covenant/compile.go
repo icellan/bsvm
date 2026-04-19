@@ -320,6 +320,46 @@ func buildFRIConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceC
 	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
 }
 
+// buildDevKeyConstructorArgs creates the ConstructorArgs map for the devnet
+// DevKey rollup contract. It reuses the shared readonly layout (including the
+// governance key slots) because DevKeyRollupContract uses GovernanceKey as
+// the advance-authorization key. No mode-specific readonly properties.
+func buildDevKeyConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (map[string]interface{}, error) {
+	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+}
+
+// CompileDevKeyRollup compiles the devnet DevKey rollup covenant contract
+// used by spec 16 "mock" and "execute" proving modes. The contract performs
+// no on-chain STARK verification (same as Mode 1 FRI) but additionally
+// requires a governance-key signature on AdvanceState, preventing non-
+// operator advances on a shared regtest network.
+//
+// GovernanceNone is rejected because without a governance key the
+// AdvanceState CheckSig would be unsatisfiable. Devnet is expected to use
+// single_key governance.
+func CompileDevKeyRollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (*CompiledCovenant, error) {
+	if err := governanceConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid governance config: %w", err)
+	}
+	if governanceConfig.Mode == GovernanceNone {
+		return nil, fmt.Errorf("devkey rollup requires governance mode single_key or multisig (advance signature has no key to verify against under none)")
+	}
+	if len(sp1VerifyingKey) == 0 {
+		return nil, fmt.Errorf("sp1 verifying key must not be empty")
+	}
+	if chainID == 0 {
+		return nil, fmt.Errorf("chain ID must not be zero")
+	}
+
+	contractPath := findDevKeyContractSource()
+	args, err := buildDevKeyConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building devkey constructor args: %w", err)
+	}
+
+	return compileRollupContract(contractPath, args, "", sp1VerifyingKey, chainID, governanceConfig, VerifyDevKey)
+}
+
 // buildGroth16ConstructorArgs creates the ConstructorArgs map for the
 // Groth16 rollup contract. It populates the shared readonly fields plus
 // the 19 Groth16 verification key components.
@@ -447,6 +487,11 @@ func buildGroth16WAConstructorArgs(sp1VerifyingKey []byte, chainID uint64, gover
 // findFRIContractSource locates the Mode 1 FRI rollup source file.
 func findFRIContractSource() string {
 	return findContractSourceNamed("rollup_fri.runar.go")
+}
+
+// findDevKeyContractSource locates the devnet DevKey rollup source file.
+func findDevKeyContractSource() string {
+	return findContractSourceNamed("rollup_devkey.runar.go")
 }
 
 // findGroth16ContractSource locates the Groth16 rollup source file.

@@ -179,7 +179,7 @@ func TestShardConfigValidation(t *testing.T) {
 		{
 			name:    "invalid verification mode",
 			modify:  func(c *ShardConfig) { c.VerificationMode = "blake3" },
-			wantErr: "verification mode must be groth16 or fri",
+			wantErr: "verification mode must be groth16, groth16-wa, fri, or devkey",
 		},
 		{
 			name:    "missing hash function",

@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+*.local
+tsconfig.tsbuildinfo
+# `tsc -b` emits transpiled .js alongside source when `outDir` isn't set.
+# Vite owns the real build; the loose .js files under src are detritus.
+src/**/*.js

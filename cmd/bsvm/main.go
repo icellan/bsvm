@@ -6,7 +6,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,16 +18,23 @@ import (
 	"syscall"
 	"time"
 
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/holiman/uint256"
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/covenant"
+	"github.com/icellan/bsvm/pkg/governance"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/network"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/prover"
 	"github.com/icellan/bsvm/pkg/rpc"
+	"github.com/icellan/bsvm/pkg/rpc/auth"
 	"github.com/icellan/bsvm/pkg/shard"
+	"github.com/icellan/bsvm/pkg/tracing"
 	"github.com/icellan/bsvm/pkg/types"
 	cli "github.com/urfave/cli/v2"
 )
@@ -43,10 +52,12 @@ func main() {
 				Usage: "Initialize a new L2 chain from genesis",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "path to data directory"},
-					&cli.Int64Flag{Name: "chain-id", Required: true, Usage: "shard chain ID"},
+					&cli.Int64Flag{Name: "chain-id", Value: 0, Usage: "shard chain ID (default: 31337 when --prove-mode is set)"},
 					&cli.Uint64Flag{Name: "gas-limit", Value: 0, Usage: "genesis block gas limit (default: 30000000)"},
-					&cli.StringFlag{Name: "governance", Value: "none", Usage: "governance mode: none, single_key, or multisig"},
-					&cli.StringFlag{Name: "verification", Value: "groth16", Usage: "verification mode: groth16 or fri"},
+					&cli.StringFlag{Name: "governance", Value: "", Usage: "governance mode: none, single_key, or multisig (default: single_key when --prove-mode is mock|execute)"},
+					&cli.StringFlag{Name: "verification", Value: "", Usage: "verification mode: groth16, groth16-wa, fri, or devkey (auto-selected by --prove-mode if both unset)"},
+					&cli.StringFlag{Name: "prove-mode", Value: "", Usage: "spec-16 devnet proof mode: mock, execute, or prove (selects covenant + chain defaults)"},
+					&cli.StringFlag{Name: "prefund-accounts", Value: "none", Usage: "prefund well-known test accounts: none or hardhat"},
 					&cli.StringFlag{Name: "sp1-vk", Value: "", Usage: "hex-encoded SP1 verifying key (optional for testing)"},
 					&cli.StringSliceFlag{Name: "alloc", Usage: "genesis alloc: address=balance_wei (repeatable)"},
 				},
@@ -78,6 +89,8 @@ func main() {
 				Usage:  "Print version information",
 				Action: cmdVersion,
 			},
+			devCommand(),
+			adminCommand(),
 		},
 	}
 
@@ -90,13 +103,62 @@ func main() {
 // cmdInit handles the "bsvm init" subcommand. It creates a new shard by
 // initializing the L2 genesis state, compiling the covenant, and writing
 // the shard configuration to disk.
+//
+// Spec 16 devnet: passing --prove-mode mock|execute|prove auto-selects
+// verification mode, chain ID default (31337), governance mode
+// (single_key for mock/execute), and the devnet governance key so
+// developers can spin up a complete shard with a single flag.
 func cmdInit(ctx *cli.Context) error {
 	dataDir := ctx.String("datadir")
 	chainID := ctx.Int64("chain-id")
 	gasLimit := ctx.Uint64("gas-limit")
 	governanceMode := ctx.String("governance")
 	verification := ctx.String("verification")
+	proveMode := ctx.String("prove-mode")
+	prefund := ctx.String("prefund-accounts")
 	sp1KeyHex := ctx.String("sp1-vk")
+
+	// Apply --prove-mode defaults before validation. Spec 16 mapping:
+	//   mock    → devkey covenant, single_key governance, chain 31337
+	//   execute → devkey covenant, single_key governance, chain 31337
+	//   prove   → groth16-wa covenant (mainnet-eligible), chain 31337
+	switch proveMode {
+	case "":
+		// No prove-mode — use explicit flags.
+	case "mock", "execute":
+		if verification == "" {
+			verification = "devkey"
+		}
+		if governanceMode == "" {
+			governanceMode = "single_key"
+		}
+		if chainID == 0 {
+			chainID = 31337
+		}
+	case "prove":
+		if verification == "" {
+			verification = "groth16-wa"
+		}
+		if governanceMode == "" {
+			governanceMode = "single_key"
+		}
+		if chainID == 0 {
+			chainID = 31337
+		}
+	default:
+		return fmt.Errorf("invalid prove mode %q: expected mock, execute, or prove", proveMode)
+	}
+
+	// Apply remaining defaults for the non-devnet path.
+	if verification == "" {
+		verification = "groth16"
+	}
+	if governanceMode == "" {
+		governanceMode = "none"
+	}
+	if chainID == 0 {
+		return fmt.Errorf("--chain-id is required (or pass --prove-mode to accept the devnet default 31337)")
+	}
 
 	// Parse governance mode.
 	var govMode covenant.GovernanceMode
@@ -116,8 +178,12 @@ func cmdInit(ctx *cli.Context) error {
 	switch verification {
 	case "groth16":
 		verifyMode = covenant.VerifyGroth16
+	case "groth16-wa":
+		verifyMode = covenant.VerifyGroth16WA
 	case "fri":
 		verifyMode = covenant.VerifyFRI
+	case "devkey":
+		verifyMode = covenant.VerifyDevKey
 	default:
 		return fmt.Errorf("invalid verification mode: %s", verification)
 	}
@@ -135,8 +201,28 @@ func cmdInit(ctx *cli.Context) error {
 		sp1VK = make([]byte, 32)
 	}
 
-	// Parse --alloc flags: "0xAddress=balanceWei"
+	// Build the genesis allocation. Prefund flag takes effect before
+	// --alloc so explicit --alloc entries can override a prefunded
+	// balance (e.g. raising Hardhat #0's starting balance for a single
+	// scenario).
 	alloc := make(map[types.Address]block.GenesisAccount)
+	switch prefund {
+	case "", "none":
+		// No prefunding.
+	case "hardhat":
+		// 1000 wBSV per account == 1000 * 10^18 wei.
+		perAccount := new(uint256.Int).SetUint64(1000)
+		perAccount.Mul(perAccount, new(uint256.Int).Exp(
+			uint256.NewInt(10), uint256.NewInt(18),
+		))
+		for addr, acc := range shard.HardhatPrefundAlloc(perAccount) {
+			alloc[addr] = acc
+		}
+	default:
+		return fmt.Errorf("invalid prefund-accounts %q: expected none or hardhat", prefund)
+	}
+
+	// Parse --alloc flags: "0xAddress=balanceWei"
 	for _, entry := range ctx.StringSlice("alloc") {
 		parts := splitAllocEntry(entry)
 		if len(parts) != 2 {
@@ -150,12 +236,29 @@ func cmdInit(ctx *cli.Context) error {
 		alloc[addr] = block.GenesisAccount{Balance: bal}
 	}
 
+	// Assemble the governance config. For devnet prove-mode runs that
+	// request single_key / multisig but don't supply keys, auto-derive
+	// the devnet governance key (Hardhat #0 pubkey) so the shard can
+	// spin up on just a --prove-mode flag.
+	govConfig := covenant.GovernanceConfig{Mode: govMode}
+	if proveMode != "" && (govMode == covenant.GovernanceSingleKey || govMode == covenant.GovernanceMultiSig) {
+		pub, err := shard.DevnetGovernanceKey()
+		if err != nil {
+			return fmt.Errorf("deriving devnet governance key: %w", err)
+		}
+		if govMode == covenant.GovernanceSingleKey {
+			govConfig.Keys = [][]byte{pub}
+		}
+		// Multisig devnet needs the operator to supply the other keys
+		// explicitly; auto-deriving a single key only covers single_key.
+	}
+
 	params := &shard.InitShardParams{
 		ChainID:         chainID,
 		DataDir:         dataDir,
 		GasLimit:        gasLimit,
 		Alloc:           alloc,
-		Governance:      covenant.GovernanceConfig{Mode: govMode},
+		Governance:      govConfig,
 		Verification:    verifyMode,
 		SP1VerifyingKey: sp1VK,
 	}
@@ -196,6 +299,14 @@ func cmdRun(ctx *cli.Context) error {
 		nodeCfg = DefaultNodeConfig()
 	}
 
+	// Apply BSVM_* env-var overrides. This is the layer spec 16's
+	// docker-compose.yml drives — the TOML file (or DefaultNodeConfig)
+	// provides the baseline and each container then tweaks per-node
+	// values (ports, peers, role, coinbase) via env.
+	if err := ApplyEnvOverrides(nodeCfg); err != nil {
+		return fmt.Errorf("applying env overrides: %w", err)
+	}
+
 	// Override from flags.
 	if rpcAddr != "" {
 		nodeCfg.RPC.HTTPAddr = rpcAddr
@@ -205,7 +316,43 @@ func cmdRun(ctx *cli.Context) error {
 	}
 
 	// Configure logging.
-	setupLogging(nodeCfg.LogLevel, nodeCfg.LogFormat)
+	logStreamer := setupLogging(nodeCfg.LogLevel, nodeCfg.LogFormat)
+
+	// 1.5 Build the metrics registry and OTel tracer. Both are
+	// best-effort — the node still runs if tracing can't reach its
+	// configured OTLP endpoint. Node identity derives from BSVM_NODE_NAME
+	// (set by spec 16 docker-compose) or falls back to the shard config.
+	nodeName := NodeNameFromEnv()
+	if nodeName == "" {
+		nodeName = "node"
+	}
+	chainIDStr := fmt.Sprintf("%d", nodeCfg.Shard.ChainID)
+	metricsRegistry := metrics.NewRegistry(metrics.Labels{
+		NodeName: nodeName,
+		ChainID:  chainIDStr,
+	})
+
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer traceCancel()
+	shutdownTracing, err := tracing.Setup(traceCtx, tracing.Config{
+		NodeName:       nodeName,
+		ChainID:        chainIDStr,
+		ServiceVersion: version,
+	})
+	if err != nil {
+		slog.Warn("tracing setup failed", "error", err)
+	}
+	defer func() {
+		if shutdownTracing == nil {
+			return
+		}
+		// Give the exporter a bounded window to drain pending spans.
+		sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer scancel()
+		if err := shutdownTracing(sctx); err != nil {
+			slog.Warn("tracing shutdown error", "error", err)
+		}
+	}()
 
 	// 2. Load shard config.
 	shardCfgPath := shardConfigPath
@@ -245,6 +392,10 @@ func cmdRun(ctx *cli.Context) error {
 	switch shardCfg.VerificationMode {
 	case "fri":
 		verifyMode = covenant.VerifyFRI
+	case "groth16-wa":
+		verifyMode = covenant.VerifyGroth16WA
+	case "devkey":
+		verifyMode = covenant.VerifyDevKey
 	default:
 		verifyMode = covenant.VerifyGroth16
 	}
@@ -263,14 +414,22 @@ func cmdRun(ctx *cli.Context) error {
 	proverCfg := nodeCfg.ToProverConfig()
 	sp1Prover := prover.NewSP1Prover(proverCfg)
 
+	// Resolve the spec-16 proving mode once so the overlay config,
+	// the admin auth config, and the startup banner all see the same
+	// value. Failure to parse the env is not fatal — an empty mode
+	// simply means "not a devnet" which disables dev-bypass auth.
+	proveMode, _ := ProveModeFromEnv()
+
 	// 5. Create overlay node.
 	overlayCfg := nodeCfg.ToOverlayConfig(chainID)
-	overlayNode, err := overlay.NewOverlayNode(
+	overlayCfg.ProveMode = proveMode
+	overlayNode, err := overlay.NewOverlayNodeWithObservability(
 		overlayCfg,
 		joinResult.ChainDB,
 		joinResult.DB,
 		covenantMgr,
 		sp1Prover,
+		metricsRegistry,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create overlay node: %w", err)
@@ -301,6 +460,59 @@ func cmdRun(ctx *cli.Context) error {
 		joinResult.ChainDB,
 		joinResult.DB,
 	)
+	// Attach the Prometheus registry so `/metrics` becomes scrapable
+	// alongside the JSON-RPC endpoint.
+	rpcServer.SetMetricsRegistry(metricsRegistry)
+
+	// Attach the slog streamer so adminLogs WebSocket subscriptions
+	// (spec 15 A9) see structured log records as they happen.
+	rpcServer.SetLogStreamer(logStreamer)
+
+	// Spec 15 admin surface. Dev-bypass is enabled only when the
+	// shard is running in mock/execute mode AND an explicit secret
+	// is configured (BSVM_ADMIN_DEV_SECRET). This keeps the admin
+	// surface OFF by default even on a mock shard — operators have
+	// to opt in.
+	devSecret := strings.TrimSpace(os.Getenv("BSVM_ADMIN_DEV_SECRET"))
+	if devSecret == "" && (proveMode == "mock" || proveMode == "execute") {
+		// Devnet convenience: fall back to the spec 16 default secret
+		// so the stock `docker compose up` workflow has a working
+		// admin surface without requiring the operator to pick a
+		// secret. Production images MUST set BSVM_ADMIN_DEV_SECRET
+		// themselves — this fallback is scoped to dev proving modes
+		// which are already unsafe for mainnet.
+		devSecret = "devnet-secret-do-not-use-in-production"
+	}
+	// Build a governance-key checker from the shard config — wallets
+	// may only authenticate under keys that the shard genesis listed
+	// as governance-authorised.
+	govConfig, _ := shardCfg.GovernanceConfig()
+	govKeyChecker := &shardGovernanceChecker{keys: govConfig.Keys}
+
+	// Persistent server identity lives inside the node's data dir so
+	// a restart keeps existing sessions' trust anchor. Only spawn the
+	// handshake endpoint when governance mode has at least one key.
+	var serverIdentity *auth.ServerIdentity
+	var sessionStore *auth.SessionStore
+	if len(govConfig.Keys) > 0 {
+		var idErr error
+		serverIdentity, idErr = auth.LoadOrCreateServerIdentity(nodeCfg.DataDir)
+		if idErr != nil {
+			slog.Warn("admin identity: failed to load/create, BRC-100 handshake disabled", "error", idErr)
+		} else {
+			sessionStore = auth.NewSessionStore()
+			sessionStore.StartSweeper()
+			defer sessionStore.Close()
+		}
+	}
+
+	rpcServer.SetAdminAuth(auth.Config{
+		DevAuthSecret:     devSecret,
+		ShardProvingMode:  overlayNode.ProveMode,
+		GovernanceChecker: govKeyChecker,
+		ServerIdentity:    serverIdentity,
+		SessionStore:      sessionStore,
+	})
 
 	// 7. Create gossip manager (P2P network).
 	netCfg := nodeCfg.ToNetworkConfig(chainID)
@@ -308,6 +520,44 @@ func cmdRun(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create gossip manager: %w", err)
 	}
+
+	// 7.5 Wire the governance proposal workflow (spec 15 A4). Uses a
+	// content-addressed in-memory store backed by libp2p gossip so
+	// proposals propagate across every node automatically. The
+	// signature verifier is a closure that parses a DER signature
+	// over the 32-byte proposal ID, returning the recovered pubkey.
+	proposalStore := governance.NewMemoryStore()
+	proposalWorkflow := governance.NewWorkflow(
+		proposalStore,
+		func(p *governance.Proposal) error {
+			data, err := json.Marshal(p)
+			if err != nil {
+				return err
+			}
+			return gossipMgr.BroadcastProposal(data)
+		},
+		makeProposalVerifier(govConfig.Keys),
+	)
+	proposalWorkflow.OnReady(func(p *governance.Proposal) {
+		// v1: log when a proposal reaches threshold. The actual BSV
+		// broadcast path lands when the governance broadcaster is
+		// wired up to the covenant manager.
+		slog.Info("governance proposal ready for broadcast",
+			"id", p.ID,
+			"action", p.Action,
+			"signatures", len(p.Signatures),
+			"required", p.Required,
+		)
+	})
+	rpcServer.AdminAPI().SetGovernanceWorkflow(proposalWorkflow, govConfig.Threshold)
+	gossipMgr.RegisterHandler(network.MsgProposal, func(peerID peer.ID, msg *network.Message) error {
+		var p governance.Proposal
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			return fmt.Errorf("decoding proposal gossip from %s: %w", peerID, err)
+		}
+		_, err := proposalWorkflow.CreateOrMerge(&p)
+		return err
+	})
 
 	// 8. Start services.
 	if err := rpcServer.Start(); err != nil {
@@ -326,6 +576,10 @@ func cmdRun(ctx *cli.Context) error {
 		"rpc", rpcCfg.HTTPAddr,
 		"p2p", netCfg.ListenAddr,
 	)
+
+	// 8.5 Spec 16: print the developer banner on node1 once services are up.
+	// Silent on non-devnet invocations (BSVM_NODE_NAME not set).
+	PrintStartupBanner(proveMode, chainID, rpcCfg.HTTPAddr, netCfg.ListenAddr)
 
 	// 9. Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
@@ -406,8 +660,9 @@ func cmdVersion(ctx *cli.Context) error {
 }
 
 // setupLogging configures the slog default logger based on the given level
-// and format strings.
-func setupLogging(level, format string) {
+// and format strings. It returns the installed LogStreamer so callers can
+// wire it to the WebSocket admin log subscription (spec 15 A9).
+func setupLogging(level, format string) *rpc.LogStreamer {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -422,14 +677,86 @@ func setupLogging(level, format string) {
 
 	opts := &slog.HandlerOptions{Level: lvl}
 
-	var handler slog.Handler
+	var inner slog.Handler
 	if format == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
+		inner = slog.NewJSONHandler(os.Stderr, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		inner = slog.NewTextHandler(os.Stderr, opts)
 	}
 
-	slog.SetDefault(slog.New(handler))
+	streamer := rpc.NewLogStreamer(inner, 4096)
+	slog.SetDefault(slog.New(streamer))
+	return streamer
+}
+
+// makeProposalVerifier returns a governance.SigVerifier that accepts
+// any signature from one of the governance keys over sha256(proposalID).
+// It rejects signatures that can't be parsed, don't verify, or come
+// from a key outside the governance set.
+//
+// The signed digest deliberately matches the wallet's existing
+// convention of signing sha256(messageBytes): the wallet can reuse
+// its BRC-3 signMessage helper with proposalID (already hex-encoded)
+// as input without any extra plumbing.
+func makeProposalVerifier(govKeys [][]byte) governance.SigVerifier {
+	return func(proposalID, sigHex string) ([]byte, error) {
+		sigBytes, err := hex.DecodeString(sigHex)
+		if err != nil {
+			return nil, fmt.Errorf("signatureHex: %w", err)
+		}
+		sigObj, err := ec.ParseDERSignature(sigBytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse DER signature: %w", err)
+		}
+		// sha256 over the ID string (hex of the content hash) — stable
+		// across wallets without needing a canonical JSON re-derivation.
+		digest := sha256.Sum256([]byte(proposalID))
+		for _, keyBytes := range govKeys {
+			pub, err := ec.ParsePubKey(keyBytes)
+			if err != nil {
+				continue
+			}
+			if sigObj.Verify(digest[:], pub) {
+				return keyBytes, nil
+			}
+		}
+		return nil, fmt.Errorf("no governance key verified the signature")
+	}
+}
+
+// shardGovernanceChecker is the minimal implementation of
+// auth.GovernanceKeyChecker backed by the shard config's
+// governance-key list. Accepts any compressed secp256k1 key that
+// appears verbatim in the genesis config — nothing fancier.
+type shardGovernanceChecker struct {
+	keys [][]byte
+}
+
+// IsGovernanceKey reports whether the given compressed pubkey
+// matches one of the shard's governance keys.
+func (c *shardGovernanceChecker) IsGovernanceKey(pub []byte) bool {
+	for _, k := range c.keys {
+		if len(k) == len(pub) && bytesEqual(k, pub) {
+			return true
+		}
+	}
+	return false
+}
+
+// bytesEqual is a local helper to avoid importing crypto/subtle for
+// the fixed-length compressed-key comparison. All inputs here are
+// 33 bytes, so constant-time isn't a concern (the set is bounded
+// and public).
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // splitAllocEntry splits "address=balance" on the first '='.

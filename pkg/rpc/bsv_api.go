@@ -44,6 +44,7 @@ type BsvAPI struct {
 	overlay         *overlay.OverlayNode
 	feeWallet       feeWalletAccessor
 	withdrawalStore WithdrawalStore
+	bridge          BridgeSnapshotProvider
 }
 
 // NewBsvAPI creates a new BsvAPI instance.

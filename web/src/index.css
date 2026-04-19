@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    font-family: theme("fontFamily.sans");
+  }
+
+  a {
+    color: theme("colors.accent");
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-lg border border-border bg-panel;
+  }
+
+  .kbd {
+    @apply inline-flex items-center rounded bg-border/60 px-1 text-[0.7rem] font-mono text-muted;
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-mono;
+  }
+
+  .badge-speculative {
+    @apply border-muted/30 text-muted;
+  }
+
+  .badge-proven {
+    @apply border-accent/40 text-accent;
+  }
+
+  .badge-finalized {
+    @apply border-success/40 text-success;
+  }
+
+  .badge-frozen {
+    @apply animate-pulse border-danger/50 text-danger;
+  }
+}

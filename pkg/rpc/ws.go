@@ -47,6 +47,16 @@ type wsConn struct {
 	closed  atomic.Bool
 	eventCh chan interface{} // buffered event queue
 	manager *WSManager       // back-reference for config
+
+	// authed / adminIdentity track first-message authentication for
+	// adminLogs subscriptions (spec 15 A9). Browsers can't set custom
+	// headers on WS upgrade, so the client sends
+	// `{"method":"admin_authenticate","params":[...]}` immediately
+	// after connecting. Until that call succeeds, adminLogs
+	// subscriptions are rejected.
+	authed         atomic.Bool
+	adminIdentity  string
+	logCancelFuncs map[string]func()
 }
 
 // startEventWriter drains the buffered event channel and writes events to
@@ -120,6 +130,11 @@ func (wc *wsConn) writeJSON(v interface{}) error {
 // close shuts down the connection and signals all goroutines to stop.
 func (wc *wsConn) close() {
 	if wc.closed.CompareAndSwap(false, true) {
+		// Cancel every adminLogs subscription so the underlying
+		// LogStreamer drops its channel reference.
+		for _, cancel := range wc.logCancelFuncs {
+			cancel()
+		}
 		close(wc.done)
 		wc.conn.Close()
 	}
@@ -147,6 +162,11 @@ type WSManager struct {
 	server    *RPCServer
 	eventFeed *event.Feed
 
+	// logStreamer fans slog records out to authenticated adminLogs
+	// subscribers. Nil when the node has not installed a streamer —
+	// adminLogs subscriptions then fail cleanly.
+	logStreamer *LogStreamer
+
 	// Configurable limits.
 	maxConns            int           // Default: 1000
 	maxSubsPerConn      int           // Default: 100
@@ -154,6 +174,15 @@ type WSManager struct {
 	slowConsumerTimeout time.Duration // Default: 30s
 
 	quit chan struct{}
+}
+
+// SetLogStreamer installs the LogStreamer used for adminLogs
+// subscriptions. Optional; when unset the adminLogs subscription
+// request fails with "log streaming not configured".
+func (wm *WSManager) SetLogStreamer(ls *LogStreamer) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	wm.logStreamer = ls
 }
 
 // NewWSManager creates a new WSManager attached to the given RPC server.
@@ -289,11 +318,12 @@ func (wm *WSManager) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wc := &wsConn{
-		conn:    conn,
-		subs:    make(map[string]*WSSubscription),
-		done:    make(chan struct{}),
-		eventCh: make(chan interface{}, queueDepth),
-		manager: wm,
+		conn:           conn,
+		subs:           make(map[string]*WSSubscription),
+		done:           make(chan struct{}),
+		eventCh:        make(chan interface{}, queueDepth),
+		manager:        wm,
+		logCancelFuncs: make(map[string]func()),
 	}
 	wc.startEventWriter()
 
@@ -379,6 +409,8 @@ func (wm *WSManager) handleMessage(wc *wsConn, data []byte) {
 		wm.handleSubscribe(wc, id, req.Params)
 	case "eth_unsubscribe":
 		wm.handleUnsubscribe(wc, id, req.Params)
+	case "admin_authenticate":
+		wm.handleAdminAuthenticate(wc, id, req.Params)
 	default:
 		// Proxy to the regular RPC dispatcher for any other method.
 		if wm.server != nil {
@@ -408,6 +440,70 @@ func (wm *WSManager) handleMessage(wc *wsConn, data []byte) {
 			})
 		}
 	}
+}
+
+// handleAdminAuthenticate implements the spec 15 A9 first-message
+// auth gate. Browsers cannot attach custom headers to a WebSocket
+// upgrade, so the admin panel sends this as the very first JSON-RPC
+// call after the upgrade completes.
+//
+// Two forms are accepted (same shape as the HTTP admin endpoint):
+//
+//  1. [{"devAuth": "<shared secret>"}] — accepted only when the
+//     shard's proving mode is mock / execute.
+//  2. [{"sessionNonce": "<server nonce from prior BRC-103 handshake>"}]
+//     — re-uses an existing BRC-100 HTTP session so operators don't
+//     have to re-handshake for live log streaming.
+//
+// Successful authentication marks the connection as authed; from
+// then on adminLogs subscriptions are permitted.
+func (wm *WSManager) handleAdminAuthenticate(wc *wsConn, id json.RawMessage, params json.RawMessage) {
+	if wm.server == nil {
+		wc.writeJSON(&wsResponse{
+			JSONRPC: "2.0",
+			Error:   &jsonrpcError{Code: errCodeServerError, Message: "server not attached"},
+			ID:      id,
+		})
+		return
+	}
+	var args []map[string]string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		wc.writeJSON(&wsResponse{
+			JSONRPC: "2.0",
+			Error:   &jsonrpcError{Code: errCodeInvalidParams, Message: "expected [{devAuth} | {sessionNonce}]"},
+			ID:      id,
+		})
+		return
+	}
+	creds := args[0]
+
+	ac := wm.server.authConfig
+
+	if sec, ok := creds["devAuth"]; ok && sec != "" && ac.DevAuthSecret != "" {
+		if sec == ac.DevAuthSecret && ac.ShardProvingMode != nil {
+			mode := ac.ShardProvingMode()
+			if mode == "mock" || mode == "execute" {
+				wc.adminIdentity = "devnet-bypass"
+				wc.authed.Store(true)
+				wc.writeJSON(&wsResponse{JSONRPC: "2.0", Result: true, ID: id})
+				return
+			}
+		}
+	}
+	if nonce, ok := creds["sessionNonce"]; ok && nonce != "" && ac.SessionStore != nil {
+		if rec := ac.SessionStore.Get(nonce); rec != nil {
+			wc.adminIdentity = rec.IdentityKey
+			wc.authed.Store(true)
+			wc.writeJSON(&wsResponse{JSONRPC: "2.0", Result: true, ID: id})
+			return
+		}
+	}
+
+	wc.writeJSON(&wsResponse{
+		JSONRPC: "2.0",
+		Error:   &jsonrpcError{Code: errCodeServerError, Message: "admin_authenticate: credentials rejected"},
+		ID:      id,
+	})
 }
 
 // handleSubscribe processes an eth_subscribe request.
@@ -532,6 +628,63 @@ func (wm *WSManager) handleSubscribe(wc *wsConn, id json.RawMessage, params json
 
 		slog.Debug("websocket subscription created", "id", subID, "type", "bsvConfirmation")
 
+	case "adminLogs":
+		// First-message auth gate: admin subscriptions require the
+		// connection to have already handshaken via admin_authenticate.
+		if !wc.authed.Load() {
+			wc.writeJSON(&wsResponse{
+				JSONRPC: "2.0",
+				Error:   &jsonrpcError{Code: errCodeServerError, Message: "adminLogs requires admin_authenticate first"},
+				ID:      id,
+			})
+			return
+		}
+		wm.mu.Lock()
+		streamer := wm.logStreamer
+		wm.mu.Unlock()
+		if streamer == nil {
+			wc.writeJSON(&wsResponse{
+				JSONRPC: "2.0",
+				Error:   &jsonrpcError{Code: errCodeServerError, Message: "adminLogs: log streaming not configured on this node"},
+				ID:      id,
+			})
+			return
+		}
+
+		subID := wm.allocateID()
+		sub := &WSSubscription{id: subID, subType: "adminLogs"}
+		wc.subs[subID] = sub
+
+		logCh, cancel := streamer.Subscribe(256)
+		wc.logCancelFuncs[subID] = cancel
+
+		// Fan log records into the connection's enqueueEvent path so
+		// they get backpressure + slow-consumer eviction for free.
+		go func() {
+			for rec := range logCh {
+				if wc.closed.Load() {
+					return
+				}
+				wc.enqueueEvent(&wsNotification{
+					JSONRPC: "2.0",
+					Method:  "eth_subscription",
+					Params: subscriptionParams{
+						Subscription: subID,
+						Result:       rec,
+					},
+				})
+			}
+		}()
+
+		wc.writeJSON(&wsResponse{
+			JSONRPC: "2.0",
+			Result:  subID,
+			ID:      id,
+		})
+
+		slog.Debug("websocket subscription created", "id", subID, "type", "adminLogs",
+			"identity", wc.adminIdentity)
+
 	default:
 		wc.writeJSON(&wsResponse{
 			JSONRPC: "2.0",
@@ -565,6 +718,10 @@ func (wm *WSManager) handleUnsubscribe(wc *wsConn, id json.RawMessage, params js
 
 	if _, ok := wc.subs[subID]; ok {
 		delete(wc.subs, subID)
+		if cancel, hasLog := wc.logCancelFuncs[subID]; hasLog {
+			cancel()
+			delete(wc.logCancelFuncs, subID)
+		}
 		wc.writeJSON(&wsResponse{
 			JSONRPC: "2.0",
 			Result:  true,

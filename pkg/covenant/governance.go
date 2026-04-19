@@ -34,6 +34,16 @@ const (
 	// fast (~400 ms) on-chain verifier compared to the generic Groth16
 	// variant (~5.6 MB). This is the production target for Mode 3.
 	VerifyGroth16WA
+
+	// VerifyDevKey is the devnet-only mode used by spec 16 "mock" and
+	// "execute" proving configurations. It mirrors the Mode 1 FRI bridge
+	// (no on-chain STARK check, public-values offset binding, OP_RETURN
+	// data-availability output, same governance surface) and additionally
+	// requires AdvanceState to carry a signature valid under the shard's
+	// GovernanceKey. Rejected at genesis when Mainnet=true and when
+	// governance mode is "none" (no key to check the signature against).
+	// See contracts/rollup_devkey.runar.go.
+	VerifyDevKey
 )
 
 // String returns a human-readable name for the verification mode.
@@ -45,6 +55,8 @@ func (m VerificationMode) String() string {
 		return "fri"
 	case VerifyGroth16WA:
 		return "groth16-wa"
+	case VerifyDevKey:
+		return "devkey"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(m))
 	}

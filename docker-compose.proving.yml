@@ -1,0 +1,45 @@
+# Spec 16 "prove" mode override for the developer devnet.
+#
+# Usage:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.proving.yml up
+#
+# Flips BSVM_PROVE_MODE from "mock" (default) to "prove" on both prover
+# nodes and reserves an NVIDIA GPU for each. Node 3 stays a follower —
+# it never produces proofs, so it doesn't need a GPU.
+#
+# Prove mode runs the full production covenant (groth16-wa) and real
+# SP1 STARK proofs. Expect 5-60 seconds per batch on GPU; CPU-only
+# prove mode works but is dramatically slower (minutes per batch) and
+# is not recommended for interactive development.
+#
+# On a host without NVIDIA runtime the `deploy.resources.reservations`
+# block is silently ignored by Docker Engine; the containers will fall
+# back to CPU proving. Look for "CUDA unavailable" in node1 logs if you
+# expect GPU acceleration and aren't seeing it.
+
+services:
+
+  node1:
+    environment:
+      BSVM_PROVE_MODE: prove
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  node2:
+    environment:
+      BSVM_PROVE_MODE: prove
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Node 3 is a follower in every mode — no GPU override needed.

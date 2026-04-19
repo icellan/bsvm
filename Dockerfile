@@ -38,7 +38,7 @@ COPY --from=builder /src/pkg/covenant/contracts/ /app/pkg/covenant/contracts/
 
 WORKDIR /app
 
-EXPOSE 8545 9945
+EXPOSE 8545 8546 9945
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
     CMD wget -qO- --post-data='{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \

@@ -70,6 +70,12 @@ type OverlayConfig struct {
 	// used across the test suite keeps working; production deployments
 	// MUST set this to true.
 	RequireRealProof bool
+
+	// ProveMode reports the spec-16 proving mode active on this node
+	// ("mock", "execute", "prove"). Empty means unset / not a devnet
+	// deployment. Read by the admin RPC surface so auth middleware
+	// and the explorer can show the operator which covenant is live.
+	ProveMode string
 }
 
 // DefaultOverlayConfig returns an OverlayConfig with sensible defaults.

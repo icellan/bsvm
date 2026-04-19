@@ -11,6 +11,7 @@ import (
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/event"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/prover"
 	"github.com/icellan/bsvm/pkg/rlp"
 	"github.com/icellan/bsvm/pkg/state"
@@ -58,12 +59,30 @@ type OverlayNode struct {
 // NewOverlayNode creates a new overlay node with the given components.
 // It reads the current chain head from the ChainDB to initialise the
 // execution tip. The state database is opened at the head state root.
+//
+// This constructor skips observability wiring. Production nodes should
+// use NewOverlayNodeWithObservability so Prometheus and OpenTelemetry
+// get the prover + batcher signals.
 func NewOverlayNode(
 	config OverlayConfig,
 	chainDB *block.ChainDB,
 	database db.Database,
 	covenantMgr *covenant.CovenantManager,
 	sp1Prover *prover.SP1Prover,
+) (*OverlayNode, error) {
+	return NewOverlayNodeWithObservability(config, chainDB, database, covenantMgr, sp1Prover, nil)
+}
+
+// NewOverlayNodeWithObservability creates an OverlayNode wiring its
+// prover and batcher subsystems to the supplied Prometheus registry.
+// When registry is nil, metrics are silently dropped (test-friendly).
+func NewOverlayNodeWithObservability(
+	config OverlayConfig,
+	chainDB *block.ChainDB,
+	database db.Database,
+	covenantMgr *covenant.CovenantManager,
+	sp1Prover *prover.SP1Prover,
+	registry *metrics.Registry,
 ) (*OverlayNode, error) {
 	// Read the current head.
 	headHeader := chainDB.ReadHeadHeader()
@@ -91,7 +110,7 @@ func NewOverlayNode(
 	// Create the parallel prover.
 	var pp *prover.ParallelProver
 	if sp1Prover != nil {
-		pp = prover.NewParallelProver(sp1Prover, 1)
+		pp = prover.NewParallelProverWithObservability(sp1Prover, 1, registry)
 	}
 
 	// Create the signer.
@@ -118,7 +137,7 @@ func NewOverlayNode(
 	}
 
 	// Create the batcher.
-	node.batcher = NewBatcher(node, config.MaxBatchSize, config.MaxBatchFlushDelay)
+	node.batcher = NewBatcherWithObservability(node, config.MaxBatchSize, config.MaxBatchFlushDelay, registry)
 
 	// Create the double-spend monitor.
 	node.dsMonitor = NewDoubleSpendMonitor(node)
@@ -259,6 +278,133 @@ func (n *OverlayNode) ValidateTransaction(tx *types.Transaction) error {
 // Batcher returns the node's transaction batcher.
 func (n *OverlayNode) Batcher() *Batcher {
 	return n.batcher
+}
+
+// ParallelProverRef returns the node's parallel prover coordinator.
+// May be nil when the node was constructed without an SP1 prover
+// (follower-only mode or unit tests).
+func (n *OverlayNode) ParallelProverRef() *prover.ParallelProver {
+	return n.parallelProver
+}
+
+// ---------------------------------------------------------------------------
+// admin RPC accessors (spec 15)
+// ---------------------------------------------------------------------------
+//
+// These tiny wrappers expose the minimum state the admin_* handlers
+// need without letting rpc/ reach into unrelated batcher / prover /
+// network internals. Each returns zero values when the relevant
+// subsystem is nil (follower mode / tests).
+
+// BatcherPause pauses the batcher.
+func (n *OverlayNode) BatcherPause() {
+	if n.batcher != nil {
+		n.batcher.Pause()
+	}
+}
+
+// BatcherResume unpauses the batcher.
+func (n *OverlayNode) BatcherResume() {
+	if n.batcher != nil {
+		n.batcher.Resume()
+	}
+}
+
+// BatcherIsPaused reports the batcher pause state.
+func (n *OverlayNode) BatcherIsPaused() bool {
+	if n.batcher == nil {
+		return false
+	}
+	return n.batcher.IsPaused()
+}
+
+// BatcherPendingCount returns the current pending-transaction count.
+func (n *OverlayNode) BatcherPendingCount() int {
+	if n.batcher == nil {
+		return 0
+	}
+	return n.batcher.PendingCount()
+}
+
+// BatcherForceFlush triggers an immediate flush of the pending batch.
+func (n *OverlayNode) BatcherForceFlush() error {
+	if n.batcher == nil {
+		return nil
+	}
+	return n.batcher.Flush()
+}
+
+// PeerSummary returns a summary of peers connected to this node.
+// Returns an empty slice when the peer manager is not attached yet —
+// this is the current state for every node because the network /
+// gossip layer stays independent of the overlay package.
+//
+// A real implementation lands alongside spec 15 wallet-side work once
+// a PeerManager accessor is added.
+func (n *OverlayNode) PeerSummary() []RPCPeerSummary {
+	return []RPCPeerSummary{}
+}
+
+// RPCPeerSummary is the shape returned by PeerSummary. Duplicated
+// here (not imported from pkg/rpc) to avoid a dependency cycle: rpc
+// already depends on overlay.
+type RPCPeerSummary struct {
+	PeerID        string `json:"peerId"`
+	Address       string `json:"address"`
+	Role          string `json:"role"`
+	LastHeartbeat int64  `json:"lastHeartbeat"`
+	BlocksBehind  int64  `json:"blocksBehind"`
+}
+
+// RuntimeConfigView is the admin-panel-facing snapshot of settings
+// the operator can read (and eventually write) at runtime.
+type RuntimeConfigView struct {
+	ChainID             int64  `json:"chainId"`
+	MinGasPriceWei      string `json:"minGasPriceWei"`
+	MaxBatchSize        int    `json:"maxBatchSize"`
+	MaxBatchFlushMs     int64  `json:"maxBatchFlushMs"`
+	MaxSpeculativeDepth int    `json:"maxSpeculativeDepth"`
+	ProveMode           string `json:"proveMode"`
+	RestartRequired     bool   `json:"restartRequired"`
+}
+
+// RuntimeConfig returns a read-only snapshot of the overlay's
+// runtime-relevant settings. Every field is currently marked as
+// requiring a restart to change — the plan scopes live reload to a
+// follow-up pass that adds per-field mutexes.
+func (n *OverlayNode) RuntimeConfig() RuntimeConfigView {
+	minGas := "0"
+	if n.config.MinGasPrice != nil {
+		minGas = n.config.MinGasPrice.String()
+	}
+	return RuntimeConfigView{
+		ChainID:             n.config.ChainID,
+		MinGasPriceWei:      minGas,
+		MaxBatchSize:        n.config.MaxBatchSize,
+		MaxBatchFlushMs:     n.config.MaxBatchFlushDelay.Milliseconds(),
+		MaxSpeculativeDepth: n.config.MaxSpeculativeDepth,
+		ProveMode:           n.config.ProveMode,
+		RestartRequired:     true,
+	}
+}
+
+// ProveMode returns the spec-16 proving mode the overlay was started
+// with. Used by the admin auth middleware to gate the dev-bypass
+// header.
+func (n *OverlayNode) ProveMode() string {
+	return n.config.ProveMode
+}
+
+// ProverMetrics returns a flat tuple of the parallel prover counters.
+// A flat tuple (rather than a struct) keeps the rpc package free of
+// the prover import and matches the shape that AdminAPI consumes.
+func (n *OverlayNode) ProverMetrics() (mode string, workers, inFlight, queueDepth int, proofsStarted, proofsSucceeded, proofsFailed, avgMs uint64) {
+	if n.parallelProver == nil {
+		return "disabled", 0, 0, 0, 0, 0, 0, 0
+	}
+	m := n.parallelProver.Metrics()
+	return m.Mode, m.Workers, m.InFlight, m.QueueDepth,
+		m.ProofsStarted, m.ProofsSucceeded, m.ProofsFailed, m.AvgProveTimeMs
 }
 
 // TxCache returns the node's transaction cache.

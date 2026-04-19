@@ -114,8 +114,11 @@ func (c *ShardConfig) Validate() error {
 	if c.VerificationMode == "" {
 		return fmt.Errorf("verification mode must not be empty")
 	}
-	if c.VerificationMode != "groth16" && c.VerificationMode != "fri" {
-		return fmt.Errorf("verification mode must be groth16 or fri, got %q", c.VerificationMode)
+	switch c.VerificationMode {
+	case "groth16", "groth16-wa", "fri", "devkey":
+		// OK
+	default:
+		return fmt.Errorf("verification mode must be groth16, groth16-wa, fri, or devkey, got %q", c.VerificationMode)
 	}
 	if c.HashFunction == "" {
 		return fmt.Errorf("hash function must not be empty")

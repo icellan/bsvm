@@ -23,6 +23,17 @@ func NewSP1Prover(config Config) *SP1Prover {
 	return &SP1Prover{config: config}
 }
 
+// Mode returns the prover backend mode (local / network / mock). Exposed
+// as an accessor so the parallel coordinator and RPC metrics can report
+// which proving path is active without callers needing to hold the
+// Config struct.
+func (p *SP1Prover) Mode() ProverMode {
+	if p == nil {
+		return ProverMock
+	}
+	return p.config.Mode
+}
+
 // BlockContext holds the block-level parameters needed by the SP1 guest.
 // This is a simplified version of vm.BlockContext containing only the
 // serializable fields needed for proving.
