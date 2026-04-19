@@ -203,6 +203,9 @@ func (g *GossipManager) BroadcastTx(tx *types.Transaction) error {
 	return g.broadcast(msg)
 }
 
+// Peers returns the gossip manager's peer manager.
+func (g *GossipManager) Peers() *PeerManager { return g.peers }
+
 // BroadcastBlockAnnounce broadcasts an L2 block announcement to all
 // connected peers. The announcement contains the block header summary
 // and transaction hashes (not full transactions).
@@ -282,6 +285,11 @@ func (g *GossipManager) RequestBatch(peerID peer.ID, blockNum uint64) ([]byte, e
 	if _, err := stream.Write(encoded); err != nil {
 		return nil, fmt.Errorf("failed to send batch request: %w", err)
 	}
+	// Half-close write side so the receiver's readStreamFull gets EOF
+	// and can process the request. The read side stays open for the response.
+	if err := stream.CloseWrite(); err != nil {
+		return nil, fmt.Errorf("failed to close write side: %w", err)
+	}
 
 	// Read response.
 	respData, err := readStreamFull(stream)
@@ -320,6 +328,12 @@ func (g *GossipManager) broadcast(msg *Message) error {
 	pid := protocol.ID(ProtocolID(g.config.ChainID))
 	peers := g.peers.AllPeers()
 
+	slog.Info("broadcasting message",
+		"type", fmt.Sprintf("0x%02x", msg.Type),
+		"peerCount", len(peers),
+		"payloadSize", len(msg.Payload),
+	)
+
 	for _, p := range peers {
 		go func(peerID peer.ID) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -337,6 +351,14 @@ func (g *GossipManager) broadcast(msg *Message) error {
 
 			if _, err := stream.Write(encoded); err != nil {
 				slog.Debug("failed to send message to peer",
+					"peer", peerID.String(),
+					"error", err,
+				)
+				return
+			}
+			// Half-close write side so the receiver's readStreamFull gets EOF.
+			if err := stream.CloseWrite(); err != nil {
+				slog.Debug("failed to close write side",
 					"peer", peerID.String(),
 					"error", err,
 				)

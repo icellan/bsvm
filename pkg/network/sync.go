@@ -116,7 +116,7 @@ func (s *SyncManager) OnBlockAnnounce(peerID peer.ID, msg *BlockAnnounceMsg) err
 
 	localTip := s.overlay.ExecutionTip()
 
-	slog.Debug("received block announcement",
+	slog.Info("received block announcement",
 		"peer", peerID.String(),
 		"block", msg.Number,
 		"stateRoot", msg.StateRoot.Hex(),

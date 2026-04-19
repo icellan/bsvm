@@ -548,6 +548,11 @@ func cmdRun(ctx *cli.Context) error {
 	// broadcasts new blocks to peers for sync.
 	overlayNode.SetBlockAnnouncer(gossipMgr)
 
+	// 7.1 Create and register the sync manager. This registers handlers for
+	// MsgBlockAnnounce, MsgCovenantAdvance, MsgHeartbeat, and MsgTxGossip
+	// so the node can sync state from peers.
+	network.NewSyncManager(overlayNode, gossipMgr, gossipMgr.Peers()).RegisterHandlers()
+
 	// 7.5 Wire the governance proposal workflow (spec 15 A4). Uses a
 	// content-addressed in-memory store backed by libp2p gossip so
 	// proposals propagate across every node automatically. The
