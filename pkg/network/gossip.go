@@ -2,22 +2,52 @@ package network
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// DerivePeerID returns the libp2p peer ID for a 32-byte identity seed.
+// Uses the same ed25519 derivation as NewGossipManager so a compose
+// file can bake in known peer IDs for its bootstrap list.
+func DerivePeerID(seed []byte) (peer.ID, error) {
+	priv, err := privKeyFromSeed(seed)
+	if err != nil {
+		return "", err
+	}
+	return peer.IDFromPrivateKey(priv)
+}
+
+// privKeyFromSeed derives a libp2p-compatible ed25519 private key from
+// a 32-byte seed. Any 32-byte sequence is valid; the caller is
+// responsible for choosing a seed with sufficient entropy.
+func privKeyFromSeed(seed []byte) (crypto.PrivKey, error) {
+	if len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("identity seed must be %d bytes, got %d", ed25519.SeedSize, len(seed))
+	}
+	edPriv := ed25519.NewKeyFromSeed(seed)
+	priv, _, err := crypto.KeyPairFromStdKey(&edPriv)
+	if err != nil {
+		return nil, fmt.Errorf("derive libp2p key: %w", err)
+	}
+	return priv, nil
+}
 
 // maxStreamReadSize is the maximum number of bytes read from a single
 // stream in one read operation. This provides an additional layer of
@@ -53,9 +83,16 @@ func NewGossipManager(config Config, ovl *overlay.OverlayNode) (*GossipManager, 
 		listenAddr = "/ip4/0.0.0.0/tcp/9945"
 	}
 
-	h, err := libp2p.New(
-		libp2p.ListenAddrStrings(listenAddr),
-	)
+	opts := []libp2p.Option{libp2p.ListenAddrStrings(listenAddr)}
+	if len(config.IdentitySeed) > 0 {
+		priv, err := privKeyFromSeed(config.IdentitySeed)
+		if err != nil {
+			return nil, fmt.Errorf("gossip manager: %w", err)
+		}
+		opts = append(opts, libp2p.Identity(priv))
+	}
+
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
@@ -130,20 +167,50 @@ func (g *GossipManager) Start(ctx context.Context) error {
 		"protocolID", string(pid),
 	)
 
-	// Connect to bootstrap peers.
+	// Connect to bootstrap peers in background with retry so simultaneous
+	// startup across a Docker cluster doesn't deadlock on TLS handshake
+	// collisions. Each peer gets its own goroutine with backoff.
 	for _, addr := range g.config.BootstrapPeers {
 		addrInfo, err := peer.AddrInfoFromString(addr)
 		if err != nil {
 			slog.Warn("invalid bootstrap peer address", "addr", addr, "error", err)
 			continue
 		}
-		if err := g.host.Connect(ctx, *addrInfo); err != nil {
-			slog.Warn("failed to connect to bootstrap peer", "addr", addr, "error", err)
-			continue
-		}
-		if err := g.peers.AddPeer(addrInfo.ID, addrInfo.Addrs); err != nil {
-			slog.Warn("failed to add bootstrap peer", "addr", addr, "error", err)
-		}
+		g.wg.Add(1)
+		go func(ai peer.AddrInfo) {
+			defer g.wg.Done()
+			backoff := 500 * time.Millisecond
+			for attempt := 0; attempt < 10; attempt++ {
+				if g.host.Network().Connectedness(ai.ID) == network.Connected {
+					g.peers.AddPeer(ai.ID, ai.Addrs)
+					return
+				}
+				dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+				err := g.host.Connect(dialCtx, ai)
+				dialCancel()
+				if err == nil {
+					slog.Info("bootstrap peer connected", "peer", ai.ID.String())
+					g.peers.AddPeer(ai.ID, ai.Addrs)
+					return
+				}
+				slog.Debug("bootstrap connect attempt failed",
+					"peer", ai.ID.String(),
+					"attempt", attempt+1,
+					"error", err,
+				)
+				select {
+				case <-time.After(backoff):
+					backoff *= 2
+					if backoff > 10*time.Second {
+						backoff = 10 * time.Second
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+			slog.Warn("failed to connect to bootstrap peer after retries",
+				"peer", ai.ID.String())
+		}(*addrInfo)
 	}
 
 	// Start mDNS discovery if enabled.
@@ -552,14 +619,67 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 		return // Ignore ourselves.
 	}
 
-	slog.Debug("mDNS discovered peer", "peer", pi.ID.String())
-	if err := n.host.Connect(n.ctx, pi); err != nil {
-		slog.Debug("failed to connect to mDNS peer", "peer", pi.ID.String(), "error", err)
+	// Filter out loopback addresses (127.0.0.1, ::1). In Docker, mDNS
+	// returns the container's loopback alongside its bridge IP, but the
+	// loopback points at the local container, not the remote peer.
+	var routable []ma.Multiaddr
+	for _, addr := range pi.Addrs {
+		s := addr.String()
+		if strings.HasPrefix(s, "/ip4/127.") || strings.HasPrefix(s, "/ip6/::1/") {
+			continue
+		}
+		routable = append(routable, addr)
+	}
+	if len(routable) == 0 {
 		return
 	}
+	pi.Addrs = routable
 
-	if err := n.peers.AddPeer(pi.ID, pi.Addrs); err != nil {
-		slog.Debug("failed to add mDNS peer", "peer", pi.ID.String(), "error", err)
+	// Connect in a goroutine with retry so the mDNS loop isn't blocked
+	// and simultaneous-dial TLS collisions are handled gracefully.
+	go n.connectWithRetry(pi)
+}
+
+// connectWithRetry attempts to connect to a peer up to 3 times with
+// exponential backoff. Simultaneous dials (both peers discover each other
+// via mDNS at the same time) cause TLS handshake collisions; retrying
+// with jitter lets one side back off so the other succeeds.
+func (n *mdnsNotifee) connectWithRetry(pi peer.AddrInfo) {
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Already connected? Skip.
+		if n.host.Network().Connectedness(pi.ID) == network.Connected {
+			n.peers.AddPeer(pi.ID, pi.Addrs)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+		err := n.host.Connect(ctx, pi)
+		cancel()
+
+		if err == nil {
+			slog.Debug("peer connected", "peer", pi.ID.String())
+			n.peers.AddPeer(pi.ID, pi.Addrs)
+			return
+		}
+
+		if attempt < maxAttempts-1 {
+			slog.Debug("mDNS connect failed, retrying",
+				"peer", pi.ID.String(),
+				"attempt", attempt+1,
+				"error", err,
+			)
+			time.Sleep(backoff)
+			backoff *= 2
+		} else {
+			slog.Debug("mDNS connect failed after retries",
+				"peer", pi.ID.String(),
+				"attempts", maxAttempts,
+				"error", err,
+			)
+		}
 	}
 }
 

@@ -19,9 +19,10 @@ mode = "mock"
 
 [network]
 listen_addr = "/ip4/0.0.0.0/tcp/9945"
+identity_seed_hex = "0100000000000000000000000000000000000000000000000000000000000001"
 bootstrap_peers = [
-  "/ip4/172.50.0.12/tcp/9945",
-  "/ip4/172.50.0.13/tcp/9945",
+  "/ip4/172.50.0.12/tcp/9945/p2p/12D3KooWKgtXurnypDumf1NvcPKfqB1NRC5WGUffMQ5VWjqTiuuJ",
+  "/ip4/172.50.0.13/tcp/9945/p2p/12D3KooWQfu42u8iy4KdXayMFaY7P1u6J3pJTLMP5s2neZ6XZ13z",
 ]
 max_peers = 50
 
