@@ -19,6 +19,12 @@ import (
 	"github.com/icellan/bsvm/pkg/vm"
 )
 
+// BlockAnnouncer is implemented by the network gossip manager to broadcast
+// new block announcements after ProcessBatch completes.
+type BlockAnnouncer interface {
+	BroadcastBlockAnnounce(parentHash types.Hash, stateRoot types.Hash, txRoot types.Hash, number uint64, gasUsed uint64, timestamp uint64, txHashes []types.Hash) error
+}
+
 // OverlayNode is the main coordinator for the L2 overlay. It ties
 // together EVM execution, state management, proving, and covenant
 // tracking. In the single-node overlay (Milestone 5), it handles
@@ -50,6 +56,10 @@ type OverlayNode struct {
 	provenTip    uint64 // latest proven block
 	confirmedTip uint64 // latest block with 1-5 BSV confirmations
 	finalizedTip uint64 // latest block with >= 6 BSV confirmations
+
+	// blockAnnouncer broadcasts new block announcements to the P2P network.
+	// Set via SetBlockAnnouncer after construction.
+	blockAnnouncer BlockAnnouncer
 
 	eventFeed *event.Feed
 
@@ -566,6 +576,15 @@ func (n *OverlayNode) SubmitDepositTx(tx *types.DepositTransaction) error {
 		"sourceHash", tx.SourceHash.Hex(),
 	)
 	return nil
+}
+
+// SetBlockAnnouncer wires the gossip manager's block announcement
+// broadcaster into the overlay. Called by cmd/bsvm after both the overlay
+// and the gossip manager are constructed.
+func (n *OverlayNode) SetBlockAnnouncer(a BlockAnnouncer) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.blockAnnouncer = a
 }
 
 // Stop gracefully stops the overlay node and its components.

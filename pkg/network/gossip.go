@@ -348,20 +348,20 @@ func (g *GossipManager) broadcast(msg *Message) error {
 
 // handleStream processes an incoming libp2p stream from a peer.
 func (g *GossipManager) handleStream(s network.Stream) {
-	defer s.Close()
-
 	remotePeer := s.Conn().RemotePeer()
 
 	// Rate limit check.
 	if !g.peers.CheckRateLimit(remotePeer) {
 		slog.Debug("rate limited peer", "peer", remotePeer.String())
 		g.peers.AdjustScore(remotePeer, -1)
+		s.Close()
 		return
 	}
 
 	data, err := readStreamFull(s)
 	if err != nil {
 		slog.Debug("failed to read stream", "peer", remotePeer, "error", err)
+		s.Close()
 		return
 	}
 
@@ -369,8 +369,18 @@ func (g *GossipManager) handleStream(s network.Stream) {
 	if err != nil {
 		slog.Debug("failed to decode message", "peer", remotePeer, "error", err)
 		g.peers.AdjustScore(remotePeer, -10)
+		s.Close()
 		return
 	}
+
+	// Batch requests are request-response: the peer expects a BatchResponse
+	// written back on the same stream. Handle them inline before the
+	// fire-and-forget handler dispatch.
+	if msg.Type == MsgBatchRequest {
+		g.handleBatchRequest(s, remotePeer, msg)
+		return // stream closed by handleBatchRequest
+	}
+	s.Close()
 
 	g.mu.RLock()
 	handler, exists := g.handlers[msg.Type]
@@ -386,6 +396,65 @@ func (g *GossipManager) handleStream(s network.Stream) {
 			g.peers.AdjustScore(remotePeer, -5)
 		}
 	}
+}
+
+// handleBatchRequest responds to a MsgBatchRequest by looking up the
+// batch data in the overlay's TxCache and writing a MsgBatchResponse
+// back on the same stream. The stream is closed before returning.
+func (g *GossipManager) handleBatchRequest(s network.Stream, peerID peer.ID, msg *Message) {
+	defer s.Close()
+
+	reqMsg, err := DecodeBatchRequestMsg(msg.Payload)
+	if err != nil {
+		slog.Debug("failed to decode batch request", "peer", peerID, "error", err)
+		g.peers.AdjustScore(peerID, -5)
+		return
+	}
+
+	slog.Debug("batch request received",
+		"peer", peerID.String(),
+		"block", reqMsg.L2BlockNum,
+	)
+
+	var batchData []byte
+	if g.overlay != nil {
+		if cached := g.overlay.TxCacheRef().GetByL2Block(reqMsg.L2BlockNum); cached != nil {
+			batchData = cached.BatchData
+		}
+	}
+
+	if batchData == nil {
+		slog.Debug("batch not found for request",
+			"block", reqMsg.L2BlockNum,
+			"peer", peerID.String(),
+		)
+	}
+
+	respMsg := &BatchResponseMsg{
+		L2BlockNum: reqMsg.L2BlockNum,
+		BatchData:  batchData,
+	}
+	wireMsg, err := respMsg.Encode()
+	if err != nil {
+		slog.Debug("failed to encode batch response", "error", err)
+		return
+	}
+	encoded, err := wireMsg.Encode()
+	if err != nil {
+		slog.Debug("failed to encode wire message", "error", err)
+		return
+	}
+
+	if _, err := s.Write(encoded); err != nil {
+		slog.Debug("failed to write batch response", "peer", peerID, "error", err)
+		return
+	}
+
+	slog.Debug("batch response sent",
+		"peer", peerID.String(),
+		"block", reqMsg.L2BlockNum,
+		"size", len(batchData),
+	)
 }
 
 // heartbeatLoop sends periodic heartbeat messages to all connected peers.

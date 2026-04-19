@@ -329,6 +329,25 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		n.eventFeed.Send(NewHeadEvent{Block: l2Block})
 	}
 
+	// 10. Announce the new block to P2P peers so they can sync.
+	if n.blockAnnouncer != nil {
+		var txHashes []types.Hash
+		for _, tx := range l2Block.Transactions {
+			txHashes = append(txHashes, tx.Hash())
+		}
+		if err := n.blockAnnouncer.BroadcastBlockAnnounce(
+			parentHeader.Hash(),
+			postStateRoot,
+			l2Block.Header.TxHash,
+			l2Block.NumberU64(),
+			l2Block.GasUsed(),
+			l2Block.Time(),
+			txHashes,
+		); err != nil {
+			slog.Debug("block announcement broadcast failed", "block", l2Block.NumberU64(), "error", err)
+		}
+	}
+
 	slog.Info("processed batch",
 		"block", l2Block.NumberU64(),
 		"txs", len(l2Block.Transactions),

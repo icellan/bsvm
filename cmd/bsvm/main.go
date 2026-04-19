@@ -27,6 +27,7 @@ import (
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/governance"
+	"github.com/icellan/bsvm/pkg/indexer"
 	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/network"
 	"github.com/icellan/bsvm/pkg/overlay"
@@ -451,6 +452,28 @@ func cmdRun(ctx *cli.Context) error {
 	// 5.7: Double-spend monitor (requires BSV block notifications).
 	slog.Info("double-spend monitor: initialized, waiting for BSV block notifications")
 
+	// 5.8 Optional per-address transaction indexer. Disabled via
+	// BSVM_INDEXER_ENABLED=false or indexer.enabled=false in TOML.
+	// When off, the bsv_getAddressTxs RPC returns "indexer disabled"
+	// so the explorer SPA can show a tasteful fallback message.
+	var txIndexer *indexer.Indexer
+	if nodeCfg.Indexer.Enabled {
+		idxPath := filepath.Join(nodeCfg.DataDir, "indexer")
+		idxCfg := indexer.Config{
+			Path:    idxPath,
+			ChainID: uint64(chainID),
+			Cache:   nodeCfg.Indexer.CacheMB,
+			Handles: 16,
+		}
+		txIndexer, err = indexer.New(idxCfg)
+		if err != nil {
+			return fmt.Errorf("create indexer at %s: %w", idxPath, err)
+		}
+		slog.Info("indexer enabled", "path", idxPath, "cacheMB", nodeCfg.Indexer.CacheMB)
+	} else {
+		slog.Info("indexer disabled (bsv_getAddressTxs will return ErrDisabled)")
+	}
+
 	// 6. Create RPC server.
 	rpcCfg := nodeCfg.ToRPCConfig()
 	rpcServer := rpc.NewRPCServerWithConfig(
@@ -521,6 +544,10 @@ func cmdRun(ctx *cli.Context) error {
 		return fmt.Errorf("failed to create gossip manager: %w", err)
 	}
 
+	// Wire the gossip manager as the block announcer so ProcessBatch
+	// broadcasts new blocks to peers for sync.
+	overlayNode.SetBlockAnnouncer(gossipMgr)
+
 	// 7.5 Wire the governance proposal workflow (spec 15 A4). Uses a
 	// content-addressed in-memory store backed by libp2p gossip so
 	// proposals propagate across every node automatically. The
@@ -559,6 +586,13 @@ func cmdRun(ctx *cli.Context) error {
 		return err
 	})
 
+	// 7.6 Attach + start the indexer (if enabled). Must happen after
+	// the event feed exists (i.e. overlayNode is constructed) and
+	// before any block gets processed on the gossip manager.
+	if txIndexer != nil {
+		rpcServer.SetIndexer(txIndexer)
+	}
+
 	// 8. Start services.
 	if err := rpcServer.Start(); err != nil {
 		return fmt.Errorf("failed to start RPC server: %w", err)
@@ -566,6 +600,35 @@ func cmdRun(ctx *cli.Context) error {
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	if txIndexer != nil {
+		// The overlay's event feed is strongly typed over overlay.NewHeadEvent,
+		// so subscribe with a matching channel and forward block pointers
+		// onto the indexer's generic ingest channel. Non-blocking send
+		// protects block processing from a slow indexer writer.
+		inCh := txIndexer.Start(bgCtx)
+		evCh := make(chan overlay.NewHeadEvent, 64)
+		overlayNode.EventFeed().Subscribe(evCh)
+		go func() {
+			for {
+				select {
+				case <-bgCtx.Done():
+					return
+				case ev := <-evCh:
+					select {
+					case inCh <- ev.Block:
+					default:
+						slog.Warn("indexer: channel full, dropping block", "block", ev.Block.NumberU64())
+					}
+				}
+			}
+		}()
+		defer func() {
+			if err := txIndexer.Close(); err != nil {
+				slog.Warn("closing indexer", "error", err)
+			}
+		}()
+	}
 
 	if err := gossipMgr.Start(bgCtx); err != nil {
 		return fmt.Errorf("failed to start gossip manager: %w", err)
