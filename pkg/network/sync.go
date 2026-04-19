@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
@@ -220,6 +221,26 @@ func (s *SyncManager) RegisterHandlers() {
 			return err
 		}
 		s.peers.UpdateChainTip(peerID, hb.ChainTip)
+
+		// If the peer is ahead, trigger a sync so the local node catches up.
+		localTip := s.overlay.ExecutionTip()
+		if hb.ChainTip > localTip {
+			slog.Debug("heartbeat: peer ahead, triggering sync",
+				"peer", peerID.String(),
+				"peerTip", hb.ChainTip,
+				"localTip", localTip,
+			)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := s.SyncWithPeer(ctx, peerID); err != nil {
+					slog.Debug("heartbeat-triggered sync failed",
+						"peer", peerID.String(),
+						"error", err,
+					)
+				}
+			}()
+		}
 		return nil
 	})
 

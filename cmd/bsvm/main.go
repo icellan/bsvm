@@ -12,8 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/holiman/uint256"
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
@@ -45,6 +48,7 @@ func main() {
 					&cli.StringFlag{Name: "governance", Value: "none", Usage: "governance mode: none, single_key, or multisig"},
 					&cli.StringFlag{Name: "verification", Value: "groth16", Usage: "verification mode: groth16 or basefold"},
 					&cli.StringFlag{Name: "sp1-vk", Value: "", Usage: "hex-encoded SP1 verifying key (optional for testing)"},
+					&cli.StringSliceFlag{Name: "alloc", Usage: "genesis alloc: address=balance_wei (repeatable)"},
 				},
 				Action: cmdInit,
 			},
@@ -131,10 +135,26 @@ func cmdInit(ctx *cli.Context) error {
 		sp1VK = make([]byte, 32)
 	}
 
+	// Parse --alloc flags: "0xAddress=balanceWei"
+	alloc := make(map[types.Address]block.GenesisAccount)
+	for _, entry := range ctx.StringSlice("alloc") {
+		parts := splitAllocEntry(entry)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid alloc entry %q: expected address=balance", entry)
+		}
+		addr := types.HexToAddress(parts[0])
+		bal := new(uint256.Int)
+		if err := bal.SetFromDecimal(parts[1]); err != nil {
+			return fmt.Errorf("invalid balance in alloc entry %q: %w", entry, err)
+		}
+		alloc[addr] = block.GenesisAccount{Balance: bal}
+	}
+
 	params := &shard.InitShardParams{
 		ChainID:         chainID,
 		DataDir:         dataDir,
 		GasLimit:        gasLimit,
+		Alloc:           alloc,
 		Governance:      covenant.GovernanceConfig{Mode: govMode},
 		Verification:    verifyMode,
 		SP1VerifyingKey: sp1VK,
@@ -410,4 +430,13 @@ func setupLogging(level, format string) {
 	}
 
 	slog.SetDefault(slog.New(handler))
+}
+
+// splitAllocEntry splits "address=balance" on the first '='.
+func splitAllocEntry(s string) []string {
+	idx := strings.IndexByte(s, '=')
+	if idx < 0 {
+		return []string{s}
+	}
+	return []string{s[:idx], s[idx+1:]}
 }
