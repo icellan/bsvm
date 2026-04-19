@@ -134,13 +134,8 @@ func TestMultiNode_StateConvergence(t *testing.T) {
 		bn1, _ := GetBlockNumber(ctx, cluster.NodeRPC(1))
 		bn2, _ := GetBlockNumber(ctx, cluster.NodeRPC(2))
 		bn3, _ := GetBlockNumber(ctx, cluster.NodeRPC(3))
-		t.Logf("convergence timed out: node1=%d node2=%d node3=%d", bn1, bn2, bn3)
-		// Don't fail — heartbeat sync may not be fully wired in the current binary.
-		// Log the state for debugging.
-		if bn1 >= 1 && (bn2 == 0 || bn3 == 0) {
-			t.Logf("NOTE: heartbeat-triggered sync did not propagate block to all nodes. " +
-				"This is expected if the sync protocol's batch request/response is not yet fully implemented.")
-		}
+		t.Fatalf("state convergence failed: node1=%d node2=%d node3=%d — "+
+			"block announce + batch sync did not propagate within 60s", bn1, bn2, bn3)
 	}
 }
 
