@@ -40,8 +40,9 @@ WORKDIR /app
 
 EXPOSE 8545 9945
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:8545 || exit 1
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
+    CMD wget -qO- --post-data='{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+        --header='Content-Type: application/json' http://localhost:8545 || exit 1
 
 ENTRYPOINT ["bsvm"]
 CMD ["run"]

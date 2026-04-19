@@ -16,9 +16,10 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
-	// Build the test image.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	cmd := exec.CommandContext(ctx, "docker", "build", "-t", "bsvm:test", "../..")
+	// Build the test image using the build script (handles runar deps
+	// and parent-directory build context).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	cmd := exec.CommandContext(ctx, "bash", "docker/build.sh")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

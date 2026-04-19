@@ -35,9 +35,9 @@ services:
         bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
       interval: 5s
-      timeout: 2s
+      timeout: 3s
       retries: 10
       start_period: 10s
 
@@ -59,9 +59,9 @@ services:
         bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
       interval: 5s
-      timeout: 2s
+      timeout: 3s
       retries: 10
       start_period: 10s
 
@@ -83,8 +83,8 @@ services:
         bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
       interval: 5s
-      timeout: 2s
+      timeout: 3s
       retries: 10
       start_period: 10s
