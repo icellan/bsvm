@@ -70,11 +70,24 @@ They determine whether the proof architecture is viable.
 **Gate 0a Primitive Validation: COMPLETE.** All FRI building blocks
 have been implemented in Rúnar and validated on BSV regtest with
 Plonky3-generated test vectors (1,326 total vectors). Measured locking
-script sizes: Baby Bear add/mul 9 bytes, inv 477 bytes, Merkle proof
-depth-20 482 bytes, FRI colinearity check 1,742 bytes. Poseidon2
-confirmed not needed (SP1-internal only; on-chain uses SHA256). The
-full FRI verifier assembly from these primitives is still TBD (Gate 0a
-Full, see spec 13).
+script sizes: KoalaBear add/mul 9 bytes, inv 477 bytes, Ext4 mul 509
+bytes, Ext4 inv ~3.1 KB, Merkle proof depth-20 482 bytes, FRI
+colinearity check 1,742 bytes. Poseidon2 confirmed not needed
+on-chain — SP1 v6.0.2 uses Poseidon2 over KoalaBear inside the proof;
+on-chain Merkle paths are SHA-256 via `OP_HASH256` / `OP_SHA256` with
+the SP1 host bridge transcoding Poseidon2 paths into SHA-256 paths
+before submission. The full FRI verifier assembly from these
+primitives is **Gate 0a Full** — unscheduled future work (see spec 13).
+
+**Gate 0a Full — not scheduled.** Production Mode 1 shards today use
+the trust-minimized FRI bridge covenant (`rollup_fri.runar.go`, see
+spec 12 "Verification modes"): the covenant binds state roots, batch
+hash, and chain id via public-value slots, emits the `BSVM\x02`
+OP_RETURN for data availability, but does NOT verify the SP1 FRI proof
+on-chain. Mode 1 is mainnet-blocked by a `PrepareGenesis` guardrail
+until Gate 0a Full lands. Mode 2 (`VerifyGroth16`) and Mode 3
+(`VerifyGroth16WA`) perform full BN254 pairing verification on-chain
+and are mainnet-eligible today under the VK pinning policy (F06).
 
 **Gate 0b: SP1 Proof Size and Verification Cost**
 
@@ -87,7 +100,7 @@ steps in order:
    SP1 SDK. Save the serialised proof bytes, verifying key, public
    values, and ELF binary.
 
-2. **Document the proof binary layout**: Trace through SP1 v4.1.1
+2. **Document the proof binary layout**: Trace through SP1 v6.0.2
    source code to map the exact byte-level structure of the serialised
    proof. Document where each component lives: shard proofs, FRI
    commitments (Merkle roots), FRI query proofs (evaluations + Merkle
@@ -107,7 +120,7 @@ steps in order:
    this trace is the golden reference for the Rúnar Script verifier.
 
 5. **Implement the FRI verifier in Rúnar**: Build the full verifier
-   using the proven primitives (Baby Bear, Merkle proofs, hash ops).
+   using the proven primitives (KoalaBear, Merkle proofs, hash ops).
    The verifier follows the trace from step 4 step by step. See spec
    13, Gate 0a Full, for details.
 

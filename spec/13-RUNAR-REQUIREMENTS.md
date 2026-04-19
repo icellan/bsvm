@@ -2,58 +2,88 @@
 
 ## Context
 
-BSVM builds four Bitcoin Script artifacts with the Rúnar Go compiler:
-a state covenant, a bridge covenant, an inbox covenant, and an SP1 FRI
-verifier. This document describes what each artifact does, what maps to
-existing Rúnar capabilities, and what new work is required.
+BSVM builds Bitcoin Script artifacts with the Rúnar Go compiler: three
+rollup covenant variants (Mode 1 FRI bridge, Mode 2 Groth16, Mode 3
+Groth16-WA), a bridge covenant, an inbox covenant, and — future work —
+an on-chain SP1 FRI verifier (Gate 0a Full). This document describes
+what each artifact does, what maps to existing Rúnar capabilities, and
+what new work is required.
 
 The Go compiler already supports stateful contracts, covenant recursion
-via OP_PUSH_TX, Hash256/SHA256, secp256k1 EC math, WOTS+/SLH-DSA
-verification, arithmetic, comparisons, byte manipulation, and
-multi-output patterns. Most of the basic building blocks exist.
+via OP_PUSH_TX, Hash256/SHA256, secp256k1 EC math, BN254 G1/G2/pairing
+primitives (Rúnar R1/R2), WOTS+/SLH-DSA verification, KoalaBear field
+arithmetic, Ext4 arithmetic, arithmetic, comparisons, byte manipulation,
+and multi-output patterns. Most of the basic building blocks for both
+the rollup covenants and the future FRI verifier exist.
 
-The gaps are: Baby Bear field arithmetic, Merkle proof verification,
-cross-covenant output introspection, and the SP1 FRI verifier itself.
+The gaps for Gate 0a Full are: full FRI-verifier composition on top of
+the KoalaBear / Ext4 / SHA-256-Merkle primitives, and the SP1 proof
+transcoding host bridge that serialises Poseidon2 Merkle paths into
+SHA-256 Merkle paths for on-chain consumption.
 
 ---
 
 ## The Four Artifacts
 
-### 1. State Covenant
+### 1. State Covenant (three variants)
 
 **Purpose**: Guard the L2 state root as a UTXO chain. Each L2 batch
-spends the current covenant UTXO and creates a new one. Only advances
-with a valid STARK proof of correct EVM execution.
+spends the current covenant UTXO and creates a new one.
 
-**State**: `stateRoot` (32-byte hash), `blockNumber` (uint64).
+The covenant ships in three variants selected at genesis (see spec 12
+"Verification modes"):
 
-**Single method `advanceState`**:
-1. Check block number increments by 1
-2. Verify SP1 STARK proof (FRI verification — the hard part)
-3. Extract pre/post state roots from proof's public values, verify
-   pre-state matches current covenant state
-4. Enforce output 0 recreates this covenant with new state
-5. Enforce output 1 is an OP_RETURN with batch data
+- **Mode 1 `VerifyFRI`** — trust-minimized FRI bridge. `advanceState`
+  takes 5 args (`newStateRoot`, `newBlockNumber`, `publicValues`,
+  `batchData`, `proofBlob`) and performs NO on-chain FRI verification.
+  Off-chain nodes verify the proof; governance freeze is the safety
+  backstop. **Not mainnet-eligible.**
+- **Mode 2 `VerifyGroth16`** — generic BN254 multi-pairing check of the
+  SP1-wrapped Groth16 proof. 16-arg `advanceState`.
+- **Mode 3 `VerifyGroth16WA`** — witness-assisted BN254 verifier, VK
+  baked into the locking script at compile time; 5-arg `advanceState`
+  with the BN254 witness bundle passed via `runar.CallOptions`.
+
+**State** (all variants): `stateRoot` (32-byte hash), `blockNumber`
+(uint64), `frozen` (0/1).
+
+**Methods per variant** (all three): `advanceState` plus governance
+methods split per mode — `FreezeSingleKey` / `FreezeMultiSig2` /
+`FreezeMultiSig3`, corresponding `Unfreeze*`, and `Upgrade*`. Split is
+mandated by the Rúnar affine type checker (Sig identifiers cannot be
+reused across branches).
+
+**Shared invariants enforced in every variant's `advanceState`**:
+1. Shard is not frozen.
+2. `newBlockNumber == currentBlockNumber + 1`.
+3. Public-value slots bind to inputs:
+   `pv[0..32) == stateRoot`,
+   `pv[32..64) == newStateRoot`,
+   `pv[104..136) == hash256(batchData)`,
+   `pv[136..144) == num2bin(chainId, 8)`.
+4. OP_RETURN data output with `BSVM\x02` magic + `batchData` is emitted
+   and bound into the tx via the Rúnar-injected continuation-hash check.
+
+Mode 2 and Mode 3 additionally verify the BN254 pairing. Mode 1 does
+not. The Gate 0a Full upgrade path replaces Mode 1's missing proof
+check with a full on-chain FRI verifier; it does not alter the shared
+invariants.
 
 **What already works in Rúnar**:
 - `StatefulSmartContract` with mutable `ByteString` and `Bigint` state
-- `runar:"readonly"` property for the SP1 verifying key (embedded at compile time)
+- `runar:"readonly"` property for the SP1 verifying key hash (embedded
+  at compile time)
 - Arithmetic (`+`) for block number increment
 - Equality comparison (`===`) for state root checks
 - `Substr(data, offset, 32)` to extract bytes from public values
 - Covenant recursion (auto-injected state continuation via OP_PUSH_TX)
 - Output enforcement via `ExtractOutputHash` + `Hash256` comparison
-
-**What's new**:
-- **SP1Verify**: The FRI verification subroutine (see section 4 below)
-- **OP_RETURN prefix enforcement**: The current covenant pattern
-  enforces outputs by comparing `hashOutputs` from the sighash
-  preimage. For the state covenant, we also need to verify that
-  output 1's script starts with a specific OP_RETURN prefix
-  (`BSVM\x02`). This can be done by including the expected output in
-  the hashOutputs comparison, but the prover must construct the
-  complete output data including the OP_RETURN. This is feasible with
-  existing primitives (`Cat` + `Hash256` + `ExtractOutputHash`).
+- `AddDataOutput(0, ...)` for the spec-12 OP_RETURN emission; included
+  in the continuation-hash binding so the on-chain tx is required to
+  carry `BSVM\x02 || batchData` verbatim.
+- BN254 G1/G2 arithmetic and multi-pairing primitives for Mode 2 / 3.
+- KoalaBear + Ext4 field arithmetic and SHA-256 Merkle primitives
+  (Gate 0a primitive set, validated on regtest).
 
 ---
 
@@ -142,9 +172,25 @@ advances.
 
 ### 4. SP1 FRI Verifier
 
-**Purpose**: Verify SP1 STARK proofs in Bitcoin Script. This is the
-make-or-break component. If it doesn't fit within BSV constraints, the
-architecture must be redesigned.
+**Status**: **Gate 0a Full — future work, not scheduled.** This section
+describes the design target for the on-chain FRI verifier. The
+compiled Mode 1 rollup covenant today (`rollup_fri.runar.go`) does NOT
+verify the FRI proof on-chain; it is the trust-minimized FRI bridge
+described in spec 12 "Verification modes". When Gate 0a Full lands,
+Mode 1 upgrades to a fully self-verifying rollup.
+
+**Purpose**: Verify SP1 v6.0.2 STARK proofs in Bitcoin Script. This is
+the make-or-break component. If it doesn't fit within BSV constraints,
+the architecture stays on Mode 2 / Mode 3 (Groth16) for production and
+Mode 1 stays a trust-minimized bridge indefinitely.
+
+**Boundary note**: SP1 v6 uses Poseidon2 over KoalaBear for FRI Merkle
+commitments and Fiat-Shamir challenges inside the proof. The on-chain
+verifier uses SHA-256 (`OP_HASH256` / `OP_SHA256`) for Merkle path
+hashing. The SP1 host bridge transcodes each Poseidon2 Merkle path
+into a SHA-256 Merkle path before submission, so "Poseidon2 on-chain"
+mentions below refer to transcript challenge derivation that the
+verifier may still need to simulate, not to Merkle operations.
 
 **What it does**: Takes a serialized SP1 proof, public values, and a
 verifying key. Returns valid/invalid.
@@ -154,13 +200,13 @@ The FRI verification algorithm:
 2. Recompute Fiat-Shamir challenges via Poseidon2 hash chain
 3. For each of ~30 queries across ~20 FRI rounds:
    - Verify Merkle proof of queried position (SHA256 hashing)
-   - Check the folding equation (Baby Bear field arithmetic)
+   - Check the folding equation (KoalaBear field arithmetic)
 4. Verify final polynomial evaluation
 5. Check DEEP-ALI polynomial identity
 6. Verify public values and verifying key match
 
 **What already works in Rúnar**:
-- Poseidon2 over Baby Bear (for FRI Merkle commitments — NOT SHA-256)
+- Poseidon2 over KoalaBear (for FRI Merkle commitments — NOT SHA-256)
 - `Hash256` (double hash, used for Fiat-Shamir if needed)
 - Bounded `for` loops (unrolled — FRI rounds and queries are fixed)
 - `Substr` for byte extraction from proof data
@@ -169,8 +215,8 @@ The FRI verification algorithm:
 
 **What's new — this is the big gap**:
 
-**Baby Bear field arithmetic**: SP1 uses the Baby Bear prime field
-(p = 2^31 - 2^27 + 1 = 2013265921). The FRI verifier needs:
+**KoalaBear field arithmetic**: SP1 uses the KoalaBear prime field
+(p = 2^31 - 2^24 + 1 = 2,130,706,433). The FRI verifier needs:
 
 - `fieldAdd(a, b)` = `(a + b) % p`
 - `fieldSub(a, b)` = `(a - b + p) % p`
@@ -187,8 +233,8 @@ does for secp256k1 field arithmetic (`ecFieldAdd`, `ecFieldMul`,
 `ecFieldInv` in `codegen/ec.go`), but over a much smaller prime.
 The implementation pattern is identical — the prime is just different.
 
-**A Baby Bear codegen module** (similar in structure to `codegen/ec.go`
-but for p = 2013265921) would provide field operations as inlined
+**A KoalaBear codegen module** (similar in structure to `codegen/ec.go`
+but for p = 2,130,706,433) would provide field operations as inlined
 opcode sequences. The FRI verifier calls these in loops.
 
 **Merkle proof verification for FRI**: Each FRI query requires
@@ -200,10 +246,10 @@ of Hash256. A built-in or a loop-based pattern handles both.
 
 | Primitive | Locking Script |
 |---|---|
-| Baby Bear add | 9 bytes |
-| Baby Bear sub | 21 bytes |
-| Baby Bear mul | 9 bytes |
-| Baby Bear inv | 477 bytes |
+| KoalaBear add | 9 bytes |
+| KoalaBear sub | 21 bytes |
+| KoalaBear mul | 9 bytes |
+| KoalaBear inv | 477 bytes |
 | Ext4 mul (all 4 components) | 509 bytes |
 | Ext4 inv (all 4 components) | 3.1 KB |
 | Merkle proof (depth 20) | 482 bytes |
@@ -218,7 +264,7 @@ sizes suggest the full verifier will be well under the 2 MB target.
 
 The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script performs the following steps. This is compiled from Rúnar's Go DSL into Bitcoin Script opcodes.
 
-**Overview**: The verifier checks that a committed polynomial is close to a Reed-Solomon codeword over the Baby Bear field (p = 2^31 - 2^27 + 1 = 2013265921).
+**Overview**: The verifier checks that a committed polynomial is close to a Reed-Solomon codeword over the KoalaBear field (p = 2^31 - 2^24 + 1 = 2,130,706,433).
 
 **Algorithm steps**:
 
@@ -233,7 +279,7 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
      alpha_i = Poseidon2(transcript || layer_data) mod p
    Query indices = Poseidon2(transcript || "queries") mod domain_size
    ```
-   Poseidon2 over Baby Bear is used (SP1's hardcoded hash function).
+   Poseidon2 over KoalaBear is used (SP1's hardcoded hash function).
 
 3. **Verify FRI folding**: For each query index q and each layer i:
    ```
@@ -245,7 +291,7 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
    // folded must equal the response at the next layer
    assert folded == next_layer_response[q / 2]
    ```
-   All arithmetic is in Baby Bear field (mod p).
+   All arithmetic is in KoalaBear field (mod p).
 
 4. **Verify Merkle authentication paths**: For each query, verify that the claimed evaluation is consistent with the committed Merkle root:
    ```
@@ -260,9 +306,9 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
 **Operation counts** (estimated per query, 100 queries — confirmed by Gate 0b):
 | Operation | Count per query | Total (100 queries) | Measured script per op |
 |-----------|----------------|-------------------|----------------------|
-| Baby Bear mul | ~60 | ~6,000 | 9 bytes |
-| Baby Bear add | ~40 | ~4,000 | 9 bytes |
-| Baby Bear inv | ~4 | ~400 | 477 bytes |
+| KoalaBear mul | ~60 | ~6,000 | 9 bytes |
+| KoalaBear add | ~40 | ~4,000 | 9 bytes |
+| KoalaBear inv | ~4 | ~400 | 477 bytes |
 | Poseidon2 compress | ~19 | ~1,900 | ~30-50KB (subroutine) |
 | Poseidon2 Merkle path | ~19 levels | ~1,900 levels | uses compress subroutine |
 
@@ -278,8 +324,8 @@ limits (4GB max script). Gate 0a Full must measure the actual size.
 **Measured regtest timing** (per-vector deploy + call, single-threaded):
 | Operation | Time per vector |
 |---|---|
-| Baby Bear add/sub/mul | ~1.2 s |
-| Baby Bear inv | ~4.0 s |
+| KoalaBear add/sub/mul | ~1.2 s |
+| KoalaBear inv | ~4.0 s |
 | Merkle proof (depth 3-10) | ~1.4 s |
 | FRI colinearity check | ~1.3 s |
 
@@ -292,25 +338,25 @@ operations is sub-millisecond.
 ## New Primitives (Status)
 
 Four primitives are required for the FRI verifier and bridge covenant.
-Two are complete and validated (Baby Bear arithmetic, SHA-256 Merkle
+Two are complete and validated (KoalaBear arithmetic, SHA-256 Merkle
 proofs). One (Poseidon2) is newly required based on Gate 0b findings.
 The fourth (cross-covenant output reference) is needed for the bridge
 covenant but not the FRI verifier.
 
-### A. Baby Bear Field Arithmetic — COMPLETE
+### A. KoalaBear Field Arithmetic — COMPLETE
 
-Implemented as a Rúnar codegen module for the Baby Bear prime field,
+Implemented as a Rúnar codegen module for the KoalaBear prime field,
 analogous to the existing EC codegen module (`codegen/ec.go`) but for:
 
 ```
-p = 2^31 - 2^27 + 1 = 2013265921
+p = 2^31 - 2^24 + 1 = 2,130,706,433
 ```
 
 Operations: `fieldAdd`, `fieldSub`, `fieldMul`, `fieldInv`.
 
 The existing EC module already implements modular field arithmetic
 over secp256k1's 256-bit prime using `OP_ADD`, `OP_MUL`, `OP_MOD`.
-Baby Bear is a 31-bit prime — the same opcode patterns, smaller
+KoalaBear is a 31-bit prime — the same opcode patterns, smaller
 numbers, much faster execution.
 
 **Inversion optimization**: For this specific prime, an addition chain
@@ -318,21 +364,21 @@ shorter than generic binary exponentiation may exist. Finding one
 would measurably reduce script size since inversion is called hundreds
 of times during FRI verification.
 
-### Baby Bear Field Implementation Strategy
+### KoalaBear Field Implementation Strategy
 
-The Baby Bear field (p = 2013265921 = 2^31 - 2^27 + 1) fits in 31 bits. Bitcoin Script operates on 32-bit signed integers (with some operations supporting larger), so Baby Bear elements fit in a single stack element.
+The KoalaBear field (p = 2,130,706,433 = 2^31 - 2^27 + 1) fits in 31 bits. Bitcoin Script operates on 32-bit signed integers (with some operations supporting larger), so KoalaBear elements fit in a single stack element.
 
 **Arithmetic implementation**:
 
 - **Addition**: `OP_ADD OP_DUP <p> OP_GREATERTHANOREQUAL OP_IF <p> OP_SUB OP_ENDIF` (5 opcodes)
 - **Subtraction**: `OP_SUB OP_DUP 0 OP_LESSTHAN OP_IF <p> OP_ADD OP_ENDIF` (5 opcodes)
-- **Multiplication**: Baby Bear elements are up to ~2×10^9. Their product is up to ~4×10^18, which exceeds 32-bit signed integer range but fits in 64-bit. BSV (post-Genesis) restored big number arithmetic — `OP_MUL` operates on arbitrary-precision integers, not just 32-bit values. The product is reduced mod p using: `OP_DUP <p> OP_DIV <p> OP_MUL OP_SUB` (Barrett reduction, ~6 opcodes). **CONFIRMED**: `OP_MUL` handles 31-bit × 31-bit inputs correctly on BSV regtest (253 test vectors, all passing). Locking script: 9 bytes.
+- **Multiplication**: KoalaBear elements are up to ~2×10^9. Their product is up to ~4×10^18, which exceeds 32-bit signed integer range but fits in 64-bit. BSV (post-Genesis) restored big number arithmetic — `OP_MUL` operates on arbitrary-precision integers, not just 32-bit values. The product is reduced mod p using: `OP_DUP <p> OP_DIV <p> OP_MUL OP_SUB` (Barrett reduction, ~6 opcodes). **CONFIRMED**: `OP_MUL` handles 31-bit × 31-bit inputs correctly on BSV regtest (253 test vectors, all passing). Locking script: 9 bytes.
 - **Inversion**: Extended Euclidean algorithm or Fermat's little theorem (`a^(p-2) mod p`). Using a square-and-multiply chain: ~300 opcodes per inversion. **CONFIRMED**: 163 test vectors passing on regtest. Locking script: 477 bytes.
 
-**Rúnar codegen module**: The Baby Bear module provides:
+**Rúnar codegen module**: The KoalaBear module provides:
 ```go
 // In runar-go DSL
-bb := runar.BabyBear()
+bb := runar.KoalaBear()
 bb.Add(a, b)      // a + b mod p
 bb.Sub(a, b)      // a - b mod p
 bb.Mul(a, b)      // a * b mod p
@@ -343,7 +389,7 @@ bb.Pow(a, exp)     // a^exp mod p (square-and-multiply)
 Each operation compiles to the opcodes shown above. The module is
 complete and tested: 829 base field vectors + 295 extension field
 vectors, all passing on BSV regtest. Extension field operations (degree-4
-over Baby Bear) compile to 509 bytes (ext4 mul) and 3.1 KB (ext4 inv).
+over KoalaBear) compile to 509 bytes (ext4 mul) and 3.1 KB (ext4 inv).
 
 ### B. Merkle Proof Verification — COMPLETE (SHA-256 variant)
 
@@ -372,24 +418,24 @@ including all Keccak-256 MPT operations. The bridge only verifies
 withdrawal inclusion in a SHA256 Merkle tree built by the SP1 guest
 and committed as a STARK public value.
 
-### D. Poseidon2 over Baby Bear — REQUIRED (Gate 0b confirmed)
+### D. Poseidon2 over KoalaBear — REQUIRED (Gate 0b confirmed)
 
-SP1 hardcodes BabyBearPoseidon2 as its STARK configuration. All FRI
+SP1 hardcodes KoalaBearPoseidon2 as its STARK configuration. All FRI
 Merkle commitments and Fiat-Shamir challenge derivation use the
-Poseidon2 permutation over Baby Bear field elements. There is no
+Poseidon2 permutation over KoalaBear field elements. There is no
 SHA256 alternative in SP1.
 
 The FRI verifier needs:
 
 ```go
 // In runar-go DSL
-p2 := runar.Poseidon2BabyBear()
-p2.Permute(state [16]BabyBear) [16]BabyBear
-p2.Compress(left [8]BabyBear, right [8]BabyBear) [8]BabyBear
+p2 := runar.Poseidon2KoalaBear()
+p2.Permute(state [16]KoalaBear) [16]KoalaBear
+p2.Compress(left [8]KoalaBear, right [8]KoalaBear) [8]KoalaBear
 ```
 
 **Poseidon2 parameters** (from Plonky3/SP1):
-- Width: 16 Baby Bear elements
+- Width: 16 KoalaBear elements
 - Rate: 8, Capacity: 8
 - Sbox: x^7 (degree 7)
 - External rounds: 8 (4 initial + 4 final)
@@ -399,10 +445,10 @@ p2.Compress(left [8]BabyBear, right [8]BabyBear) [8]BabyBear
   (left into positions 0-7, right into positions 8-15), apply the full
   permutation, take the first 8 elements as the output digest
 - Round constants: from Plonky3's `p3-poseidon2` crate, specific to
-  Baby Bear with these parameters
+  KoalaBear with these parameters
 
 **Implementation in Bitcoin Script**: The Poseidon2 permutation is
-purely algebraic — it uses only Baby Bear field multiplications and
+purely algebraic — it uses only KoalaBear field multiplications and
 additions (already proven on BSV). Each external round: matrix multiply
 (MDS) + sbox (x^7) on all 16 elements + constant addition. Each
 internal round: matrix multiply (diagonal) + sbox on element 0 only +
@@ -416,7 +462,7 @@ duplicated), but the data flow (pushing 16 inputs, calling the
 subroutine, reading 8 outputs) adds overhead per call.
 
 **Test vectors**: MUST be generated from Plonky3's `p3-poseidon2`
-crate with SP1's exact Baby Bear parameters before implementing the
+crate with SP1's exact KoalaBear parameters before implementing the
 Rúnar codegen module. At minimum:
 - 100+ permutation vectors (random inputs → expected outputs)
 - 50+ compression vectors (two 8-element digests → compressed digest)
@@ -477,7 +523,7 @@ full state covenant contract (`bsvm/pkg/covenant/contracts/rollup.runar.go`):
 
 | Primitive | Status | Details |
 |---|---|---|
-| Baby Bear field multiplication (`OP_MUL` with 31-bit operands) | **CONFIRMED** | `bbFieldMul(a, b)` produces correct results on-chain |
+| KoalaBear field multiplication (`OP_MUL` with 31-bit operands) | **CONFIRMED** | `bbFieldMul(a, b)` produces correct results on-chain |
 | SHA-256 Merkle proof verification (depth 20) | **CONFIRMED** | ~300 opcodes unrolled, used for bridge (NOT FRI — FRI uses Poseidon2) |
 | hash256 batch data binding (`OP_HASH256`) | **CONFIRMED** | 165 KB proof blob hashed on-chain |
 | ByteString comparisons (`OP_EQUAL`) | **CONFIRMED** | 32-byte hash comparisons work correctly |
@@ -500,10 +546,10 @@ with Plonky3-generated test vectors on BSV regtest:
 
 | Primitive | Vectors | Locking Script | Status |
 |---|---|---|---|
-| Baby Bear add | 187 | 9 bytes | All pass on regtest |
-| Baby Bear sub | 226 | 21 bytes | All pass on regtest |
-| Baby Bear mul | 253 | 9 bytes | All pass on regtest |
-| Baby Bear inv | 163 | 477 bytes | All pass on regtest |
+| KoalaBear add | 187 | 9 bytes | All pass on regtest |
+| KoalaBear sub | 226 | 21 bytes | All pass on regtest |
+| KoalaBear mul | 253 | 9 bytes | All pass on regtest |
+| KoalaBear inv | 163 | 477 bytes | All pass on regtest |
 | Ext4 mul (4 components) | 226 | 509 bytes | All pass interpreter |
 | Ext4 inv (4 components) | 69 | 3.1 KB | All pass interpreter |
 | Merkle inclusion (SHA256) | 72 | 482 bytes (depth 20) | All pass on regtest |
@@ -529,15 +575,15 @@ verifies the FRI protocol on-chain.
 **Prerequisites**: The FRI verifier depends on primitives already
 confirmed working on BSV (see Gate 0a Primitive Validation above),
 plus the Poseidon2 hash function:
-- Baby Bear field arithmetic (confirmed)
+- KoalaBear field arithmetic (confirmed)
 - SHA-256 Merkle proof verification (confirmed — used for BSVM-specific
   bindings, NOT for FRI)
-- Poseidon2 permutation over Baby Bear — **REQUIRED**. SP1 hardcodes
-  BabyBearPoseidon2 as its STARK configuration. All FRI Merkle
+- Poseidon2 permutation over KoalaBear — **REQUIRED**. SP1 hardcodes
+  KoalaBearPoseidon2 as its STARK configuration. All FRI Merkle
   commitments and Fiat-Shamir challenge derivation use Poseidon2.
   There is no SHA256 alternative in SP1. The Rúnar FRI verifier MUST
   implement the full Poseidon2 permutation in Bitcoin Script using
-  Baby Bear field arithmetic (multiplications, additions, constant
+  KoalaBear field arithmetic (multiplications, additions, constant
   additions — no bitwise operations). Parameters: width=16, rate=8,
   capacity=8, sbox_degree=7, external_rounds=8, internal_rounds=13.
   Round constants from Plonky3's p3-poseidon2 crate. Estimated script
@@ -554,7 +600,7 @@ plus the Poseidon2 hash function:
 2. Implement each verification step as Rúnar DSL code:
    - Fiat-Shamir challenge derivation (hash transcript → field elements)
    - For each FRI query: Merkle inclusion check + colinearity/folding
-     equation in Baby Bear extension field
+     equation in KoalaBear extension field
    - Final polynomial evaluation check
    - Opening value verification against AIR constraints
 
@@ -616,7 +662,7 @@ step-by-step procedure.
 - `tests/sp1/evm_vk.bin` — verifying key for EVM guest
 - `tests/sp1/evm_public_values.bin` — 272-byte public values
 - `docs/sp1-proof-format.md` — byte-level proof structure
-- `docs/sp1-fri-parameters.md` — exact FRI parameters from SP1 v4.1.1
+- `docs/sp1-fri-parameters.md` — exact FRI parameters from SP1 v6.0.2
 - `docs/sp1-verification-trace.md` — step-by-step verification with actual values
 - FRI verifier compiled Script size, stack depth, and execution time
 - All negative tests passing on regtest
@@ -703,9 +749,9 @@ These are NOT built-in Bitcoin opcodes — they are Rúnar DSL abstractions that
 | BSV block height | **Exists** — `ExtractLocktime` |
 | Multi-output | **Exists** — `AddOutput` |
 | P2PKH construction | **Exists** — manual via `Hash160` + `Cat` |
-| Baby Bear field arithmetic | **COMPLETE** — codegen module, 1,326 test vectors |
+| KoalaBear field arithmetic | **COMPLETE** — codegen module, 1,326 test vectors |
 | SHA256 Merkle proof verification | **COMPLETE** — for bridge/BSVM bindings (NOT FRI) |
-| Poseidon2 over Baby Bear | **NEW — REQUIRED** — for FRI Merkle commitments + Fiat-Shamir |
+| Poseidon2 over KoalaBear | **NEW — REQUIRED** — for FRI Merkle commitments + Fiat-Shamir |
 | Poseidon2 Merkle proof verification | **NEW — REQUIRED** — for FRI query verification |
 | Cross-covenant output read | **NEW** — calling convention + pattern |
 | SP1 FRI verifier (with Poseidon2) | **NEW** — the main deliverable |

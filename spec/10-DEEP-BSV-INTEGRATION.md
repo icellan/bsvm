@@ -2,15 +2,15 @@
 
 ## Why Rúnar, Not sCrypt
 
-sCrypt is TypeScript-based with a single compiler implementation. Rúnar is fundamentally different in philosophy and gives us three structural advantages for this project:
+sCrypt is TypeScript-based. Rúnar fits this project differently and gives us three structural advantages:
 
-1. **Go compiler as a library**: Rúnar has independent compiler implementations in Go, TypeScript, Rust, and Python — all producing byte-identical Bitcoin Script output. Since bsvm is written in Go, we import Rúnar's Go compiler directly as a package. The covenant scripts are compiled at build time or at genesis from Go source, with no JavaScript toolchain in the critical path.
+1. **Go compiler as a library**: BSVM is written in Go and imports Rúnar's Go compiler directly as a package. The covenant scripts are compiled at build time or at genesis from Go source with no JavaScript toolchain in the critical path. Rúnar also has non-Go backends (TypeScript, Rust, Python, Zig, Ruby) but BSVM compiles exclusively through the Go backend — cross-compiler parity against the BSVM contract set is NOT a BSVM release criterion, is not tested here, and should not be relied on for auditing the covenant logic.
 
-2. **Formal correctness via multi-implementation conformance**: The ANF (Administrative Normal Form) intermediate representation gives every sub-expression a named temporary with canonical JSON serialization (RFC 8785). If the Go, Rust, and TypeScript compilers all produce the same bytes for a given contract, the probability of a shared bug is near zero. For a covenant that guards the entire L2 state, this is not optional — it is essential.
+2. **ANF IR as the audit artifact**: Rúnar's Administrative Normal Form (ANF) intermediate representation gives every sub-expression a named temporary with canonical JSON serialization (RFC 8785). The ANF is an explicit, inspectable contract surface — auditors can read it directly rather than disassembling Script bytes. This is the audit artifact for the Go-compiled covenants.
 
-3. **Built-in ZKP verification**: Rúnar ships with ZKP verifier contracts as built-in examples. This means the Phase 3 validity proof covenant doesn't require novel Script engineering — it compiles from existing primitives.
+3. **Built-in ZKP verification primitives**: Rúnar ships BN254 G1/G2/pairing, KoalaBear field arithmetic, Ext4 arithmetic, and SHA-256 Merkle primitives as built-in compiler support. The Mode 2 / Mode 3 Groth16 verifiers and the future Gate 0a Full FRI verifier compose directly from these primitives without novel Script engineering.
 
-4. **Same author, same project**: Rúnar and bsvm share the same development context. The compiler can be evolved alongside the EVM project as new covenant requirements emerge, without coordinating with an external team.
+4. **Same author, same project**: Rúnar and bsvm share the same development context. The compiler can be evolved alongside the EVM project as new covenant requirements emerge without coordinating with an external team.
 
 ---
 
@@ -114,9 +114,9 @@ func CompileCovenant(sp1VerifyingKey []byte, chainID uint64, governanceConfig Go
 
 ### ANF as the Audit Artifact
 
-The ANF IR is the formal specification of the covenant. It can be serialized as canonical JSON (RFC 8785) and published alongside the genesis. Anyone with any Rúnar implementation (Go, Rust, TS, Python) can independently verify it produces byte-identical Script output.
+The ANF IR is the formal specification of the covenant. It is serialized as canonical JSON (RFC 8785) and published alongside the genesis. Auditors read the ANF directly to verify the covenant's semantics rather than disassembling Script bytes. Re-compiling via other Rúnar backends is NOT a supported verification path for BSVM — the Go compiler's output is the authoritative locking script.
 
-**ANF publication**: The covenant's ANF IR is serialized as canonical JSON (RFC 8785) and published in the genesis transaction's second OP_RETURN output. Nodes joining the shard verify the ANF hash matches the compiled script's hash. This ensures all nodes can independently verify the covenant logic.
+**ANF publication**: The covenant's ANF IR is serialized as canonical JSON (RFC 8785) and published in the genesis transaction's second OP_RETURN output. Nodes joining the shard compile the same contract source through the Go compiler and verify the resulting ANF hash and script hash match the on-chain records. This ensures all nodes can independently verify the covenant logic with the same toolchain.
 
 ---
 

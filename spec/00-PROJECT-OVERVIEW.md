@@ -98,10 +98,13 @@ Run full Solidity/EVM smart contracts as a Layer 2 on BSV, leveraging BSV's unbo
 - **Kdag-K/evm**: Showed how to make the EVM consensus-agnostic. Their `Service` abstraction is a good pattern.
 - **ava-labs/coreth**: Demonstrated UTXO↔account model bridging for atomic transactions. Their approach to translating between models is directly applicable.
 - **evstack/go-execution-evm**: Modern rollup-oriented EVM extraction using the go-execution interface pattern.
-- **Rúnar compiler**: Multi-language Bitcoin Script compiler (Go, TS, Rust,
-  Python) with byte-identical output. Provides the covenant locking scripts
-  and the SHA256 + field arithmetic primitives for STARK verification. Created
-  by the same team as bsvm.
+- **Rúnar compiler (Go backend)**: Bitcoin Script compiler imported as a Go
+  library. BSVM compiles all covenant contracts through the Go compiler only;
+  Rúnar's other language backends (TS, Rust, Python, Zig, Ruby) are not part
+  of BSVM's release criteria and are not tested against the BSVM contract set.
+  Provides the covenant locking scripts and the SHA-256 + KoalaBear field
+  arithmetic primitives for STARK verification. Created by the same team as
+  bsvm.
 
 ## Repository Structure
 
