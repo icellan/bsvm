@@ -32,7 +32,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        if [ ! -f /data/shard.json ]; then
+          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+        fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
       test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
@@ -56,7 +58,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        if [ ! -f /data/shard.json ]; then
+          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+        fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
       test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
@@ -80,7 +84,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        bsvm init --datadir /data --chain-id 8453111 --verification basefold 2>&1 || true
+        if [ ! -f /data/shard.json ]; then
+          bsvm init --datadir /data --chain-id 8453111 --verification basefold --alloc 0x954147ba3891a8865becc37fa0ce6d790cf00f93=1000000000000000000000
+        fi
         exec bsvm run --datadir /data --config /etc/bsvm/node.toml
     healthcheck:
       test: ["CMD", "wget", "-qO-", "--post-data={\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}", "--header=Content-Type: application/json", "http://localhost:8545"]
