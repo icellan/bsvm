@@ -1,5 +1,7 @@
 # BSVM
 
+## NOTE: BSVM is still a work in progress. A lot of things still need to be tested and validated. DO NOT USE IN PRODUCTION.
+
 A validity-proven Ethereum Virtual Machine Layer 2 on BSV.
 
 BSVM runs full EVM smart contracts on BSV, with every state transition proven correct by a STARK proof verified on-chain in Bitcoin Script. There is no sequencer key — the proof alone authorizes state advances. Anyone with a valid proof can advance the chain.
