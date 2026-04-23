@@ -126,10 +126,11 @@ export default function Block() {
                 label: "coinbase",
                 value: (
                   <Link to={`/address/${block.data.miner}`} style={{ color: "var(--ts-accent)" }}>
-                    {shorten(block.data.miner)}
+                    <Copy value={block.data.miner} responsive />
                   </Link>
                 ),
                 mono: true,
+                wide: true,
               },
               {
                 label: "timestamp",
