@@ -83,7 +83,22 @@ export default function Block() {
             ← prev
           </Button>
           <Button onClick={() => nav(`/block/${n + 1}`)}>next →</Button>
-          <Button variant="accent-ghost">Raw JSON</Button>
+          <Button
+            variant="accent-ghost"
+            onClick={() => {
+              // Open the raw eth_getBlockByNumber response in a new tab
+              // as a data URL. Keeps the page stateless (no modal) and
+              // lets operators copy / save from the browser's own view.
+              const json = JSON.stringify(block.data, null, 2);
+              const blob = new Blob([json], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              window.open(url, "_blank", "noopener,noreferrer");
+              // Revoke after a short delay so the new tab finishes loading.
+              setTimeout(() => URL.revokeObjectURL(url), 60_000);
+            }}
+          >
+            Raw JSON
+          </Button>
         </div>
       </div>
 
@@ -93,7 +108,7 @@ export default function Block() {
             items={[
               {
                 label: "hash",
-                value: <Copy value={block.data.hash} label={shorten(block.data.hash)} />,
+                value: <Copy value={block.data.hash} responsive />,
                 mono: true,
                 wide: true,
               },
@@ -101,7 +116,7 @@ export default function Block() {
                 label: "parent",
                 value: (
                   <Link to={`/block/${n - 1}`} style={{ color: "var(--ts-accent)" }}>
-                    <Copy value={block.data.parentHash} label={shorten(block.data.parentHash)} />
+                    <Copy value={block.data.parentHash} responsive />
                   </Link>
                 ),
                 mono: true,
@@ -134,13 +149,13 @@ export default function Block() {
               },
               {
                 label: "state root",
-                value: <Copy value={block.data.stateRoot} label={shorten(block.data.stateRoot)} />,
+                value: <Copy value={block.data.stateRoot} responsive />,
                 mono: true,
                 wide: true,
               },
               {
                 label: "receipts root",
-                value: <Copy value={block.data.receiptsRoot} label={shorten(block.data.receiptsRoot)} />,
+                value: <Copy value={block.data.receiptsRoot} responsive />,
                 mono: true,
                 wide: true,
               },
@@ -347,7 +362,7 @@ function BsvSettlement({
           value: noAdvance ? (
             <span style={{ color: "var(--ts-text-3)" }}>—</span>
           ) : (
-            <Copy value={data.bsvTxId} label={shorten("0x" + data.bsvTxId)} />
+            <Copy value={data.bsvTxId} responsive />
           ),
           mono: true,
           wide: true,

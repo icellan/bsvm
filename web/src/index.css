@@ -100,6 +100,15 @@
   }
 }
 
+/* Responsive hash display — Copy with `responsive` prop renders both
+   the full value and a shortened form; only one is visible at a time. */
+.copy-full { display: inline; overflow-wrap: anywhere; }
+.copy-short { display: none; }
+@media (max-width: 720px) {
+  .copy-full { display: none; }
+  .copy-short { display: inline; }
+}
+
 @keyframes ts-pulse {
   0%,
   100% {
