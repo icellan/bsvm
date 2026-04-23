@@ -183,10 +183,15 @@ func cmdDeployShard(ctx *cli.Context) error {
 
 	// Compute the genesis state root in a throwaway DB so we can bake
 	// it into the covenant's initial stateRoot readonly property.
+	// Use wall-clock time as the deterministic genesis timestamp —
+	// all nodes pick this up from the manifest and replay block 0
+	// with the same value, so the L2 clock starts from now() instead
+	// of 1970 while execution stays deterministic.
+	genesisTimestamp := time.Now().Unix()
 	tmpDB := db.NewMemoryDB()
 	genesisHeader, err := block.InitGenesis(tmpDB, &block.Genesis{
 		Config:    vm.DefaultL2Config(chainID),
-		Timestamp: 0,
+		Timestamp: uint64(genesisTimestamp),
 		GasLimit:  gasLimit,
 		Alloc:     alloc,
 	})
@@ -254,7 +259,7 @@ func cmdDeployShard(ctx *cli.Context) error {
 		Governance:       shard.GovernanceFromConfig(govConfig),
 		Alloc:            shard.AllocFromMap(alloc),
 		CovenantSats:     covenant.DefaultCovenantSats,
-		Timestamp:        time.Now().Unix(),
+		Timestamp:        genesisTimestamp,
 	}
 	manifestBytes, err := shard.EncodeManifest(manifest)
 	if err != nil {

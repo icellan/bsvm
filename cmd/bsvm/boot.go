@@ -229,7 +229,7 @@ func bootFromGenesisTxID(
 	} else {
 		header, initErr := block.InitGenesis(database, &block.Genesis{
 			Config:    chainConfig,
-			Timestamp: 0,
+			Timestamp: uint64(derived.GenesisTimestamp),
 			GasLimit:  effectiveGasLimit,
 			Alloc:     derived.Alloc,
 		})

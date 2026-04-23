@@ -74,6 +74,11 @@ type DerivedShard struct {
 	// Alloc is the genesis account allocation recovered from the
 	// manifest, ready to hand to block.InitGenesis.
 	Alloc map[types.Address]block.GenesisAccount
+	// GenesisTimestamp is the unix seconds value the deploy baked
+	// into the manifest. All nodes replay genesis with this value so
+	// the deterministic `parentTs + interval` chain starts from a
+	// real wall-clock moment instead of 1970.
+	GenesisTimestamp int64
 	// GenesisStateRoot is the state root recorded in the script's
 	// stateful slot (the initial CovenantState.StateRoot). The caller
 	// MUST re-run InitGenesis on the derived alloc and verify the
@@ -351,6 +356,7 @@ func deriveShardFromTxData(tx *runar.TransactionData, txidHex string) (*DerivedS
 		SP1VerifyingKey:       sp1VK,
 		SP1VerifyingKeyHash:   vkHashFromManifest,
 		Alloc:                 alloc,
+		GenesisTimestamp:      manifest.Timestamp,
 		GenesisStateRoot:      stateRoot,
 		CovenantLockingScript: covenantOut.Script,
 	}, nil
