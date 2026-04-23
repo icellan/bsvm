@@ -134,7 +134,7 @@ func (w *ConfirmationWatcher) poll() {
 		cancel()
 		if err != nil {
 			slog.Debug("confirmation query failed",
-				"block", blockNum, "txid", pending.txid.Hex(), "error", err)
+				"block", blockNum, "txid", pending.txid.BSVString(), "error", err)
 			continue
 		}
 		snapshot[blockNum].confirmations = confs

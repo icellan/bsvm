@@ -235,7 +235,9 @@ func (c *RunarBroadcastClient) BroadcastAdvance(_ context.Context, req Broadcast
 // mempool but not yet mined. An unknown txid produces an RPC error
 // propagated to the caller.
 func (c *RunarBroadcastClient) GetConfirmations(ctx context.Context, txid types.Hash) (uint32, error) {
-	txidHex := hex.EncodeToString(txid[:])
+	// getrawtransaction expects BSV's big-endian display form; txid is
+	// stored in chainhash little-endian bytes so reverse via BSVString.
+	txidHex := txid.BSVString()
 
 	raw, err := c.confirmations.GetRawTransactionVerbose(txidHex)
 	if err != nil {
@@ -291,9 +293,10 @@ func (c *RunarBroadcastClient) LastError() error {
 }
 
 // parseRunarTxID converts a hex-string txid returned by contract.Call into
-// a types.Hash. The SDK returns 64-char hex (no 0x prefix); we store the
-// bytes verbatim so GetConfirmations' reverse encode produces the same
-// string to feed back into getrawtransaction.
+// a types.Hash. The SDK returns 64-char hex (no 0x prefix) in BSV's
+// big-endian display form, so we reverse into chainhash little-endian
+// order for in-memory storage. GetConfirmations converts back via
+// BSVString() before feeding the txid into getrawtransaction.
 func parseRunarTxID(s string) (types.Hash, error) {
 	if len(s) >= 2 && (s[0:2] == "0x" || s[0:2] == "0X") {
 		s = s[2:]
@@ -305,7 +308,10 @@ func parseRunarTxID(s string) (types.Hash, error) {
 	if len(b) != 32 {
 		return types.Hash{}, fmt.Errorf("expected 32-byte txid, got %d", len(b))
 	}
+	// Reverse into chainhash little-endian bytes — BSV-canon.
 	var h types.Hash
-	copy(h[:], b)
+	for i := 0; i < 32; i++ {
+		h[i] = b[31-i]
+	}
 	return h, nil
 }

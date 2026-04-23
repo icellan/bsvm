@@ -521,7 +521,7 @@ func cmdRun(ctx *cli.Context) error {
 	chainID := boot.ChainID
 	slog.Info("shard loaded",
 		"chainID", chainID,
-		"txid", boot.GenesisCovenantTxID.Hex(),
+		"txid", boot.GenesisCovenantTxID.BSVString(),
 		"verification", boot.Verification.String(),
 		"synced", boot.Synced,
 	)
@@ -727,7 +727,10 @@ func cmdRun(ctx *cli.Context) error {
 	// still trying to bootstrap (followers without BSV RPC) can
 	// request it from us on the chain-agnostic genesis-sync protocol.
 	if boot.GenesisRawTxHex != "" {
-		gossipMgr.SetLocalGenesis(strings.TrimPrefix(boot.GenesisCovenantTxID.Hex(), "0x"), boot.GenesisRawTxHex)
+		// Peers verify the raw hex by hashing + byte-reversing it and
+		// comparing to the txid string we send, so publish the
+		// BSV-canonical big-endian display form via BSVString().
+		gossipMgr.SetLocalGenesis(boot.GenesisCovenantTxID.BSVString(), boot.GenesisRawTxHex)
 	}
 
 	// 7.1 Create and register the sync manager. This registers handlers for

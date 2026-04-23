@@ -303,8 +303,10 @@ func padOrZero(b []byte, size int) []byte {
 // is set.
 func genesisOutpointFromOpts(opts bsvWireOpts) (string, uint32, error) {
 	if opts.DerivedBoot != nil {
-		txidHex := strings.TrimPrefix(opts.DerivedBoot.GenesisCovenantTxID.Hex(), "0x")
-		return txidHex, opts.DerivedBoot.GenesisCovenantVout, nil
+		// DerivedBoot.GenesisCovenantTxID stores chainhash little-endian
+		// bytes; BSVString() reverses to the big-endian display form
+		// that BSV RPC (runar.FromTxId / getrawtransaction) expects.
+		return opts.DerivedBoot.GenesisCovenantTxID.BSVString(), opts.DerivedBoot.GenesisCovenantVout, nil
 	}
 	if opts.ShardCfg != nil {
 		return strings.TrimPrefix(opts.ShardCfg.GenesisCovenantTxID, "0x"), opts.ShardCfg.GenesisCovenantVout, nil

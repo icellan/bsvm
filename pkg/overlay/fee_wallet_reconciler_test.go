@@ -53,12 +53,18 @@ func (s *stubUtxoSource) setErr(err error) {
 
 // Deterministic 32-byte txid hex from an index so tests can build
 // runar.UTXOs whose Txid string matches the FeeUTXO.TxID produced by
-// types.HexToHash.
+// makeUTXO. The reconciler ingests u.Txid via types.BSVHashFromHex,
+// which hex-decodes then byte-reverses into chainhash little-endian
+// order. makeUTXO sets TxID[0]=lo, TxID[1]=hi directly (matching our
+// chainhash little-endian layout). For the reconciler's reversed
+// output to equal makeUTXO's layout, the hex we emit must decode to
+// the byte-reversal of makeUTXO's TxID: zeros in byte 0..29, i_hi in
+// byte 30, i_lo in byte 31.
 func txidHex(i int) string {
-	var h types.Hash
-	h[0] = byte(i)
-	h[1] = byte(i >> 8)
-	return hex.EncodeToString(h[:])
+	b := make([]byte, types.HashLength)
+	b[types.HashLength-1] = byte(i)
+	b[types.HashLength-2] = byte(i >> 8)
+	return hex.EncodeToString(b)
 }
 
 func runarUTXO(i int, vout int, sats int64) runar.UTXO {

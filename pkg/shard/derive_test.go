@@ -531,9 +531,11 @@ func TestDeriveShardFromRawTx_Equivalence(t *testing.T) {
 		t.Fatalf("DeriveShardFromRawTx: %v", err)
 	}
 	// The raw-bytes path records the actual hash of the bytes as the
-	// GenesisTxID — compare against our test-computed txid.
-	if strings.TrimPrefix(dsRaw.GenesisTxID.Hex(), "0x") != txid {
-		t.Errorf("DeriveShardFromRawTx GenesisTxID = %s, want %s", dsRaw.GenesisTxID.Hex(), txid)
+	// GenesisTxID — compare against our test-computed txid. GenesisTxID
+	// is a BSV hash stored in chainhash little-endian bytes; BSVString
+	// returns the big-endian display form that matches TxIDFromRawTx.
+	if dsRaw.GenesisTxID.BSVString() != txid {
+		t.Errorf("DeriveShardFromRawTx GenesisTxID = %s, want %s", dsRaw.GenesisTxID.BSVString(), txid)
 	}
 	if dsRaw.ChainID != chainID {
 		t.Errorf("ChainID = %d, want %d", dsRaw.ChainID, chainID)

@@ -38,6 +38,42 @@ func HexToHash(s string) Hash {
 	return BytesToHash(fromHex(s))
 }
 
+// BSVHashFromHex parses a big-endian hex string (the form emitted by
+// bitcoin-cli / block explorers / the Rúnar SDK) and returns a Hash
+// whose bytes are in little-endian chainhash order.
+//
+// Use this for BSV transaction ids and BSV block hashes.
+// Do NOT use for L2 txids, state roots, or other EVM-domain hashes —
+// those stay in big-endian hex ⟷ big-endian bytes convention.
+func BSVHashFromHex(s string) Hash {
+	b := fromHex(s)
+	var h Hash
+	if len(b) != HashLength {
+		return h
+	}
+	for i := 0; i < HashLength; i++ {
+		h[i] = b[HashLength-1-i]
+	}
+	return h
+}
+
+// BSVString returns the BSV-canonical txid / block hash hex: 64
+// lowercase hex chars, no 0x prefix, big-endian display order. The
+// receiver MUST be a BSV hash (i.e. constructed via BSVHashFromHex or
+// copied from chainhash-ordered bytes). Do NOT call this on L2 hashes
+// such as state roots, EVM tx hashes, or block hashes — their Hex()
+// method returns the correct big-endian 0x-prefixed form.
+func (h Hash) BSVString() string {
+	if h == (Hash{}) {
+		return ""
+	}
+	var reversed [HashLength]byte
+	for i := 0; i < HashLength; i++ {
+		reversed[i] = h[HashLength-1-i]
+	}
+	return hex.EncodeToString(reversed[:])
+}
+
 // HexToAddress converts a hex string (with or without 0x prefix) to Address.
 func HexToAddress(s string) Address {
 	return BytesToAddress(fromHex(s))

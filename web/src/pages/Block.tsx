@@ -4,7 +4,6 @@ import { useQuery } from "@tanstack/react-query";
 import { bsv, eth, hexToNumber } from "@/rpc/client";
 import Copy, { shorten } from "@/components/Copy";
 import { Panel, KV, Chip, Bar, Button, Tier, tierFor } from "@/components/ui";
-import ProofTrajectory from "@/components/charts/ProofTrajectory";
 
 // Block — single-block detail. Header KV grid, gas + tx stats + proof
 // trajectory strip, full transactions table.
@@ -27,6 +26,12 @@ export default function Block() {
   const shard = useQuery({
     queryKey: ["bsv_shardInfo"],
     queryFn: bsv.shardInfo,
+    refetchInterval: 5_000,
+  });
+  const confirm = useQuery({
+    queryKey: ["bsv_getConfirmationStatus", blockNum ?? -1],
+    queryFn: () => bsv.getConfirmationStatus(blockNum ?? 0),
+    enabled: !isHash && blockNum !== null,
     refetchInterval: 5_000,
   });
 
@@ -113,8 +118,19 @@ export default function Block() {
               },
               {
                 label: "timestamp",
-                value: new Date(hexToNumber(block.data.timestamp) * 1000).toISOString().replace("T", " ").replace(".000Z", "Z"),
+                // L2 timestamps are deterministic: parentTs + interval (see
+                // pkg/overlay/process.go). On a freshly genesis'd shard the
+                // first few blocks land in 1970 because the genesis block
+                // starts at t=0 — that's correct, not a bug. Show both the
+                // raw unix seconds and the ISO form so operators see the
+                // convention.
+                value: (() => {
+                  const ts = hexToNumber(block.data.timestamp);
+                  const iso = new Date(ts * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
+                  return `${iso}  (t=${ts}s)`;
+                })(),
                 mono: true,
+                wide: true,
               },
               {
                 label: "state root",
@@ -169,12 +185,16 @@ export default function Block() {
                 marginBottom: 6,
               }}
             >
-              proof trajectory
+              lifecycle
             </div>
-            <ProofTrajectory tier={t} />
+            <LifecycleStrip tier={t} confirm={confirm.data} />
           </div>
         </Panel>
       </div>
+
+      <Panel title="BSV settlement" kicker="Covenant advance">
+        <BsvSettlement data={confirm.data} loading={confirm.isLoading} />
+      </Panel>
 
       <Panel title="Transactions" kicker={`${txs.length} in block`} padded={false}>
         {txs.length === 0 ? (
@@ -279,6 +299,138 @@ function LoadingRow({ label }: { label: string }) {
       style={{ fontSize: 12, color: "var(--ts-text-3)", padding: 14 }}
     >
       {label}
+    </div>
+  );
+}
+
+type ConfirmData = {
+  l2BlockNumber: string;
+  bsvTxId: string;
+  confirmations: string;
+  confirmed: boolean;
+  safe: boolean;
+  finalized: boolean;
+};
+
+// BsvSettlement panel: shows which BSV covenant-advance tx settled
+// this L2 block, with confirmation / safe / finalized flags. Empty
+// bsvTxId means the advance hasn't been broadcast yet (or the node
+// never observed its confirmation — e.g. this is a peer-replayed
+// block on a follower node).
+function BsvSettlement({
+  data,
+  loading,
+}: {
+  data: ConfirmData | undefined;
+  loading: boolean;
+}) {
+  if (loading)
+    return (
+      <div className="mono" style={{ fontSize: 11, color: "var(--ts-text-3)" }}>
+        Loading…
+      </div>
+    );
+  if (!data)
+    return (
+      <div className="mono" style={{ fontSize: 11, color: "var(--ts-text-3)" }}>
+        No settlement data.
+      </div>
+    );
+  const confs = hexToNumber(data.confirmations);
+  const noAdvance = !data.bsvTxId;
+
+  return (
+    <KV
+      items={[
+        {
+          label: "bsv txid",
+          value: noAdvance ? (
+            <span style={{ color: "var(--ts-text-3)" }}>—</span>
+          ) : (
+            <Copy value={data.bsvTxId} label={shorten("0x" + data.bsvTxId)} />
+          ),
+          mono: true,
+          wide: true,
+        },
+        {
+          label: "confirmations",
+          value: (
+            <span style={{ color: confs >= 6 ? "var(--ts-ok)" : confs > 0 ? "var(--ts-info)" : "var(--ts-text-3)" }}>
+              {noAdvance ? "—" : confs}
+            </span>
+          ),
+          mono: true,
+        },
+        {
+          label: "status",
+          value: (
+            <div className="flex gap-1" style={{ flexWrap: "wrap" }}>
+              <Chip tone={data.confirmed ? "ok" : "neutral"}>
+                {data.confirmed ? "confirmed" : "pending"}
+              </Chip>
+              <Chip tone={data.safe ? "ok" : "neutral"}>
+                {data.safe ? "safe" : "speculative"}
+              </Chip>
+              <Chip tone={data.finalized ? "ok" : "neutral"}>
+                {data.finalized ? "finalized" : "not-final"}
+              </Chip>
+            </div>
+          ),
+        },
+      ]}
+      columns={2}
+    />
+  );
+}
+
+// LifecycleStrip: 4-step lifecycle indicator (assembled → proof-ok →
+// covenant → confirmed). Replaces the purely-cosmetic ProofTrajectory
+// mockup. Stage is derived from the confirmation RPC + the block's
+// tier; a stage is "active" when the block has reached it.
+function LifecycleStrip({
+  tier,
+  confirm,
+}: {
+  tier: string;
+  confirm: ConfirmData | undefined;
+}) {
+  const hasBsv = !!confirm?.bsvTxId;
+  const isConfirmed = !!confirm?.confirmed;
+  const isFinalized = !!confirm?.finalized;
+
+  const stages = [
+    { key: "assembled", label: "assembled", active: true },
+    { key: "proof-ok", label: "proof-ok", active: tier !== "speculative" || hasBsv },
+    { key: "covenant", label: "on-chain", active: hasBsv },
+    { key: "confirmed", label: isFinalized ? "finalized" : "confirmed", active: isConfirmed },
+  ];
+
+  return (
+    <div className="flex gap-1" style={{ width: "100%" }}>
+      {stages.map((s) => (
+        <div key={s.key} style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              height: 8,
+              borderRadius: 2,
+              background: s.active ? "var(--ts-accent)" : "var(--ts-bg-2)",
+              border: `1px solid ${s.active ? "var(--ts-accent)" : "var(--ts-line)"}`,
+            }}
+          />
+          <div
+            className="mono"
+            style={{
+              marginTop: 4,
+              fontSize: 10,
+              color: s.active ? "var(--ts-text-2)" : "var(--ts-text-3)",
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+            }}
+          >
+            {s.label}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

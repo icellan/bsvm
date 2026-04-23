@@ -89,7 +89,7 @@ func SyncFromBSV(
 		currentTxID = cp.CovenantTxID
 		covenantBlockNum = cp.L2BlockNum
 		slog.Info("resuming sync from checkpoint",
-			"covenantTxID", cp.CovenantTxID.Hex(),
+			"covenantTxID", cp.CovenantTxID.BSVString(),
 			"l2BlockNum", cp.L2BlockNum,
 		)
 	}
@@ -98,7 +98,7 @@ func SyncFromBSV(
 		// Find the transaction that spends the current covenant output.
 		spendingTx, err := client.GetSpendingTx(currentTxID, currentVout)
 		if err != nil {
-			return fmt.Errorf("getting spending tx for %s:%d: %w", currentTxID.Hex(), currentVout, err)
+			return fmt.Errorf("getting spending tx for %s:%d: %w", currentTxID.BSVString(), currentVout, err)
 		}
 		if spendingTx == nil {
 			// Output is unspent. We have reached the tip of the
@@ -121,7 +121,7 @@ func SyncFromBSV(
 		batch, batchData, err := extractBatch(spendingTx)
 		if err != nil {
 			return fmt.Errorf("extracting batch from covenant advance %s at block %d: %w",
-				spendingTx.TxID.Hex(), covenantBlockNum, err)
+				spendingTx.TxID.BSVString(), covenantBlockNum, err)
 		}
 
 		// Re-execute the batch to verify correctness.

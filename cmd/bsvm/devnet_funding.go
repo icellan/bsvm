@@ -205,7 +205,9 @@ pollLoop:
 			continue
 		}
 		feeUTXO := &overlay.FeeUTXO{
-			TxID:         types.HexToHash(u.Txid),
+			// u.Txid is a BSV txid (big-endian display form from
+			// listunspent) — reverse into chainhash little-endian bytes.
+			TxID:         types.BSVHashFromHex(u.Txid),
 			Vout:         uint32(u.OutputIndex),
 			Satoshis:     uint64(u.Satoshis),
 			ScriptPubKey: scriptBytes,

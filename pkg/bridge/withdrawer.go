@@ -160,7 +160,7 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		slog.Info("withdrawal claimed",
 			"nonce", wd.Nonce,
 			"amount", wd.AmountSatoshis,
-			"bsvTx", txid.Hex(),
+			"bsvTx", txid.BSVString(),
 		)
 
 		// Update bridge UTXO tracking.

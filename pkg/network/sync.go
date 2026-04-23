@@ -165,7 +165,7 @@ func (s *SyncManager) OnCovenantAdvance(peerID peer.ID, msg *CovenantAdvanceMsg)
 
 	slog.Info("received covenant advance",
 		"peer", peerID.String(),
-		"bsvTxID", msg.BSVTxID.Hex(),
+		"bsvTxID", msg.BSVTxID.BSVString(),
 		"l2Block", msg.L2BlockNum,
 		"stateRoot", msg.StateRoot.Hex(),
 		"localTip", localTip,

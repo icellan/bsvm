@@ -2,9 +2,11 @@ package types
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math/big"
 	"testing"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/crypto"
 )
@@ -62,6 +64,73 @@ func TestHexToHash(t *testing.T) {
 	h2 := HexToHash("0000000000000000000000000000000000000000000000000000000000000002")
 	if h2[31] != 2 {
 		t.Errorf("HexToHash without prefix last byte = %d, want 2", h2[31])
+	}
+}
+
+func TestBSVHashFromHex_RoundTrip(t *testing.T) {
+	// A known BSV txid string (display / big-endian form, 64 lowercase
+	// hex chars, no 0x). Pulled from a regtest deploy and pinned here
+	// so we exercise the full reverse.
+	const canonical = "d1f7b5b4b4d33b7c6e6e1e1e1d1e1f20a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+	h := BSVHashFromHex(canonical)
+
+	// 1. The receiver's bytes should be the reverse of the hex decode.
+	if hex.EncodeToString(h[:]) == canonical {
+		t.Fatalf("BSVHashFromHex did not reverse: got %s, want reversed form", hex.EncodeToString(h[:]))
+	}
+
+	// 2. BSVString() must reproduce the original canonical form.
+	if got := h.BSVString(); got != canonical {
+		t.Fatalf("BSVString() = %s, want %s", got, canonical)
+	}
+
+	// 3. An 0x prefix must be tolerated and stripped.
+	if h2 := BSVHashFromHex("0x" + canonical); h2 != h {
+		t.Fatalf("BSVHashFromHex: 0x-prefixed form diverged from plain form")
+	}
+}
+
+func TestBSVHashFromHex_ZeroOnBadInput(t *testing.T) {
+	if h := BSVHashFromHex(""); h != (Hash{}) {
+		t.Fatalf("BSVHashFromHex(\"\") should return zero hash")
+	}
+	if h := BSVHashFromHex("abcd"); h != (Hash{}) {
+		t.Fatalf("BSVHashFromHex short hex should return zero hash")
+	}
+}
+
+func TestBSVString_ZeroReturnsEmpty(t *testing.T) {
+	var zero Hash
+	if got := zero.BSVString(); got != "" {
+		t.Fatalf("zero.BSVString() = %q, want empty", got)
+	}
+}
+
+func TestBSVString_MatchesChainhash(t *testing.T) {
+	// A non-zero Hash with a recognisable byte pattern.
+	var h Hash
+	for i := 0; i < HashLength; i++ {
+		h[i] = byte(i)
+	}
+	// BSVString must return the 64-hex byte-reversed form (i.e. the
+	// same string chainhash.NewHash(h[:]).String() would emit).
+	want := "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+	if got := h.BSVString(); got != want {
+		t.Fatalf("BSVString() = %s, want %s", got, want)
+	}
+}
+
+func TestBSVHashFromHex_ChainhashCrossCheck(t *testing.T) {
+	const canonical = "d1f7b5b4b4d33b7c6e6e1e1e1d1e1f20a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	h := BSVHashFromHex(canonical)
+
+	ch, err := chainhash.NewHash(h[:])
+	if err != nil {
+		t.Fatalf("chainhash.NewHash: %v", err)
+	}
+	if got := ch.String(); got != canonical {
+		t.Fatalf("chainhash.String(BSVHashFromHex(%q)) = %s, want %s", canonical, got, canonical)
 	}
 }
 

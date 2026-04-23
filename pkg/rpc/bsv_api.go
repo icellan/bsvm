@@ -6,9 +6,27 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/overlay"
+	"github.com/icellan/bsvm/pkg/types"
 )
+
+// bsvTxIDHex returns a BSV txid in its canonical form: 64 lowercase hex
+// chars with NO 0x prefix. BSV txids are stored in types.Hash as
+// chainhash little-endian bytes (matching the chainhash convention);
+// chainhash.Hash.String() reverses on output to produce the big-endian
+// hex form bitcoin-cli / block explorers emit.
+func bsvTxIDHex(h types.Hash) string {
+	if (h == types.Hash{}) {
+		return ""
+	}
+	ch, err := chainhash.NewHash(h[:])
+	if err != nil {
+		return ""
+	}
+	return ch.String()
+}
 
 // WithdrawalProofData contains the Merkle proof data for a withdrawal claim.
 type WithdrawalProofData struct {
@@ -113,7 +131,7 @@ func (api *BsvAPI) ShardInfo() map[string]interface{} {
 	return map[string]interface{}{
 		"shardId":             EncodeUint64(uint64(api.overlay.Config().ChainID)),
 		"chainId":             EncodeUint64(uint64(api.overlay.Config().ChainID)),
-		"genesisCovenantTxId": cm.GenesisTxID().Hex(),
+		"genesisCovenantTxId": bsvTxIDHex(cm.GenesisTxID()),
 		"peerCount":           EncodeUint64(uint64(api.peerCount())),
 		"executionTip":        EncodeUint64(api.overlay.ExecutionTip()),
 		"provenTip":           EncodeUint64(api.overlay.ProvenTip()),
@@ -130,13 +148,14 @@ func (api *BsvAPI) GetConfirmationStatus(blockNum uint64) map[string]interface{}
 	finalizedTip := api.overlay.FinalizedTip()
 
 	// Determine BSV tx ID and confirmation count from the TxCache.
-	var bsvTxID string
+	// The cache carries BroadcastTxID once an advance has been
+	// dispatched to BSV; an empty hash means proving is still in
+	// flight or the node was restarted after confirmation.
+	bsvTxID := ""
 	var confirmations uint64
 	entry := api.overlay.TxCacheRef().GetByL2Block(blockNum)
 	if entry != nil {
-		bsvTxID = "0x" // no BSV tx yet for unconfirmed entries
-	} else {
-		bsvTxID = "0x"
+		bsvTxID = bsvTxIDHex(entry.BroadcastTxID)
 	}
 
 	// Estimate confirmations based on which tip the block falls within.
@@ -190,7 +209,7 @@ func (api *BsvAPI) GetCovenantTip() map[string]interface{} {
 	// confirmation monitor, not by default).
 	confirmed := confirmedTip > 0 && state.BlockNumber <= confirmedTip
 	result := map[string]interface{}{
-		"bsvTxId":       cm.CurrentTxID().Hex(),
+		"bsvTxId":       bsvTxIDHex(cm.CurrentTxID()),
 		"l2BlockNumber": EncodeUint64(state.BlockNumber),
 		"stateRoot":     state.StateRoot.Hex(),
 		"confirmed":     confirmed,
@@ -356,7 +375,7 @@ func (api *BsvAPI) BuildWithdrawalClaim(bsvAddress string, satoshiAmount uint64,
 	covenantTxID := cm.CurrentTxID()
 	unsignedTx := map[string]interface{}{
 		"version":       1,
-		"covenantTxId":  covenantTxID.Hex(),
+		"covenantTxId":  bsvTxIDHex(covenantTxID),
 		"covenantVout":  0,
 		"recipientHash": "0x" + hex.EncodeToString(addrBytes),
 		"satoshis":      EncodeUint64(satoshiAmount),

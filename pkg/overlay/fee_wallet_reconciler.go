@@ -188,7 +188,11 @@ func (r *FeeWalletReconciler) ReconcileOnce() (added, removed int, err error) {
 				"txid", u.Txid, "vout", u.OutputIndex, "satoshis", u.Satoshis)
 			continue
 		}
-		key := utxoKey(types.HexToHash(u.Txid), uint32(u.OutputIndex))
+		// u.Txid is a BSV txid (big-endian display form from
+		// listunspent). Reverse into chainhash little-endian bytes so
+		// the key matches AddUTXO / RemoveUTXO callers who construct
+		// TxIDs via the same BSVHashFromHex helper.
+		key := utxoKey(types.BSVHashFromHex(u.Txid), uint32(u.OutputIndex))
 		networkSet[key] = u
 	}
 
@@ -213,7 +217,7 @@ func (r *FeeWalletReconciler) ReconcileOnce() (added, removed int, err error) {
 			// removal. Skipping lets the rest of the pass still ingest
 			// new change outputs so broadcast can make progress.
 			slog.Warn("reconciler: RemoveUTXO failed, will retry next tick",
-				"txid", w.TxID.Hex(), "vout", w.Vout, "err", removeErr)
+				"txid", w.TxID.BSVString(), "vout", w.Vout, "err", removeErr)
 			continue
 		}
 		removed++
@@ -231,7 +235,9 @@ func (r *FeeWalletReconciler) ReconcileOnce() (added, removed int, err error) {
 			continue
 		}
 		feeUTXO := &FeeUTXO{
-			TxID:         types.HexToHash(u.Txid),
+			// u.Txid is a BSV txid (big-endian display form) — reverse
+			// into chainhash little-endian bytes for in-memory storage.
+			TxID:         types.BSVHashFromHex(u.Txid),
 			Vout:         uint32(u.OutputIndex),
 			Satoshis:     uint64(u.Satoshis),
 			ScriptPubKey: scriptBytes,

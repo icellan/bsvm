@@ -140,7 +140,9 @@ func DeriveShardFromTx(ctx context.Context, fetcher TxFetcher, txidHex string) (
 		// The fetcher was asked for a specific txid; trust that label
 		// and set it on the derived shard so callers see the exact
 		// value they asked for (no 0x, no casing surprises).
-		derived.GenesisTxID = types.HexToHash(strings.TrimPrefix(strings.ToLower(txidHex), "0x"))
+		// txidHex is a BSV txid (big-endian display form) —
+		// BSVHashFromHex stores bytes in chainhash little-endian order.
+		derived.GenesisTxID = types.BSVHashFromHex(txidHex)
 		return derived, nil
 	}
 	// Fallback for providers that don't populate Raw — derive from the
@@ -336,7 +338,10 @@ func deriveShardFromTxData(tx *runar.TransactionData, txidHex string) (*DerivedS
 	}
 
 	return &DerivedShard{
-		GenesisTxID:           types.HexToHash(txidHex),
+		// txidHex is the BSV-canonical big-endian display form
+		// (produced by TxIDFromRawTx); reverse into little-endian
+		// chainhash bytes for in-memory storage.
+		GenesisTxID:           types.BSVHashFromHex(txidHex),
 		GenesisCovenantVout:   0,
 		CovenantSats:          covenantSats,
 		ChainID:               manifest.ChainID,

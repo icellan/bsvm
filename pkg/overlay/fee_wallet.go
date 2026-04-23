@@ -50,9 +50,11 @@ func NewFeeWallet(database db.Database) *FeeWallet {
 	}
 }
 
-// utxoKey returns the map key for a UTXO: hex(txid) + ":" + decimal(vout).
+// utxoKey returns the map key for a UTXO: BSV-canonical txid hex +
+// ":" + decimal(vout). The txid is a BSV txid stored in chainhash
+// little-endian bytes; BSVString reverses for display.
 func utxoKey(txid types.Hash, vout uint32) string {
-	return fmt.Sprintf("%s:%d", txid.Hex(), vout)
+	return fmt.Sprintf("%s:%d", txid.BSVString(), vout)
 }
 
 // dbKey returns the database key for a UTXO: prefix(2) + txid(32) + vout(4 BE).
@@ -114,7 +116,7 @@ func (fw *FeeWallet) AddUTXO(utxo *FeeUTXO) error {
 	fw.utxos[key] = utxo
 
 	if err := fw.persistUTXO(utxo); err != nil {
-		slog.Error("failed to persist fee wallet utxo", "txid", utxo.TxID.Hex(), "vout", utxo.Vout, "err", err)
+		slog.Error("failed to persist fee wallet utxo", "txid", utxo.TxID.BSVString(), "vout", utxo.Vout, "err", err)
 		return err
 	}
 	return nil
@@ -133,7 +135,7 @@ func (fw *FeeWallet) RemoveUTXO(txid types.Hash, vout uint32) error {
 	delete(fw.utxos, key)
 
 	if err := fw.deleteUTXO(txid, vout); err != nil {
-		slog.Error("failed to delete fee wallet utxo from db", "txid", txid.Hex(), "vout", vout, "err", err)
+		slog.Error("failed to delete fee wallet utxo from db", "txid", txid.BSVString(), "vout", vout, "err", err)
 		return err
 	}
 	return nil

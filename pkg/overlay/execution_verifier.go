@@ -112,7 +112,7 @@ func (v *ExecutionVerifier) VerifyCovenantAdvance(advance *CovenantAdvanceEvent)
 			"block", advance.L2BlockNum,
 			"expected", advance.PostStateRoot.Hex(),
 			"computed", computedRoot.Hex(),
-			"bsvTx", advance.BSVTxID.Hex(),
+			"bsvTx", advance.BSVTxID.BSVString(),
 		)
 		return fmt.Errorf("execution mismatch at block %d: covenant=%s computed=%s",
 			advance.L2BlockNum, advance.PostStateRoot.Hex(), computedRoot.Hex())

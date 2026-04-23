@@ -87,7 +87,7 @@ func (api *BsvAPI) GetDeposits(fromBlock, toBlock uint64) []map[string]interface
 			l2Wei = d.L2WeiAmount.Dec()
 		}
 		out = append(out, map[string]interface{}{
-			"bsvTxId":         d.BSVTxID.Hex(),
+			"bsvTxId":         bsvTxIDHex(d.BSVTxID),
 			"vout":            EncodeUint64(uint64(d.Vout)),
 			"bsvBlockHeight":  EncodeUint64(d.BSVBlockHeight),
 			"l2Address":       d.L2Address.Hex(),
@@ -134,7 +134,7 @@ func (api *BsvAPI) NetworkHealth() map[string]interface{} {
 	specDepth := uint64(api.overlay.TxCacheRef().SpeculativeDepth())
 
 	result := map[string]interface{}{
-		"peerCount":              EncodeUint64(0), // wired in when PeerManager accessor lands
+		"peerCount":              EncodeUint64(uint64(api.peerCount())),
 		"executionTip":           EncodeUint64(exec),
 		"provenTip":              EncodeUint64(proven),
 		"confirmedTip":           EncodeUint64(confirmed),

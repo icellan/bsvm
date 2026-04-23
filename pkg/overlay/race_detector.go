@@ -85,7 +85,7 @@ func (rd *RaceDetector) HandleCovenantAdvance(event *CovenantAdvanceEvent) error
 		rd.pendingAdvance = nil
 
 		slog.Info("race won: our covenant advance accepted",
-			"bsvTxID", event.BSVTxID.Hex(),
+			"bsvTxID", event.BSVTxID.BSVString(),
 			"l2Block", event.L2BlockNum,
 		)
 

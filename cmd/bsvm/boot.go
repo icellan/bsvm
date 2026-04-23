@@ -177,9 +177,11 @@ func bootFromGenesisTxID(
 	}
 	// Pin the txid to the exact string the operator configured so
 	// downstream log lines show the same txid across all nodes.
-	derived.GenesisTxID = types.HexToHash(strings.TrimPrefix(strings.ToLower(genesisTxIDHex), "0x"))
+	// genesisTxIDHex is a BSV txid (big-endian display form) —
+	// BSVHashFromHex reverses into chainhash little-endian storage.
+	derived.GenesisTxID = types.BSVHashFromHex(genesisTxIDHex)
 	slog.Info("shard derived from covenant",
-		"txid", derived.GenesisTxID.Hex(),
+		"txid", derived.GenesisTxID.BSVString(),
 		"chainID", derived.ChainID,
 		"verification", derived.Verification.String(),
 		"governanceMode", derived.Governance.Mode.String(),
@@ -304,10 +306,15 @@ func bootFromShardConfig(configPath, dataDir string) (*bootResult, error) {
 		StateDB:             joinResult.StateDB,
 		ChainConfig:         joinResult.ChainConfig,
 		ChainID:             cfg.ChainID,
-		GenesisCovenantTxID: types.HexToHash(cfg.GenesisCovenantTxID),
+		// GenesisCovenantTxID is a BSV txid (big-endian display form in
+		// the shard.json file) — use BSVHashFromHex so in-memory bytes
+		// end up in chainhash little-endian order.
+		GenesisCovenantTxID: types.BSVHashFromHex(cfg.GenesisCovenantTxID),
 		GenesisCovenantVout: cfg.GenesisCovenantVout,
 		CovenantSats:        cfg.CovenantSats,
-		GenesisStateRoot:    types.HexToHash(cfg.GenesisStateRoot),
+		// GenesisStateRoot is an L2 / EVM hash — keep big-endian bytes
+		// matching big-endian hex convention.
+		GenesisStateRoot: types.HexToHash(cfg.GenesisStateRoot),
 		Verification:        verifyMode,
 		Governance:          govConfig,
 		SP1VerifyingKey:     sp1VK,
