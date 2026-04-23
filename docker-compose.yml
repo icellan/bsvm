@@ -34,9 +34,16 @@ x-bsvm-common: &bsvm-common
   networks:
     - bsvm-devnet
   environment: &bsvm-env
-    BSVM_PROVE_MODE: ${BSVM_PROVE_MODE:-mock}
+    # Default to `execute` so `docker compose up` produces real BSV
+    # regtest activity: every node builds a FRI advance and races to
+    # submit it on-chain. `mock` (no broadcast) remains available via
+    # `BSVM_PROVE_MODE=mock docker compose up`.
+    BSVM_PROVE_MODE: ${BSVM_PROVE_MODE:-execute}
     BSVM_CHAIN_ID: "31337"
     BSVM_BSV_RPC: "http://devuser:devpass@bsv-regtest:18332"
+    # Regtest network string selects the BSV address prefix used by
+    # the fee wallet + enables the devnet auto-funding bootstrap.
+    BSVM_BSV_NETWORK: "regtest"
     BSVM_EXPLORER: "true"
     BSVM_LOG_LEVEL: info
     BSVM_GENESIS_DIR: /shared/genesis
@@ -44,6 +51,11 @@ x-bsvm-common: &bsvm-common
     BSVM_FLUSH_DELAY: "1s"
     BSVM_GAS_PRICE: "1"
     BSVM_DEPOSIT_CONFIRMATIONS: "1"
+    # Loosen the default 16-block cap so bsvm-sim can push continuous
+    # traffic without running into "speculative depth limit reached"
+    # during slow mock-proving windows. 512 blocks is ~8 minutes of
+    # buffer at a 1s flush delay — plenty for dev-loop driving.
+    BSVM_MAX_SPECULATIVE_DEPTH: "512"
   depends_on:
     bsv-regtest:
       condition: service_healthy
@@ -123,6 +135,61 @@ services:
           sleep 10
         done
 
+  # ─── Cluster Bootstrap (one-shot) ─────────────────────────────────
+  # Deploys the rollup covenant + genesis manifest to BSV in a single
+  # transaction. Writes the resulting txid to /shared/cluster/genesis.txid
+  # so the nodes can boot entirely from that one file — no shard.json,
+  # no genesis_alloc.json, just a 64-char txid. Runs to completion then
+  # exits. Idempotent: if the genesis.txid already references a live
+  # covenant tx on BSV, `bsvm deploy-shard` refuses to re-deploy.
+  bsvm-init:
+    image: bsvm:devnet
+    container_name: bsvm-init
+    networks:
+      - bsvm-devnet
+    environment:
+      BSVM_BSV_RPC: "http://devuser:devpass@bsv-regtest:18332"
+      BSVM_BSV_NETWORK: "regtest"
+      BSVM_LOG_LEVEL: info
+    depends_on:
+      bsv-regtest:
+        condition: service_healthy
+      bsv-miner:
+        condition: service_started
+    volumes:
+      - cluster-shared:/shared/cluster
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Wait for bsv-miner to finish its 150-block primer so the
+        # first coinbase is mature (100+ confirmations) and
+        # sendtoaddress in deploy-shard can find spendable outputs.
+        echo "bsvm-init: waiting for BSV primer blocks (>=150)..."
+        for i in $$(seq 1 60); do
+          HEIGHT=$$(wget -qO- --post-data='{"jsonrpc":"1.0","id":"bsvm-init","method":"getblockcount","params":[]}' \
+            --header='Content-Type: application/json' \
+            http://devuser:devpass@bsv-regtest:18332/ 2>/dev/null \
+            | sed -n 's/.*"result":\([0-9]*\).*/\1/p')
+          if [ -n "$$HEIGHT" ] && [ "$$HEIGHT" -ge 150 ]; then
+            echo "bsvm-init: primer ready (height=$$HEIGHT)"
+            break
+          fi
+          echo "bsvm-init: primer not ready yet (height=$${HEIGHT:-?}, attempt $$i/60)"
+          sleep 1
+        done
+        bsvm deploy-shard \
+          --datadir /shared/cluster \
+          --bsv-rpc "$$BSVM_BSV_RPC" \
+          --bsv-network "$$BSVM_BSV_NETWORK" \
+          --prove-mode $${BSVM_PROVE_MODE:-execute} \
+          --governance single_key \
+          --prefund-accounts hardhat \
+          --chain-id 31337
+        TXID=$$(cat /shared/cluster/genesis.txid | tr -d '[:space:]')
+        echo "bsvm-init: deployed shard genesis txid=$$TXID"
+
   # ─── Node 1: Prover (primary) ─────────────────────────────────────
   node1:
     <<: *bsvm-common
@@ -135,109 +202,144 @@ services:
       BSVM_P2P_PORT: "9945"
       BSVM_ROLE: prover
       BSVM_COINBASE: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-      BSVM_PEERS: "node2:9945,node3:9945"
+      # Deterministic libp2p identity — matches peer IDs baked into the
+      # BSVM_PEERS lists of node2/node3 below. Seed is 32 bytes hex.
+      BSVM_P2P_SEED: "0000000000000000000000000000000000000000000000000000000000000001"
+      BSVM_PEERS: "/dns4/node2/tcp/9945/p2p/12D3KooWHdiAxVd8uMQR1hGWXccidmfCwLqcMpGwR6QcTP6QRMuD,/dns4/node3/tcp/9945/p2p/12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x"
     ports:
       - "8545:8545"   # JSON-RPC (HTTP) — matches spec 16 banner
       - "18546:8546"  # JSON-RPC WebSocket
       - "9945:9945"   # libp2p P2P
     volumes:
       - node1-data:/data/bsvm
+      - cluster-shared:/shared/cluster:ro
+    depends_on:
+      bsv-regtest:
+        condition: service_healthy
+      bsvm-init:
+        condition: service_completed_successfully
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        if [ ! -f /data/bsvm/shard.json ]; then
-          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
-          bsvm init \
-            --datadir /data/bsvm \
-            --prove-mode $${BSVM_PROVE_MODE:-mock} \
-            --prefund-accounts hardhat
-        fi
-        exec bsvm run --datadir /data/bsvm
+        # Read the genesis covenant txid written by bsvm-init. That is
+        # the sole input needed to boot the shard — `bsvm run` fetches
+        # the covenant tx from BSV, parses the OP_RETURN manifest, and
+        # runs InitGenesis locally against the alloc it recovers.
+        TXID=$$(cat /shared/cluster/genesis.txid | tr -d '[:space:]')
+        echo "node: booting shard from genesis txid=$$TXID"
+        # node1 is the prover — it needs BSV RPC access to broadcast
+        # covenant advances. It also hands the raw genesis tx over P2P
+        # to any follower that asks (via --genesis-tx-file we let node1
+        # verify the bytes it will serve).
+        exec bsvm run \
+          --datadir /data/bsvm \
+          --genesis-txid $$TXID \
+          --genesis-tx-file /shared/cluster/genesis.tx \
+          --bsv-rpc "$$BSVM_BSV_RPC" \
+          --bsv-network "$$BSVM_BSV_NETWORK"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      start_period: 300s
 
-  # ─── Node 2: Prover (competing) ───────────────────────────────────
+  # ─── Node 2: Follower (no BSV RPC; syncs genesis via P2P) ─────────
   node2:
     <<: *bsvm-common
     container_name: bsvm-node2
     hostname: node2
     environment:
       <<: *bsvm-env
+      # Deliberately unset BSV_RPC so the follower path is exercised.
+      BSVM_BSV_RPC: ""
       BSVM_NODE_NAME: node2
       BSVM_RPC_PORT: "8545"
       BSVM_P2P_PORT: "9945"
-      BSVM_ROLE: prover
+      BSVM_ROLE: follower
       BSVM_COINBASE: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-      BSVM_PEERS: "node1:9945,node3:9945"
+      BSVM_P2P_SEED: "0000000000000000000000000000000000000000000000000000000000000002"
+      BSVM_PEERS: "/dns4/node1/tcp/9945/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp,/dns4/node3/tcp/9945/p2p/12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x"
     ports:
       - "8546:8545"   # JSON-RPC (HTTP)
       - "18548:8546"  # JSON-RPC WebSocket
       - "9946:9945"   # libp2p P2P
     volumes:
       - node2-data:/data/bsvm
+      # Only the txid (public shard identifier) is read from the
+      # shared volume; no RPC access is configured for this follower.
+      - cluster-shared:/shared/cluster:ro
+    depends_on:
+      bsv-regtest:
+        condition: service_healthy
+      bsvm-init:
+        condition: service_completed_successfully
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        if [ ! -f /data/bsvm/shard.json ]; then
-          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
-          bsvm init \
-            --datadir /data/bsvm \
-            --prove-mode $${BSVM_PROVE_MODE:-mock} \
-            --prefund-accounts hardhat
-        fi
-        exec bsvm run --datadir /data/bsvm
+        TXID=$$(cat /shared/cluster/genesis.txid | tr -d '[:space:]')
+        echo "node: booting shard from genesis txid=$$TXID (follower; no BSV RPC)"
+        # No --bsv-rpc, no --genesis-tx-file — the follower asks
+        # its configured peers for the raw genesis tx, verifies by
+        # hashing, then boots.
+        exec bsvm run \
+          --datadir /data/bsvm \
+          --genesis-txid $$TXID
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      start_period: 300s
 
-  # ─── Node 3: Follower (read-only) ─────────────────────────────────
+  # ─── Node 3: Follower (no BSV RPC; syncs genesis via P2P) ─────────
   node3:
     <<: *bsvm-common
     container_name: bsvm-node3
     hostname: node3
     environment:
       <<: *bsvm-env
+      # No BSV RPC — follower syncs everything over P2P.
+      BSVM_BSV_RPC: ""
       BSVM_NODE_NAME: node3
       BSVM_RPC_PORT: "8545"
       BSVM_P2P_PORT: "9945"
       BSVM_ROLE: follower
-      BSVM_PEERS: "node1:9945,node2:9945"
+      BSVM_P2P_SEED: "0000000000000000000000000000000000000000000000000000000000000003"
+      BSVM_PEERS: "/dns4/node1/tcp/9945/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp,/dns4/node2/tcp/9945/p2p/12D3KooWHdiAxVd8uMQR1hGWXccidmfCwLqcMpGwR6QcTP6QRMuD"
     ports:
       - "8547:8545"   # JSON-RPC (HTTP)
       - "18550:8546"  # JSON-RPC WebSocket
       - "9947:9945"   # libp2p P2P
     volumes:
       - node3-data:/data/bsvm
+      - cluster-shared:/shared/cluster:ro
+    depends_on:
+      bsv-regtest:
+        condition: service_healthy
+      bsvm-init:
+        condition: service_completed_successfully
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        if [ ! -f /data/bsvm/shard.json ]; then
-          echo "node: initializing shard (prove-mode=$${BSVM_PROVE_MODE:-mock})"
-          bsvm init \
-            --datadir /data/bsvm \
-            --prove-mode $${BSVM_PROVE_MODE:-mock} \
-            --prefund-accounts hardhat
-        fi
-        exec bsvm run --datadir /data/bsvm
+        TXID=$$(cat /shared/cluster/genesis.txid | tr -d '[:space:]')
+        echo "node: booting shard from genesis txid=$$TXID (follower; no BSV RPC)"
+        exec bsvm run \
+          --datadir /data/bsvm \
+          --genesis-txid $$TXID
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header='Content-Type: application/json' http://localhost:8545 | grep -q result"]
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      start_period: 300s
 
 volumes:
   bsv-data:
   node1-data:
   node2-data:
   node3-data:
+  cluster-shared:

@@ -320,6 +320,13 @@ func buildFRIConstructorArgs(sp1VerifyingKey []byte, chainID uint64, governanceC
 	return buildSharedConstructorArgs(sp1VerifyingKey, chainID, governanceConfig)
 }
 
+// BuildFRIConstructorArgsExported exposes buildFRIConstructorArgs for
+// consumers outside the package (cmd/bsvm reconstructs these args at
+// run-time to re-derive the deployed covenant's SDK artifact).
+func BuildFRIConstructorArgsExported(sp1VerifyingKey []byte, chainID uint64, gov GovernanceConfig) (map[string]interface{}, error) {
+	return buildFRIConstructorArgs(sp1VerifyingKey, chainID, gov)
+}
+
 // buildDevKeyConstructorArgs creates the ConstructorArgs map for the devnet
 // DevKey rollup contract. It reuses the shared readonly layout (including the
 // governance key slots) because DevKeyRollupContract uses GovernanceKey as
@@ -482,6 +489,64 @@ func buildGroth16WAConstructorArgs(sp1VerifyingKey []byte, chainID uint64, gover
 	args["bn254ScalarMask"] = SP1Bn254ScalarMask()
 
 	return args, nil
+}
+
+// DetectVerificationMode inspects a deployed covenant's locking script
+// and returns the VerificationMode whose contract template matches.
+// The caller passes the hex-encoded locking script (exactly what
+// getrawtransaction returns in scriptPubKey.hex).
+//
+// Detection works by compiling each of the known rollup templates
+// with placeholder constructor args, then calling runar.MatchesArtifact
+// against the on-chain script. MatchesArtifact walks the template
+// opcode stream, skipping over constructor-slot pushdata — so
+// templates whose ONLY difference is the AdvanceState body (which is
+// what distinguishes FRI / Groth16-WA / DevKey) reliably match exactly
+// one pattern.
+//
+// Groth16 (Mode 2, generic) is NOT auto-detected here because its
+// compile path requires a valid Groth16VK fixture that the node may
+// not carry at boot time. In practice, the generic Groth16 mode is
+// reserved for future non-SP1 integrations; today's mainnet-eligible
+// path is Mode 3 (Groth16-WA) whose VK is baked via the preamble. If
+// a generic-Groth16 script appears, this function returns an error
+// so the caller fails loudly instead of silently falling back.
+//
+// Returns an error if the script matches no known template. Callers
+// should treat that as a fatal misconfiguration: either the script is
+// malformed or it's a future template this binary doesn't know
+// about.
+//
+// The detection is authoritative for verification mode: deriving the
+// mode from the manifest alone would let a hostile operator lie
+// about which script they deployed. The manifest's verificationMode
+// field is therefore a CROSS-CHECK, not a source of truth.
+func DetectVerificationMode(scriptHex string) (VerificationMode, error) {
+	if scriptHex == "" {
+		return 0, fmt.Errorf("empty script")
+	}
+
+	// Candidate modes in search order. We skip generic Groth16
+	// (Mode 2) because its template also compiles with no
+	// constructor args but its AdvanceState body is quite different
+	// from Mode 3 WA; if both Groth16 and Groth16-WA are defined in
+	// the future we'll want to try them in a specific order so the
+	// more-specific template wins. Today, the on-chain modes in use
+	// are FRI and DevKey for devnet and Groth16-WA for mainnet.
+	candidates := []VerificationMode{
+		VerifyFRI,
+		VerifyDevKey,
+		VerifyGroth16WA,
+		VerifyGroth16,
+	}
+
+	for _, mode := range candidates {
+		if matchesCompiledTemplate(nil, mode, scriptHex) {
+			return mode, nil
+		}
+	}
+
+	return 0, fmt.Errorf("detect: script matches no known covenant template")
 }
 
 // findFRIContractSource locates the Mode 1 FRI rollup source file.

@@ -1,89 +1,41 @@
 package contracts
 
 import (
-	"encoding/binary"
 	"testing"
-
-	runar "github.com/icellan/runar/packages/runar-go"
 )
 
 // F07 — spec-12 OP_RETURN data-output coverage for Mode 1 (trust-minimized
-// FRI bridge). Shares the magic + helpers defined in rollup_groth16_f07_test.go.
+// FRI bridge).
+//
+// These tests previously asserted that AdvanceState emits a BSVM\x02
+// OP_RETURN output carrying the raw batchData. That behaviour has been
+// withdrawn in the trust-minimized FRI bridge because the Rúnar Go SDK
+// does not yet honour `add_data_output` ANF bindings when assembling
+// the call transaction — `BuildCallTransaction` only emits the state
+// continuation and change outputs, so every compiled script that used
+// `AddDataOutput` for its continuation-hash check failed on-chain with
+// "Script evaluated without error but finished with a false/empty top
+// stack element". The covenant still binds the batchData via
+// `pvBatchDataHash == hash256(batchData)`, so the hash commitment is
+// preserved; only the raw-bytes DA channel has moved from BSV to P2P
+// gossip. When the SDK learns to walk a method's ANF for data outputs
+// and emit them between the contract continuation and the change
+// output, the F07 OP_RETURN contract-level guarantee (and these tests)
+// can be restored verbatim.
 
-func TestFRIRollup_F07_EmitsSpec12OpReturn(t *testing.T) {
+// TestFRIRollup_F07_NoOpReturn asserts the advance method records NO
+// data outputs on the contract instance. The companion Mode 2 / Mode 3
+// Groth16 variants keep the OP_RETURN envelope since they declare it
+// via AddDataOutput (but they're guarded by the same SDK limitation —
+// fixing either requires the runar-go tx builder to honour
+// add_data_output ANF bindings).
+func TestFRIRollup_F07_NoOpReturn(t *testing.T) {
 	c := newFRIRollup(zeros32(), 0, 0)
 	args := buildFRIArgs(zeros32(), 1)
 	callFRIAdvance(c, args)
 
-	got := extractDataOutputScript(t, c.DataOutputs())
-	want := expectedOpReturnScript([]byte(args.batchData))
-	if string(got) != string(want) {
-		t.Errorf("OP_RETURN script mismatch:\n  got  %x\n  want %x", got, want)
-	}
-}
-
-func TestFRIRollup_F07_MagicPrefix(t *testing.T) {
-	c := newFRIRollup(zeros32(), 0, 0)
-	args := buildFRIArgs(zeros32(), 1)
-	callFRIAdvance(c, args)
-
-	script := extractDataOutputScript(t, c.DataOutputs())
-	if len(script) < 3+4+5 {
-		t.Fatalf("script too short: %d bytes", len(script))
-	}
-	if script[0] != opReturnHdr0 || script[1] != opReturnHdr1 || script[2] != opReturnPushData {
-		t.Errorf("bad OP_FALSE OP_RETURN OP_PUSHDATA4 prefix: got %02x %02x %02x",
-			script[0], script[1], script[2])
-	}
-	magic := script[7 : 7+5]
-	if string(magic) != string(advanceMagic) {
-		t.Errorf("bad BSVM\\x02 magic at offset 7: got %x, want %x", magic, advanceMagic)
-	}
-}
-
-func TestFRIRollup_F07_LengthEncoding(t *testing.T) {
-	c := newFRIRollup(zeros32(), 0, 0)
-	args := buildFRIArgs(zeros32(), 1)
-	callFRIAdvance(c, args)
-
-	script := extractDataOutputScript(t, c.DataOutputs())
-	declaredLen := binary.LittleEndian.Uint32(script[3:7])
-	wantLen := uint32(len(advanceMagic) + len(args.batchData))
-	if declaredLen != wantLen {
-		t.Errorf("OP_PUSHDATA4 length: got %d, want %d", declaredLen, wantLen)
-	}
-}
-
-func TestFRIRollup_F07_BatchDataRoundTrip(t *testing.T) {
-	c := newFRIRollup(zeros32(), 0, 0)
-	args := buildFRIArgs(zeros32(), 1)
-	callFRIAdvance(c, args)
-
-	script := extractDataOutputScript(t, c.DataOutputs())
-	recovered := script[3+4+len(advanceMagic):]
-	if string(recovered) != string(args.batchData) {
-		t.Errorf("batchData not recoverable from OP_RETURN:\n  got  %x\n  want %x",
-			recovered, []byte(args.batchData))
-	}
-}
-
-func TestFRIRollup_F07_DifferentBatchesProduceDifferentScripts(t *testing.T) {
-	c1 := newFRIRollup(zeros32(), 0, 0)
-	args1 := buildFRIArgs(zeros32(), 1)
-	callFRIAdvance(c1, args1)
-	script1 := extractDataOutputScript(t, c1.DataOutputs())
-
-	c2 := newFRIRollup(zeros32(), 0, 0)
-	args2 := buildFRIArgs(zeros32(), 1)
-	altBatch := []byte(args2.batchData)
-	altBatch[0] ^= 0xFF
-	args2.batchData = runar.ByteString(altBatch)
-	pv := buildPublicValues(zeros32(), stateRootForBlock(1), string(altBatch), string(args2.proofBlob), chainId)
-	args2.publicValues = runar.ByteString(pv)
-	callFRIAdvance(c2, args2)
-	script2 := extractDataOutputScript(t, c2.DataOutputs())
-
-	if string(script1) == string(script2) {
-		t.Fatal("expected different OP_RETURN scripts for different batchData")
+	if got := len(c.DataOutputs()); got != 0 {
+		t.Errorf("Mode 1 FRI AdvanceState must NOT emit any data outputs "+
+			"(SDK limitation — see file header); got %d data outputs", got)
 	}
 }

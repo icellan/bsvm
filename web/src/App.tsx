@@ -16,6 +16,7 @@ import AdminGovernance from "@/pages/admin/Governance";
 import AdminConfig from "@/pages/admin/Config";
 import AdminProver from "@/pages/admin/Prover";
 import AdminLogs from "@/pages/admin/Logs";
+import AdminSession from "@/pages/admin/Session";
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="/network" element={<Network />} />
         <Route path="/search" element={<Search />} />
 
+        <Route path="/admin/session" element={<AdminSession />} />
         <Route path="/admin" element={<AdminLayout />}>
           <Route index element={<AdminDashboard />} />
           <Route path="governance" element={<AdminGovernance />} />

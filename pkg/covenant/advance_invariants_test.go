@@ -283,12 +283,21 @@ func TestAdvance_SingleOpPushTxBinding(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestAdvance_SingleDataOutput pins the F07 data-availability invariant:
-// every rollup's advanceState emits exactly one add_data_output binding,
-// which is the BSVM\x02 || batchData OP_RETURN. The continuation-hash
-// check (TestAdvance_SingleOpPushTxBinding) cryptographically requires
-// the on-chain tx to carry this output verbatim. Zero add_data_outputs
-// would mean batchData is not on-chain; more than one would mean an
-// extra data output is bound into the tx shape without a reason.
+// Mode 2 / Mode 3 rollup advanceState methods emit exactly one
+// add_data_output binding, which is the BSVM\x02 || batchData OP_RETURN.
+// The continuation-hash check (TestAdvance_SingleOpPushTxBinding)
+// cryptographically requires the on-chain tx to carry this output
+// verbatim. Zero add_data_outputs would mean batchData is not on-chain;
+// more than one would mean an extra data output is bound into the tx
+// shape without a reason.
+//
+// Mode 1 FRI is exempt: the runar-go SDK's tx builder does not (yet)
+// honour `add_data_output` ANF bindings, so compiling a FRI covenant
+// that emits an OP_RETURN output makes every advance fail on-chain
+// (hashOutputs in the preimage disagrees with the in-script
+// computation). The FRI contract commits to batchDataHash only until
+// the SDK catches up; see rollup_fri.runar.go AdvanceState docstring
+// for the restoration path.
 func TestAdvance_SingleDataOutput(t *testing.T) {
 	for _, fx := range buildRollupFixtures(t) {
 		t.Run(fx.Name, func(t *testing.T) {
@@ -296,8 +305,13 @@ func TestAdvance_SingleDataOutput(t *testing.T) {
 			if adv == nil {
 				t.Fatal("advanceState method missing from compiled ANF")
 			}
-			if adv.AddDataOutput != 1 {
-				t.Errorf("advanceState must contain exactly 1 add_data_output binding, got %d", adv.AddDataOutput)
+			wantDataOutputs := 1
+			if fx.Name == "fri" {
+				wantDataOutputs = 0
+			}
+			if adv.AddDataOutput != wantDataOutputs {
+				t.Errorf("advanceState must contain exactly %d add_data_output binding(s), got %d",
+					wantDataOutputs, adv.AddDataOutput)
 			}
 		})
 	}

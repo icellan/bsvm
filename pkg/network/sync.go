@@ -68,12 +68,17 @@ func (s *SyncManager) SyncWithPeer(ctx context.Context, peerID peer.ID) error {
 
 		batchData, err := s.gossip.RequestBatch(peerID, blockNum)
 		if err != nil {
-			s.peers.AdjustScore(peerID, -10)
+			// Transport / timeout failures are not the peer's fault —
+			// transient conn drops or our own stream plumbing can cause
+			// these. Don't dock score; the peer stays connected for
+			// the next sync tick.
 			return fmt.Errorf("failed to fetch batch for block %d from peer %s: %w",
 				blockNum, peerID, err)
 		}
 
 		if len(batchData) == 0 {
+			// Empty batch *is* a protocol violation — the peer claimed
+			// to have the block and returned nothing.
 			s.peers.AdjustScore(peerID, -5)
 			return fmt.Errorf("empty batch data for block %d from peer %s",
 				blockNum, peerID)
@@ -85,9 +90,13 @@ func (s *SyncManager) SyncWithPeer(ctx context.Context, peerID peer.ID) error {
 			"size", len(batchData),
 		)
 
-		// Replay the batch through the overlay node.
+		// Replay the batch through the overlay node. A replay failure
+		// can be caused by local state issues (divergent parent, stale
+		// trie) as easily as by a bad batch, so we don't penalise the
+		// peer here — the node will retry on the next sync tick. If
+		// the peer is persistently sending garbage, the gossip decode
+		// path docks score separately.
 		if err := s.overlay.ReplayBatchData(batchData); err != nil {
-			s.peers.AdjustScore(peerID, -5)
 			return fmt.Errorf("failed to replay batch for block %d: %w",
 				blockNum, err)
 		}

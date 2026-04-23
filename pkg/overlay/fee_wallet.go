@@ -205,6 +205,30 @@ func (fw *FeeWallet) UTXOCount() int {
 	return len(fw.utxos)
 }
 
+// UTXOs returns a defensive copy of every UTXO currently tracked by
+// the wallet. The returned slice may be iterated freely without
+// holding the wallet lock — subsequent AddUTXO / RemoveUTXO calls will
+// not mutate the returned entries, only the wallet's internal map.
+//
+// Used by the fee-wallet reconciler to diff the wallet's view against
+// the BSV node's listunspent view without blocking broadcast paths
+// that need to call SelectUTXOs concurrently.
+func (fw *FeeWallet) UTXOs() []*FeeUTXO {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+
+	out := make([]*FeeUTXO, 0, len(fw.utxos))
+	for _, u := range fw.utxos {
+		// Shallow-copy the struct so the caller can't mutate the
+		// wallet's internal state by writing through the returned
+		// pointer. ScriptPubKey is still the same backing slice but we
+		// treat it as immutable everywhere.
+		cp := *u
+		out = append(out, &cp)
+	}
+	return out
+}
+
 // NeedsConsolidation returns true if the wallet has too many small UTXOs
 // and should consolidate them into fewer larger ones.
 func (fw *FeeWallet) NeedsConsolidation() bool {

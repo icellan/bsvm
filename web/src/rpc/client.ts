@@ -131,6 +131,47 @@ export const bsv = {
     call<ConfirmationStatus>("bsv_getConfirmationStatus", [
       typeof blockNum === "number" ? `0x${blockNum.toString(16)}` : blockNum,
     ]),
+  indexerStatus: () => call<IndexerStatus>("bsv_indexerStatus"),
+  getPeers: () => call<PeerEntry[]>("bsv_getPeers"),
+  getAddressTxs: (
+    address: string,
+    opts?: { fromBlock?: number; toBlock?: number; limit?: number },
+  ) => {
+    const params: unknown[] = [address];
+    if (opts) {
+      const o: Record<string, string> = {};
+      if (opts.fromBlock !== undefined) o.fromBlock = `0x${opts.fromBlock.toString(16)}`;
+      if (opts.toBlock !== undefined) o.toBlock = `0x${opts.toBlock.toString(16)}`;
+      if (opts.limit !== undefined) o.limit = `0x${opts.limit.toString(16)}`;
+      params.push(o);
+    }
+    return call<AddressTxEntry[]>("bsv_getAddressTxs", params);
+  },
+};
+
+export type IndexerStatus = {
+  enabled: boolean;
+  lastBlock?: HexString;
+  ingested?: HexString;
+  dropped?: HexString;
+};
+
+export type PeerEntry = {
+  id: string;
+  addrs: string[];
+  chainTip: HexString;
+  lastSeen: HexString;
+  score: number;
+  direction: "inbound" | "outbound" | "";
+};
+
+export type AddressTxEntry = {
+  txHash: HexString;
+  blockNumber: HexString;
+  transactionIndex: HexString;
+  direction: "from" | "to" | "create";
+  status: HexString;
+  otherParty?: string;
 };
 
 // Admin namespace — every call routes through /admin/rpc and

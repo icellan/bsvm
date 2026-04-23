@@ -27,8 +27,18 @@ export default function Search() {
   }, [q, navigate]);
 
   return (
-    <div className="mx-auto max-w-lg text-sm text-muted">
-      <p>Could not classify "{q}". Expected a block number, tx hash (0x + 64 hex), or address (0x + 40 hex).</p>
+    <div
+      className="mono"
+      style={{
+        fontSize: 11,
+        color: "var(--ts-text-3)",
+        padding: 14,
+        maxWidth: 560,
+      }}
+    >
+      Could not classify{" "}
+      <span style={{ color: "var(--ts-accent)" }}>&quot;{q}&quot;</span>.
+      Expected a block number, tx hash (0x + 64 hex), or address (0x + 40 hex).
     </div>
   );
 }

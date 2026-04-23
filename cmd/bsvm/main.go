@@ -25,6 +25,7 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/bsvclient"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/governance"
 	"github.com/icellan/bsvm/pkg/indexer"
@@ -65,11 +66,58 @@ func main() {
 				Action: cmdInit,
 			},
 			{
+				Name:  "init-cluster",
+				Usage: "[DEPRECATED — use deploy-shard] Deploy the rollup covenant to BSV and write a shared shard.json for a multi-node cluster",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "datadir", Value: "/shared/cluster", Usage: "shared directory for the cluster shard config"},
+					&cli.StringFlag{Name: "bsv-rpc", Usage: "BSV JSON-RPC endpoint (user:pass@host:port). Defaults to $BSVM_BSV_RPC"},
+					&cli.StringFlag{Name: "bsv-network", Value: "regtest", Usage: "BSV network: regtest|testnet|mainnet"},
+					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "cluster proof mode: execute (FRI) or prove (groth16-wa)"},
+					&cli.Int64Flag{Name: "chain-id", Value: 31337, Usage: "EVM chain id"},
+					&cli.StringFlag{Name: "prefund-accounts", Value: "hardhat", Usage: "genesis prefund: hardhat|none"},
+				},
+				Action: cmdInitCluster,
+			},
+			{
+				Name:  "deploy-shard",
+				Usage: "Deploy the rollup covenant + genesis manifest to BSV in a single transaction; prints the genesis txid",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "data directory to write genesis.txid + covenant.anf.json into"},
+					&cli.StringFlag{Name: "bsv-rpc", Usage: "BSV JSON-RPC endpoint (user:pass@host:port). Defaults to $BSVM_BSV_RPC"},
+					&cli.StringFlag{Name: "bsv-network", Value: "regtest", Usage: "BSV network: regtest|testnet|mainnet"},
+					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "proof mode: execute (FRI), prove (Groth16-WA), or mock (devkey)"},
+					&cli.StringFlag{Name: "verification", Usage: "verification mode override: fri|groth16|groth16-wa|devkey"},
+					&cli.StringFlag{Name: "governance", Value: "single_key", Usage: "governance mode: none|single_key|multisig"},
+					&cli.Int64Flag{Name: "chain-id", Value: 31337, Usage: "EVM chain id"},
+					&cli.Uint64Flag{Name: "gas-limit", Value: 0, Usage: "genesis block gas limit (default 30_000_000)"},
+					&cli.StringFlag{Name: "prefund-accounts", Value: "hardhat", Usage: "genesis prefund: hardhat|none"},
+					&cli.StringFlag{Name: "alloc-file", Usage: "optional JSON file with extra alloc entries (address → balance)"},
+				},
+				Action: cmdDeployShard,
+			},
+			{
+				Name:  "init-local",
+				Usage: "Initialize a node-local DB from a shared cluster shard.json (copies state, does not touch BSV)",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "shared-config", Required: true, Usage: "path to the shared shard.json produced by init-cluster"},
+					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "local per-node data directory"},
+				},
+				Action: cmdInitLocal,
+			},
+			{
 				Name:  "run",
 				Usage: "Start the L2 node",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "config", Value: "", Usage: "path to node config file (TOML)"},
-					&cli.StringFlag{Name: "shard-config", Value: "", Usage: "path to shard config file (default: <datadir>/shard.json)"},
+					&cli.StringFlag{Name: "shard-config", Value: "", Usage: "path to shard config file (default: <datadir>/shard.json; ignored when --genesis-txid is set)"},
+					&cli.StringFlag{Name: "genesis-txid", Usage: "Genesis covenant txid to derive shard config from. When set, the shard is bootstrapped entirely from BSV (covenant script + OP_RETURN manifest); no shard.json is required. Also honours $BSVM_GENESIS_TXID."},
+					&cli.StringFlag{
+						Name:    "genesis-tx-file",
+						Usage:   "path to a file containing the raw genesis tx hex (alternative to --bsv-rpc for bootstrap — the node hashes the file and verifies against --genesis-txid)",
+						EnvVars: []string{"BSVM_GENESIS_TX_FILE"},
+					},
+					&cli.StringFlag{Name: "bsv-rpc", Usage: "BSV JSON-RPC endpoint. Required with --genesis-txid when --genesis-tx-file is not set (and the node has no cached genesis and cannot sync via P2P). Defaults to $BSVM_BSV_RPC"},
+					&cli.StringFlag{Name: "bsv-network", Value: "", Usage: "BSV network: regtest|testnet|mainnet. Defaults to $BSVM_BSV_NETWORK or regtest"},
 					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "path to data directory"},
 					&cli.StringFlag{Name: "rpc-addr", Value: "", Usage: "JSON-RPC listen address (overrides config)"},
 				},
@@ -89,6 +137,12 @@ func main() {
 				Name:   "version",
 				Usage:  "Print version information",
 				Action: cmdVersion,
+			},
+			{
+				Name:      "peer-id",
+				Usage:     "Print the libp2p peer ID for a hex-encoded 32-byte identity seed",
+				ArgsUsage: "<64-char-hex-seed>",
+				Action:    cmdPeerID,
 			},
 			devCommand(),
 			adminCommand(),
@@ -126,9 +180,26 @@ func cmdInit(ctx *cli.Context) error {
 	switch proveMode {
 	case "":
 		// No prove-mode — use explicit flags.
-	case "mock", "execute":
+	case "mock":
+		// Mock: devkey covenant, no broadcast — for fast unit-style dev
+		// where BSV network access isn't wanted.
 		if verification == "" {
 			verification = "devkey"
+		}
+		if governanceMode == "" {
+			governanceMode = "single_key"
+		}
+		if chainID == 0 {
+			chainID = 31337
+		}
+	case "execute":
+		// Execute: FRI covenant, broadcasts to BSV. The FRI contract has
+		// no advance-time signature check, so all 3 devnet nodes can race
+		// to submit advances and BSV decides the winner — which is what
+		// the spec-16 multi-prover demo requires. Governance still
+		// defaults to single_key so the freeze backstop works.
+		if verification == "" {
+			verification = "fri"
 		}
 		if governanceMode == "" {
 			governanceMode = "single_key"
@@ -282,11 +353,33 @@ func cmdInit(ctx *cli.Context) error {
 // cmdRun handles the "bsvm run" subcommand. It loads the shard config,
 // opens the database, creates all node components, starts services, and
 // waits for a shutdown signal.
+//
+// The boot path is selected by whichever of the two inputs is present:
+//
+//   - --genesis-txid (or $BSVM_GENESIS_TXID): the Phase 8 path. Fetches
+//     the genesis covenant tx from BSV, derives every config dimension
+//     from vout 0 (covenant script) + vout 1 (OP_RETURN manifest), and
+//     runs InitGenesis locally so the node's state root matches what the
+//     covenant binds. No shard.json is needed.
+//
+//   - --shard-config / <datadir>/shard.json (legacy): loads an
+//     out-of-band shard.json — the pre-Phase-8 workflow. Kept for
+//     backward compatibility with init-cluster / init-local.
+//
+// If both are set, --genesis-txid wins. If neither is set, the legacy
+// path is taken (falling back to <datadir>/shard.json).
 func cmdRun(ctx *cli.Context) error {
 	configPath := ctx.String("config")
 	shardConfigPath := ctx.String("shard-config")
 	dataDir := ctx.String("datadir")
 	rpcAddr := ctx.String("rpc-addr")
+	genesisTxID := strings.TrimSpace(ctx.String("genesis-txid"))
+	if genesisTxID == "" {
+		genesisTxID = strings.TrimSpace(os.Getenv("BSVM_GENESIS_TXID"))
+	}
+	// Strip optional 0x prefix so operators can paste either form.
+	genesisTxID = strings.TrimPrefix(genesisTxID, "0x")
+	genesisTxFile := strings.TrimSpace(ctx.String("genesis-tx-file"))
 
 	// 1. Load node config.
 	var nodeCfg *NodeConfig
@@ -306,6 +399,15 @@ func cmdRun(ctx *cli.Context) error {
 	// values (ports, peers, role, coinbase) via env.
 	if err := ApplyEnvOverrides(nodeCfg); err != nil {
 		return fmt.Errorf("applying env overrides: %w", err)
+	}
+
+	// CLI-flag overrides for BSV connection (used by the
+	// genesis-txid boot path and, when set, any later BSV work).
+	if v := strings.TrimSpace(ctx.String("bsv-rpc")); v != "" {
+		nodeCfg.BSV.NodeURL = v
+	}
+	if v := strings.TrimSpace(ctx.String("bsv-network")); v != "" {
+		nodeCfg.BSV.Network = v
 	}
 
 	// Override from flags.
@@ -355,31 +457,78 @@ func cmdRun(ctx *cli.Context) error {
 		}
 	}()
 
-	// 2. Load shard config.
-	shardCfgPath := shardConfigPath
-	if shardCfgPath == "" {
-		shardCfgPath = filepath.Join(nodeCfg.DataDir, "shard.json")
-	}
-
-	joinResult, err := shard.JoinShard(shardCfgPath, nodeCfg.DataDir)
-	if err != nil {
-		return fmt.Errorf("failed to join shard: %w", err)
+	// 2. Boot — select Phase 8 derivation path or legacy shard.json.
+	var (
+		boot        *bootResult
+		bsvProvider *bsvclient.RPCProvider
+	)
+	if genesisTxID != "" {
+		// Phase 8/9: derive everything from the genesis covenant tx.
+		// A follower without BSV RPC access still works so long as
+		// one of the fallback sources (file / cache / P2P) supplies
+		// the raw tx bytes.
+		bsvNet := nodeCfg.BSV.Network
+		if bsvNet == "" {
+			bsvNet = "regtest"
+		}
+		bootOpts := bootGenesisOpts{
+			TxFilePath: genesisTxFile,
+		}
+		// Only build an RPC provider when the node config has one.
+		// Followers run without BSV.NodeURL and don't need it.
+		if nodeCfg.BSV.NodeURL != "" {
+			provider, provErr := bsvclient.NewRPCProvider(nodeCfg.BSV.NodeURL, bsvNet)
+			if provErr != nil {
+				return fmt.Errorf("build BSV RPC provider: %w", provErr)
+			}
+			bsvProvider = provider
+			bootOpts.Provider = provider
+		}
+		// P2P fallback: if we have neither a file nor an RPC
+		// provider, dial the configured bootstrap peers on the
+		// chain-agnostic genesis-sync protocol and ask for the
+		// raw tx. A temporary libp2p host is spun up for the
+		// duration of the fetch, then shut down — the main gossip
+		// manager (chain-scoped) starts fresh once the shard is
+		// derived.
+		needP2P := bootOpts.TxFilePath == "" && bootOpts.Provider == nil
+		if needP2P {
+			peerSync, cleanup, perr := bootstrapPeerSync(nodeCfg, genesisTxID)
+			if perr != nil {
+				return fmt.Errorf("bootstrap peer sync: %w", perr)
+			}
+			defer cleanup()
+			bootOpts.PeerSync = peerSync
+		}
+		boot, err = bootFromGenesisTxID(ctx.Context, genesisTxID, nodeCfg.DataDir, 0, bootOpts)
+		if err != nil {
+			return fmt.Errorf("boot from genesis txid: %w", err)
+		}
+	} else {
+		// Legacy path: load shard.json.
+		shardCfgPath := shardConfigPath
+		if shardCfgPath == "" {
+			shardCfgPath = filepath.Join(nodeCfg.DataDir, "shard.json")
+		}
+		boot, err = bootFromShardConfig(shardCfgPath, nodeCfg.DataDir)
+		if err != nil {
+			return fmt.Errorf("failed to join shard: %w", err)
+		}
 	}
 	// Ensure DB is closed on all exit paths.
-	defer joinResult.DB.Close()
+	defer boot.DB.Close()
 
-	shardCfg := joinResult.Config
-	chainID := shardCfg.ChainID
-
+	chainID := boot.ChainID
 	slog.Info("shard loaded",
 		"chainID", chainID,
-		"synced", joinResult.Synced,
+		"txid", boot.GenesisCovenantTxID.Hex(),
+		"verification", boot.Verification.String(),
+		"synced", boot.Synced,
 	)
 
 	// 3. Create covenant manager.
-	genesisTxID := types.HexToHash(shardCfg.GenesisCovenantTxID)
 	initialState := covenant.CovenantState{
-		StateRoot: types.HexToHash(shardCfg.GenesisStateRoot),
+		StateRoot: boot.GenesisStateRoot,
 	}
 
 	// Load compiled covenant (may be nil if covenant ANF is not available).
@@ -389,23 +538,13 @@ func cmdRun(ctx *cli.Context) error {
 		compiledCov = &covenant.CompiledCovenant{}
 	}
 
-	var verifyMode covenant.VerificationMode
-	switch shardCfg.VerificationMode {
-	case "fri":
-		verifyMode = covenant.VerifyFRI
-	case "groth16-wa":
-		verifyMode = covenant.VerifyGroth16WA
-	case "devkey":
-		verifyMode = covenant.VerifyDevKey
-	default:
-		verifyMode = covenant.VerifyGroth16
-	}
+	verifyMode := boot.Verification
 
 	covenantMgr := covenant.NewCovenantManager(
 		compiledCov,
-		genesisTxID,
-		shardCfg.GenesisCovenantVout,
-		shardCfg.CovenantSats,
+		boot.GenesisCovenantTxID,
+		boot.GenesisCovenantVout,
+		boot.CovenantSats,
 		initialState,
 		uint64(chainID),
 		verifyMode,
@@ -426,8 +565,8 @@ func cmdRun(ctx *cli.Context) error {
 	overlayCfg.ProveMode = proveMode
 	overlayNode, err := overlay.NewOverlayNodeWithObservability(
 		overlayCfg,
-		joinResult.ChainDB,
-		joinResult.DB,
+		boot.ChainDB,
+		boot.DB,
 		covenantMgr,
 		sp1Prover,
 		metricsRegistry,
@@ -437,12 +576,42 @@ func cmdRun(ctx *cli.Context) error {
 	}
 
 	// 5.5: Sync from BSV covenant chain if not fully synced.
-	if !joinResult.Synced {
+	if !boot.Synced {
 		if nodeCfg.BSV.NodeURL != "" {
 			slog.Info("BSV sync not yet available, will sync via P2P gossip",
 				"bsv_node_url", nodeCfg.BSV.NodeURL)
 		} else {
 			slog.Info("BSV client not configured, will sync via P2P gossip")
+		}
+	}
+
+	// 5.9: BSV covenant broadcast wiring. Only when the operator wants
+	// real BSV settlement (prove modes execute/prove) AND a BSV RPC
+	// endpoint is configured AND this node isn't explicitly configured
+	// as a follower. Followers skip the entire BSV-broadcast stack —
+	// no fee wallet, no RPC provider usage, no covenant broadcast
+	// client, no fee-wallet reconciler — so the only BSV access we
+	// require is the prover node's. Mock mode (no BSV settlement) and
+	// bare-metal runs without BSV.NodeURL fall through to the existing
+	// no-broadcast path where receipts are purely speculative.
+	role := NodeRoleFromEnv()
+	if role == "follower" {
+		slog.Info("node role=follower — skipping BSV broadcast wiring; syncing via P2P only")
+	}
+	if role != "follower" && (proveMode == "execute" || proveMode == "prove") && nodeCfg.BSV.NodeURL != "" {
+		if err := wireBSVBroadcast(ctx.Context, bsvWireOpts{
+			NodeCfg:     nodeCfg,
+			ShardCfg:    boot.LegacyShardConfig,
+			DerivedBoot: boot,
+			ChainID:     chainID,
+			ProveMode:   proveMode,
+			DataDir:     nodeCfg.DataDir,
+			DB:          boot.DB,
+			OverlayNode: overlayNode,
+			CovenantMgr: covenantMgr,
+			Provider:    bsvProvider,
+		}); err != nil {
+			return fmt.Errorf("BSV broadcast wiring failed: %w", err)
 		}
 	}
 
@@ -478,10 +647,10 @@ func cmdRun(ctx *cli.Context) error {
 	rpcCfg := nodeCfg.ToRPCConfig()
 	rpcServer := rpc.NewRPCServerWithConfig(
 		rpcCfg,
-		joinResult.ChainConfig,
+		boot.ChainConfig,
 		overlayNode,
-		joinResult.ChainDB,
-		joinResult.DB,
+		boot.ChainDB,
+		boot.DB,
 	)
 	// Attach the Prometheus registry so `/metrics` becomes scrapable
 	// alongside the JSON-RPC endpoint.
@@ -506,10 +675,10 @@ func cmdRun(ctx *cli.Context) error {
 		// which are already unsafe for mainnet.
 		devSecret = "devnet-secret-do-not-use-in-production"
 	}
-	// Build a governance-key checker from the shard config — wallets
-	// may only authenticate under keys that the shard genesis listed
-	// as governance-authorised.
-	govConfig, _ := shardCfg.GovernanceConfig()
+	// Build a governance-key checker from the boot's governance
+	// config — wallets may only authenticate under keys that the
+	// shard genesis listed as governance-authorised.
+	govConfig := boot.Governance
 	govKeyChecker := &shardGovernanceChecker{keys: govConfig.Keys}
 
 	// Persistent server identity lives inside the node's data dir so
@@ -548,10 +717,22 @@ func cmdRun(ctx *cli.Context) error {
 	// broadcasts new blocks to peers for sync.
 	overlayNode.SetBlockAnnouncer(gossipMgr)
 
+	// Register the raw genesis tx we booted from so peers that are
+	// still trying to bootstrap (followers without BSV RPC) can
+	// request it from us on the chain-agnostic genesis-sync protocol.
+	if boot.GenesisRawTxHex != "" {
+		gossipMgr.SetLocalGenesis(strings.TrimPrefix(boot.GenesisCovenantTxID.Hex(), "0x"), boot.GenesisRawTxHex)
+	}
+
 	// 7.1 Create and register the sync manager. This registers handlers for
 	// MsgBlockAnnounce, MsgCovenantAdvance, MsgHeartbeat, and MsgTxGossip
 	// so the node can sync state from peers.
 	network.NewSyncManager(overlayNode, gossipMgr, gossipMgr.Peers()).RegisterHandlers()
+
+	// Expose the P2P peer set through the bsv_* namespace so the
+	// explorer's Network page can render a live peers table.
+	rpcServer.BsvAPI().SetPeerSource(&peerSourceAdapter{mgr: gossipMgr.Peers()})
+	rpcServer.NetAPI().SetPeerCounter(gossipMgr.Peers())
 
 	// 7.5 Wire the governance proposal workflow (spec 15 A4). Uses a
 	// content-addressed in-memory store backed by libp2p gossip so
@@ -722,6 +903,26 @@ func cmdRecover(ctx *cli.Context) error {
 }
 
 // cmdVersion prints version information.
+// cmdPeerID prints the libp2p peer ID derived from a 32-byte seed. Used
+// to pre-compute peer IDs for docker-compose / devnet bootstrap lists
+// so every node has a deterministic, known peer ID.
+func cmdPeerID(ctx *cli.Context) error {
+	if ctx.NArg() != 1 {
+		return fmt.Errorf("peer-id: expected exactly one argument (hex seed)")
+	}
+	seedHex := strings.TrimPrefix(ctx.Args().Get(0), "0x")
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil {
+		return fmt.Errorf("peer-id: decode hex seed: %w", err)
+	}
+	pid, err := network.DerivePeerID(seed)
+	if err != nil {
+		return fmt.Errorf("peer-id: derive: %w", err)
+	}
+	fmt.Println(pid.String())
+	return nil
+}
+
 func cmdVersion(ctx *cli.Context) error {
 	fmt.Printf("bsvm version %s\n", version)
 	return nil
@@ -792,6 +993,32 @@ func makeProposalVerifier(govKeys [][]byte) governance.SigVerifier {
 	}
 }
 
+// peerSourceAdapter bridges network.PeerManager to rpc.PeerSource so
+// BsvAPI can render the peers table without importing the network
+// package (and its libp2p transitive deps). The conversion flattens
+// network.PeerSnapshot fields into rpc.PeerSnapshot.
+type peerSourceAdapter struct {
+	mgr *network.PeerManager
+}
+
+func (a *peerSourceAdapter) PeerCount() int { return a.mgr.PeerCount() }
+
+func (a *peerSourceAdapter) Snapshot() []rpc.PeerSnapshot {
+	src := a.mgr.Snapshot()
+	out := make([]rpc.PeerSnapshot, 0, len(src))
+	for _, s := range src {
+		out = append(out, rpc.PeerSnapshot{
+			ID:        s.ID,
+			Addrs:     s.Addrs,
+			ChainTip:  s.ChainTip,
+			LastSeenS: s.LastSeen.Unix(),
+			Score:     s.Score,
+			Direction: s.Direction,
+		})
+	}
+	return out
+}
+
 // shardGovernanceChecker is the minimal implementation of
 // auth.GovernanceKeyChecker backed by the shard config's
 // governance-key list. Accepts any compressed secp256k1 key that
@@ -825,6 +1052,55 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// bootstrapPeerSync spins up a temporary libp2p host dedicated to the
+// chain-agnostic genesis-sync protocol, dials the configured bootstrap
+// peers, and returns a closure that requests the raw genesis tx from
+// any peer that answers. The closure and a cleanup function are
+// returned so the caller can defer tear-down to the end of cmdRun.
+//
+// This is how follower nodes (no BSV RPC) learn the raw bytes: they
+// know the expected txid (public shard identifier) and their
+// bootstrap peer list (docker-compose / operator config), and they
+// ask their peers for whatever they have. Hash verification happens
+// in the boot layer, not here.
+//
+// If the supplied bootstrap peer list is empty, the returned closure
+// returns an error immediately — there's nothing to sync from.
+func bootstrapPeerSync(nodeCfg *NodeConfig, expectedTxID string) (RawTxSource, func(), error) {
+	netCfg := nodeCfg.ToNetworkConfig(0)
+	if len(netCfg.BootstrapPeers) == 0 {
+		return nil, func() {}, fmt.Errorf("no bootstrap peers configured — set BSVM_PEERS or supply --bsv-rpc / --genesis-tx-file")
+	}
+	gm, err := network.NewBootstrapGenesisSyncer(netCfg)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("create bootstrap genesis syncer: %w", err)
+	}
+	// Start dials bootstrap peers asynchronously; the returned
+	// source closure polls for peers until at least one answers.
+	startCtx, startCancel := context.WithCancel(context.Background())
+	if err := gm.Start(startCtx); err != nil {
+		startCancel()
+		_ = gm.Stop()
+		return nil, func() {}, fmt.Errorf("start bootstrap genesis syncer: %w", err)
+	}
+	cleanup := func() {
+		startCancel()
+		_ = gm.Stop()
+	}
+	src := func(ctx context.Context) (string, error) {
+		slog.Info("genesis-sync: requesting from bootstrap peers",
+			"peers", len(netCfg.BootstrapPeers),
+			"expected_txid", expectedTxID,
+		)
+		// 60 s upper bound is generous enough for a slow devnet
+		// startup (Docker service start order can race); the
+		// helper inside gossipMgr returns as soon as any peer
+		// answers with a matching txid.
+		return gm.RequestGenesisFromPeers(ctx, expectedTxID, 60*time.Second)
+	}
+	return src, cleanup, nil
 }
 
 // splitAllocEntry splits "address=balance" on the first '='.

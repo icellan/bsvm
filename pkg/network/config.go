@@ -35,6 +35,14 @@ type Config struct {
 	// EnableMDNS enables mDNS-based peer discovery for local development.
 	// Default: true.
 	EnableMDNS bool
+
+	// IdentitySeed is a 32-byte seed used to deterministically derive the
+	// libp2p host's ed25519 identity key. When non-empty, the resulting
+	// peer ID is stable across restarts, so bootstrap lists configured
+	// with fixed `/p2p/<peer-id>` suffixes (typical devnet / multinode
+	// compose) can reliably dial this node. When empty, libp2p falls
+	// back to generating a fresh random identity at each startup.
+	IdentitySeed []byte
 }
 
 // DefaultConfig returns a Config with sensible defaults for production use.

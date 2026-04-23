@@ -14,6 +14,7 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/indexer"
 	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/rpc/auth"
@@ -53,6 +54,21 @@ type RPCServer struct {
 	registry    *metrics.Registry
 	authConfig  auth.Config
 	logStreamer *LogStreamer
+	indexer     IndexerReader
+}
+
+// IndexerReader is the read-side of pkg/indexer that bsv_getAddressTxs
+// depends on. Declared as an interface so tests can stub it without
+// spinning up a LevelDB.
+type IndexerReader interface {
+	LookupEntries(indexer.Query) ([]indexer.Entry, error)
+}
+
+// SetIndexer attaches an indexer provider. Must be called before
+// Start(). Passing nil disables the bsv_getAddressTxs RPC — callers
+// will receive "indexer disabled" errors.
+func (s *RPCServer) SetIndexer(idx IndexerReader) {
+	s.indexer = idx
 }
 
 // SetAdminAuth configures the auth layer that guards /admin/rpc. Must
@@ -566,6 +582,9 @@ func (s *RPCServer) dispatch(method string, params json.RawMessage) (interface{}
 	case "bsv_peerCount":
 		return s.bsvAPI.PeerCount(), nil
 
+	case "bsv_getPeers":
+		return s.bsvAPI.GetPeers(), nil
+
 	case "bsv_getCovenantTip":
 		return s.bsvAPI.GetCovenantTip(), nil
 
@@ -591,9 +610,141 @@ func (s *RPCServer) dispatch(method string, params json.RawMessage) (interface{}
 	case "bsv_provingStatus":
 		return s.bsvAPI.ProvingStatus(), nil
 
+	case "bsv_getAddressTxs":
+		return s.handleBsvGetAddressTxs(params)
+
+	case "bsv_indexerStatus":
+		return s.handleBsvIndexerStatus()
+
 	default:
 		return nil, newRPCError(errCodeMethodNotFound, fmt.Sprintf("method %q not found", method))
 	}
+}
+
+// handleBsvGetAddressTxs resolves `bsv_getAddressTxs(address, opts?)`.
+// opts is an optional object: {"fromBlock","toBlock","limit"} — all
+// numeric fields accept either decimal or 0x-prefixed hex. Returns
+// newest-first entries, capped by server-side limit.
+func (s *RPCServer) handleBsvGetAddressTxs(params json.RawMessage) (interface{}, error) {
+	if s.indexer == nil {
+		return nil, newRPCError(errCodeServerError,
+			"indexer disabled (set BSVM_INDEXER_ENABLED=true to enable)")
+	}
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, newRPCError(errCodeInvalidParams, "expected [address, opts?]")
+	}
+	addr, err := parseAddress(args[0])
+	if err != nil {
+		return nil, newRPCError(errCodeInvalidParams, "invalid address: "+err.Error())
+	}
+
+	q := indexer.Query{Address: addr, Limit: 50}
+	if len(args) > 1 && len(args[1]) > 0 && string(args[1]) != "null" {
+		var opts struct {
+			FromBlock json.RawMessage `json:"fromBlock"`
+			ToBlock   json.RawMessage `json:"toBlock"`
+			Limit     json.RawMessage `json:"limit"`
+		}
+		if err := json.Unmarshal(args[1], &opts); err != nil {
+			return nil, newRPCError(errCodeInvalidParams, "invalid opts: "+err.Error())
+		}
+		if len(opts.FromBlock) > 0 {
+			n, err := parseNumberFlexible(opts.FromBlock)
+			if err != nil {
+				return nil, newRPCError(errCodeInvalidParams, "fromBlock: "+err.Error())
+			}
+			q.FromBlock = n
+		}
+		if len(opts.ToBlock) > 0 {
+			n, err := parseNumberFlexible(opts.ToBlock)
+			if err != nil {
+				return nil, newRPCError(errCodeInvalidParams, "toBlock: "+err.Error())
+			}
+			q.ToBlock = n
+		}
+		if len(opts.Limit) > 0 {
+			n, err := parseNumberFlexible(opts.Limit)
+			if err != nil {
+				return nil, newRPCError(errCodeInvalidParams, "limit: "+err.Error())
+			}
+			q.Limit = int(n)
+		}
+	}
+
+	entries, err := s.indexer.LookupEntries(q)
+	if err != nil {
+		return nil, newRPCError(errCodeInternal, "indexer lookup: "+err.Error())
+	}
+
+	// Shape the response for JSON — hex-encode numbers to stay
+	// consistent with every other bsv_* method.
+	out := make([]map[string]any, len(entries))
+	for i, e := range entries {
+		row := map[string]any{
+			"txHash":           e.TxHash.Hex(),
+			"blockNumber":      fmt.Sprintf("0x%x", e.BlockNumber),
+			"transactionIndex": fmt.Sprintf("0x%x", e.TxIndex),
+			"direction":        string(e.Direction),
+			"status":           fmt.Sprintf("0x%x", e.Status),
+		}
+		if e.Other != nil {
+			row["otherParty"] = e.Other.Hex()
+		}
+		out[i] = row
+	}
+	return out, nil
+}
+
+// handleBsvIndexerStatus reports indexer enabled/disabled + tip so the
+// UI can show a tasteful fallback without another RPC round-trip.
+func (s *RPCServer) handleBsvIndexerStatus() (interface{}, error) {
+	if s.indexer == nil {
+		return map[string]any{"enabled": false}, nil
+	}
+	// Duck-type the Stats method so we don't force every IndexerReader
+	// implementation to expose it (tests can stub LookupEntries only).
+	type statser interface {
+		Stats() indexer.Stats
+	}
+	resp := map[string]any{"enabled": true}
+	if st, ok := s.indexer.(statser); ok {
+		s := st.Stats()
+		resp["lastBlock"] = fmt.Sprintf("0x%x", s.LastBlock)
+		resp["ingested"] = fmt.Sprintf("0x%x", s.Ingested)
+		resp["dropped"] = fmt.Sprintf("0x%x", s.Dropped)
+	}
+	return resp, nil
+}
+
+// parseNumberFlexible decodes a JSON number value that may be either a
+// JSON integer or a hex string ("0x…"). Standard Ethereum JSON-RPC
+// uses hex; simulator / HTTP clients often send plain integers.
+func parseNumberFlexible(raw json.RawMessage) (uint64, error) {
+	if len(raw) == 0 {
+		return 0, nil
+	}
+	// Try hex-string form first.
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimPrefix(s, "0x")
+		s = strings.TrimPrefix(s, "0X")
+		if s == "" {
+			return 0, nil
+		}
+		var n uint64
+		_, err := fmt.Sscanf(s, "%x", &n)
+		if err != nil {
+			return 0, fmt.Errorf("parse hex %q: %w", s, err)
+		}
+		return n, nil
+	}
+	// Fall back to raw JSON integer.
+	var n uint64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, fmt.Errorf("expected hex string or integer, got %s", string(raw))
+	}
+	return n, nil
 }
 
 // -- Parameter parsing handlers --

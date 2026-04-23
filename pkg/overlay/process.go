@@ -48,6 +48,14 @@ type ProcessResult struct {
 // ProcessBatch executes a batch of transactions through the Go EVM,
 // generates an SP1 proof, and prepares data for covenant advance.
 //
+// This is the producer path: the node's configured coinbase is credited,
+// and the block timestamp is derived deterministically from the parent
+// header and the configured block interval. Any forced inbox
+// transactions are drained and prepended to the batch.
+//
+// For replaying a peer-produced batch (sync path), use ReplayBatch
+// instead so the producer's coinbase and timestamp are used verbatim.
+//
 // Steps:
 //  1. Get parent header from ChainDB
 //  2. Start access recording on StateDB
@@ -77,6 +85,95 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		return nil, fmt.Errorf("circuit breaker tripped: node is in follower-only mode")
 	}
 
+	// Check if forced inbox inclusion is required. Producer-only: on the
+	// replay path the batch already contains whatever the producer chose
+	// to include.
+	if n.inboxMonitor != nil && n.inboxMonitor.MustDrainInbox() {
+		inboxTxsRLP := n.inboxMonitor.DrainPending()
+		// Decode and prepend inbox transactions to the batch.
+		for _, rlpTx := range inboxTxsRLP {
+			var inboxTx types.Transaction
+			if err := rlp.DecodeBytes(rlpTx, &inboxTx); err != nil {
+				slog.Warn("skipping invalid inbox transaction", "error", err)
+				continue
+			}
+			txs = append([]*types.Transaction{&inboxTx}, txs...)
+		}
+	}
+
+	// Derive the block timestamp deterministically from parent + interval.
+	// Spec 11/12: every node (and the SP1 guest) must land on the same
+	// block hash, so the timestamp cannot come from wall-clock time.
+	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
+	if parentHeader == nil {
+		return nil, fmt.Errorf("parent header not found for block %d", n.executionTip)
+	}
+	interval := n.config.BlockInterval
+	if interval == 0 {
+		interval = 1
+	}
+	timestamp := parentHeader.Timestamp + interval
+
+	return n.processBatchInternal(n.config.Coinbase, timestamp, txs)
+}
+
+// ReplayBatch re-executes a batch produced by a peer, reusing the
+// producer's coinbase and timestamp verbatim. This is the sync path:
+// the local node's config.Coinbase and local clock are ignored so that
+// every node derives the same post-state root from the same batch
+// bytes.
+//
+// The caller must hold no locks; this method acquires n.mu internally.
+//
+// Returns an error if the batch timestamp is not strictly greater than
+// the parent header's timestamp (replays must advance time monotonically,
+// matching the invariant ProcessBatch enforces on producers).
+func (n *OverlayNode) ReplayBatch(batch *block.BatchData) (*ProcessResult, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if batch == nil {
+		return nil, fmt.Errorf("nil batch")
+	}
+
+	// Decode transactions from RLP.
+	txs := make([]*types.Transaction, 0, len(batch.Transactions))
+	for _, rlpTx := range batch.Transactions {
+		tx := new(types.Transaction)
+		if err := rlp.DecodeBytes(rlpTx, tx); err != nil {
+			slog.Warn("skipping invalid transaction in batch replay", "error", err)
+			continue
+		}
+		txs = append(txs, tx)
+	}
+	if len(txs) == 0 {
+		return nil, fmt.Errorf("no valid transactions in replay batch")
+	}
+
+	// Validate the replay timestamp advances monotonically against our
+	// current tip's parent header. Out-of-order replays are rejected so
+	// a malformed gossip message can't corrupt the local chain.
+	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
+	if parentHeader == nil {
+		return nil, fmt.Errorf("parent header not found for block %d", n.executionTip)
+	}
+	if batch.Timestamp <= parentHeader.Timestamp {
+		return nil, fmt.Errorf("replay batch timestamp %d not greater than parent timestamp %d",
+			batch.Timestamp, parentHeader.Timestamp)
+	}
+
+	return n.processBatchInternal(batch.Coinbase, batch.Timestamp, txs)
+}
+
+// processBatchInternal is the shared execution core for ProcessBatch
+// (producer) and ReplayBatch (follower sync). Caller MUST hold n.mu.
+// The coinbase and timestamp parameters are applied verbatim — the
+// caller is responsible for picking producer-path or replay-path values.
+func (n *OverlayNode) processBatchInternal(
+	coinbase types.Address,
+	timestamp uint64,
+	txs []*types.Transaction,
+) (*ProcessResult, error) {
 	// 1. Get parent header from ChainDB.
 	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
 	if parentHeader == nil {
@@ -96,39 +193,21 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	// 2. Start access recording on StateDB.
 	n.stateDB.StartAccessRecording()
 
-	// Capture inbox root BEFORE draining so we have the true
-	// "before" state for the SP1 public values.
+	// Capture inbox root BEFORE execution so we have the true "before"
+	// state for the SP1 public values. On the producer path any forced
+	// inbox drain has already happened in ProcessBatch before this call.
 	var inboxRootBefore types.Hash
 	if n.inboxMonitor != nil {
 		inboxRootBefore = n.inboxMonitor.QueueHash()
 	}
 
-	// Check if forced inbox inclusion is required.
-	if n.inboxMonitor != nil && n.inboxMonitor.MustDrainInbox() {
-		inboxTxsRLP := n.inboxMonitor.DrainPending()
-		// Decode and prepend inbox transactions to the batch.
-		for _, rlpTx := range inboxTxsRLP {
-			var inboxTx types.Transaction
-			if err := rlp.DecodeBytes(rlpTx, &inboxTx); err != nil {
-				slog.Warn("skipping invalid inbox transaction", "error", err)
-				continue
-			}
-			txs = append([]*types.Transaction{&inboxTx}, txs...)
-		}
-	}
-
-	// 3. Execute via block.BlockExecutor.ProcessBatch.
-	// Derive the block timestamp deterministically from parent + interval.
-	// Spec 11/12: every node (and the SP1 guest) must land on the same
-	// block hash, so the timestamp cannot come from wall-clock time.
-	interval := n.config.BlockInterval
-	if interval == 0 {
-		interval = 1
-	}
-	timestamp := parentHeader.Timestamp + interval
+	// 3. Execute via block.BlockExecutor.ProcessBatch using the caller-
+	// supplied coinbase and timestamp. For replays these come verbatim
+	// from the producer's batch data; for producer runs they are the
+	// node's configured coinbase and parent+interval timestamp.
 	l2Block, receipts, err := n.executor.ProcessBatch(
 		parentHeader,
-		n.config.Coinbase,
+		coinbase,
 		timestamp,
 		txs,
 		n.stateDB,
@@ -177,8 +256,8 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		rlpTxs = append(rlpTxs, buf)
 	}
 
-	// Capture inbox root AFTER draining. inboxRootBefore was captured
-	// before draining at the top of this function.
+	// Capture inbox root AFTER execution. inboxRootBefore was captured
+	// above before the executor ran.
 	var inboxRootAfter types.Hash
 	if n.inboxMonitor != nil {
 		inboxRootAfter = n.inboxMonitor.QueueHash()
@@ -192,7 +271,7 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 		BlockContext: prover.BlockContext{
 			Number:    l2Block.NumberU64(),
 			Timestamp: l2Block.Time(),
-			Coinbase:  n.config.Coinbase,
+			Coinbase:  coinbase,
 			GasLimit:  l2Block.GasLimit(),
 			BaseFee:   0,
 		},
@@ -231,7 +310,7 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	canonicalBatch := &block.BatchData{
 		Version:        block.BatchVersion,
 		Timestamp:      l2Block.Time(),
-		Coinbase:       n.config.Coinbase,
+		Coinbase:       coinbase,
 		ParentHash:     parentHeader.Hash(),
 		Transactions:   rlpTxs,
 		DepositHorizon: depositHorizon,

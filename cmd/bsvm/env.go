@@ -45,6 +45,9 @@ func ApplyEnvOverrides(cfg *NodeConfig) error {
 	if v := os.Getenv("BSVM_P2P_PORT"); v != "" {
 		cfg.Network.ListenAddr = fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", v)
 	}
+	if v := os.Getenv("BSVM_P2P_SEED"); v != "" {
+		cfg.Network.IdentitySeedHex = strings.TrimPrefix(v, "0x")
+	}
 	if v := os.Getenv("BSVM_PEERS"); v != "" {
 		// BSVM_PEERS is a comma-separated list of <host>:<port> pairs
 		// (Docker service names). Translate to libp2p multiaddrs so
@@ -76,12 +79,36 @@ func ApplyEnvOverrides(cfg *NodeConfig) error {
 	if v := os.Getenv("BSVM_BSV_RPC"); v != "" {
 		cfg.BSV.NodeURL = v
 	}
+	if v := os.Getenv("BSVM_BSV_NETWORK"); v != "" {
+		cfg.BSV.Network = v
+	}
 	if v := os.Getenv("BSVM_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("BSVM_BATCH_SIZE: %w", err)
 		}
 		cfg.Overlay.MaxBatchSize = n
+	}
+	if v := os.Getenv("BSVM_MAX_SPECULATIVE_DEPTH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("BSVM_MAX_SPECULATIVE_DEPTH: %w", err)
+		}
+		cfg.Overlay.MaxSpeculativeDepth = n
+	}
+	if v := os.Getenv("BSVM_INDEXER_ENABLED"); v != "" {
+		b, err := parseBool(v)
+		if err != nil {
+			return fmt.Errorf("BSVM_INDEXER_ENABLED: %w", err)
+		}
+		cfg.Indexer.Enabled = b
+	}
+	if v := os.Getenv("BSVM_INDEXER_CACHE_MB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("BSVM_INDEXER_CACHE_MB: %w", err)
+		}
+		cfg.Indexer.CacheMB = n
 	}
 	if v := os.Getenv("BSVM_FLUSH_DELAY"); v != "" {
 		cfg.Overlay.MaxBatchFlushDelay = v
@@ -134,4 +161,16 @@ func NodeRoleFromEnv() string {
 // startup banner (only node1 prints the full banner).
 func NodeNameFromEnv() string {
 	return strings.TrimSpace(os.Getenv("BSVM_NODE_NAME"))
+}
+
+// parseBool accepts the values Docker operators already type — "1",
+// "true", "yes", "on" — with their obvious negations.
+func parseBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on", "enabled":
+		return true, nil
+	case "0", "false", "no", "off", "disabled":
+		return false, nil
+	}
+	return false, fmt.Errorf("not a boolean: %q", v)
 }

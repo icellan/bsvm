@@ -83,6 +83,14 @@ jobs:
         working-directory: bsv-evm
         run: go test -tags devnet_smoke -v -timeout 5m ./test/devnet/...
 
+      - name: Run simulator smoke test
+        working-directory: bsv-evm
+        # Drives real traffic against the compose devnet using bsvm-sim
+        # in headless mode. Requires the smoke image to have a loosened
+        # MaxSpeculativeDepth (set via compose env) so the 512-block
+        # buffer doesn't saturate during the 45s window.
+        run: go test -tags devnet_sim -v -timeout 4m ./test/devnet/...
+
       - name: Capture container logs on failure
         if: failure()
         working-directory: bsv-evm

@@ -37,6 +37,26 @@ type feeWalletAccessor interface {
 	Address() string
 }
 
+// PeerSource exposes the list of currently connected network peers for
+// rendering via bsv_getPeers. The network layer's PeerManager satisfies
+// this via Snapshot(); keeping it as an interface lets BsvAPI stay free
+// of the network package.
+type PeerSource interface {
+	Snapshot() []PeerSnapshot
+	PeerCount() int
+}
+
+// PeerSnapshot mirrors network.PeerSnapshot but lives in the rpc
+// package so callers don't need to import go-libp2p types.
+type PeerSnapshot struct {
+	ID        string
+	Addrs     []string
+	ChainTip  uint64
+	LastSeenS int64  // unix seconds
+	Score     int
+	Direction string
+}
+
 // BsvAPI implements the bsv_* namespace of the JSON-RPC API. These are
 // BSV-specific extensions that provide visibility into the L2's covenant
 // chain, confirmation status, and shard information.
@@ -45,6 +65,7 @@ type BsvAPI struct {
 	feeWallet       feeWalletAccessor
 	withdrawalStore WithdrawalStore
 	bridge          BridgeSnapshotProvider
+	peers           PeerSource
 }
 
 // NewBsvAPI creates a new BsvAPI instance.
@@ -62,6 +83,13 @@ func (api *BsvAPI) SetFeeWallet(fw feeWalletAccessor) {
 // withdrawals instead of just "pending_proof" status.
 func (api *BsvAPI) SetWithdrawalStore(store WithdrawalStore) {
 	api.withdrawalStore = store
+}
+
+// SetPeerSource wires the P2P peer manager so bsv_getPeers can list the
+// current connected peers. Optional: without a source, bsv_getPeers
+// returns an empty list and bsv_peerCount stays at "0x0".
+func (api *BsvAPI) SetPeerSource(src PeerSource) {
+	api.peers = src
 }
 
 // ShardInfo returns basic shard information including chain tips.
@@ -198,10 +226,36 @@ func (api *BsvAPI) GetCachedChainLength() string {
 	return EncodeUint64(uint64(api.overlay.TxCacheRef().Len()))
 }
 
-// PeerCount returns the number of connected peers. Returns "0x0" until the
-// network manager is wired in. This implements bsv_peerCount.
+// PeerCount returns the number of connected peers. Returns "0x0" until
+// a PeerSource is wired via SetPeerSource. This implements bsv_peerCount.
 func (api *BsvAPI) PeerCount() string {
-	return "0x0"
+	if api.peers == nil {
+		return "0x0"
+	}
+	return EncodeUint64(uint64(api.peers.PeerCount()))
+}
+
+// GetPeers returns the current set of connected peers for the Network
+// page's peers table. Empty when the P2P layer is disabled or no source
+// has been wired. This implements bsv_getPeers.
+func (api *BsvAPI) GetPeers() []map[string]interface{} {
+	if api.peers == nil {
+		return []map[string]interface{}{}
+	}
+	snaps := api.peers.Snapshot()
+	out := make([]map[string]interface{}, 0, len(snaps))
+	for _, s := range snaps {
+		entry := map[string]interface{}{
+			"id":        s.ID,
+			"addrs":     s.Addrs,
+			"chainTip":  EncodeUint64(s.ChainTip),
+			"lastSeen":  EncodeUint64(uint64(s.LastSeenS)),
+			"score":     s.Score,
+			"direction": s.Direction,
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // BuildWithdrawalClaim returns the unsigned BSV transaction data and Merkle

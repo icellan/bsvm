@@ -168,12 +168,17 @@ func Build(cfg Config) (*Bundle, error) {
 
 	var client *covenant.RunarBroadcastClient
 	if !cfg.NoBroadcast {
+		confSrc, ok := cfg.Provider.(covenant.ConfirmationSource)
+		if !ok {
+			return nil, fmt.Errorf("regtestharness: cfg.Provider %T does not satisfy covenant.ConfirmationSource (needs GetRawTransactionVerbose)", cfg.Provider)
+		}
 		client, err = covenant.NewRunarBroadcastClient(covenant.RunarBroadcastClientOpts{
-			Contract: cfg.Contract,
-			Provider: cfg.Provider,
-			Signer:   cfg.Signer,
-			ChainID:  cfg.ChainID,
-			Mode:     cfg.ProofMode,
+			Contract:      cfg.Contract,
+			Provider:      cfg.Provider,
+			Signer:        cfg.Signer,
+			Confirmations: confSrc,
+			ChainID:       cfg.ChainID,
+			Mode:          cfg.ProofMode,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("NewRunarBroadcastClient: %w", err)

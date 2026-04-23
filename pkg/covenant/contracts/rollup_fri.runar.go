@@ -13,6 +13,11 @@ import runar "github.com/icellan/runar/packages/runar-go"
 // well-formed public-values blob and matching batchData — a malicious
 // prover can therefore commit an invalid state transition.
 //
+// The batch data itself is NOT carried on-chain in Mode 1 — see the
+// AdvanceState doc comment for the rationale. The covenant binds the
+// batchDataHash via the public-values slot, and the raw batch travels
+// over the P2P gossip layer.
+//
 // The safety model rests on two off-chain layers:
 //
 //  1. Nodes re-execute every batch locally and verify the SP1 FRI proof
@@ -83,9 +88,21 @@ type FRIRollupContract struct {
 //     [104..136) batchDataHash == hash256(batchData)
 //     [136..144) chainId       == c.ChainId (little-endian 8 bytes)
 //
-// Spec-12 OP_RETURN data-availability output is emitted with the
-// `BSVM\x02` magic. The continuation-hash binding ensures the on-chain
-// tx carries batchData verbatim.
+// # Data availability
+//
+// The batch bytes themselves are NOT emitted as an on-chain OP_RETURN.
+// The covenant binds only the batch hash via the public-values slot; the
+// raw batch data travels over the P2P gossip layer (chain-scoped genesis
+// sync + block announcements), and any node can verify it matches the
+// committed hash. Emitting the raw batch as a second tx output was
+// intentionally dropped: under the current runar-go SDK the ANF
+// `add_data_output` intrinsic is recorded in the compiled script's
+// continuation-hash check but NOT reproduced as an actual tx output by
+// the SDK's tx builder (BuildCallTransaction), so the on-chain script
+// would reject every advance. When the SDK learns to walk the method's
+// ANF and auto-emit data outputs between the contract continuation and
+// the change output, the OP_RETURN envelope can be restored by adding
+// `c.AddDataOutput(0, buildOpReturn(batchData))` after the bindings.
 //
 // proofBlob is accepted as a parameter so the ABI is stable against the
 // future on-chain FRI verifier upgrade (Gate 0a Full). It is not
@@ -109,18 +126,6 @@ func (c *FRIRollupContract) AdvanceState(
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
-
-	// Spec-12 OP_RETURN data-availability output:
-	//   OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4> "BSVM\x02" <batchData>
-	// The continuation-hash check (Rúnar-injected) binds this output to
-	// the tx so an on-chain observer can always read batchData without
-	// parsing the covenant input script.
-	opReturnHdr := runar.ByteString("\x00\x6a\x4e")
-	bsvmMagic := runar.ByteString("BSVM\x02")
-	payload := runar.Cat(bsvmMagic, batchData)
-	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
-	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
-	c.AddDataOutput(0, opReturnScript)
 
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber

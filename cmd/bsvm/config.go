@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
@@ -30,8 +31,24 @@ type NodeConfig struct {
 	Bridge     BridgeSection     `toml:"bridge"`
 	Database   DatabaseSection   `toml:"database"`
 	Governance GovernanceSection `toml:"governance"`
+	Indexer    IndexerSection    `toml:"indexer"`
 	LogLevel   string            `toml:"log_level"`
 	LogFormat  string            `toml:"log_format"`
+}
+
+// IndexerSection configures the per-address transaction indexer.
+// Operators can disable the indexer entirely to avoid the extra disk
+// cost — at the price of the explorer's Address page tx-history panel
+// showing "indexer disabled".
+type IndexerSection struct {
+	// Enabled toggles the indexer. Default true.
+	Enabled bool `toml:"enabled"`
+	// CacheMB is the LevelDB cache size in megabytes. 16 is plenty for
+	// an append-mostly index.
+	CacheMB int `toml:"cache_mb"`
+	// MaxResults caps the per-query response size. Defaults to 500;
+	// 0 means use the default. Hard ceiling is 1000 in pkg/indexer.
+	MaxResults int `toml:"max_results"`
 }
 
 // ShardSection holds shard identification.
@@ -70,6 +87,10 @@ type NetworkSection struct {
 	ListenAddr     string   `toml:"listen_addr"`
 	BootstrapPeers []string `toml:"bootstrap_peers"`
 	MaxPeers       int      `toml:"max_peers"`
+	// IdentitySeedHex is a 64-char hex-encoded 32-byte seed used to
+	// deterministically derive the libp2p peer ID. Leave blank for a
+	// fresh random identity at each startup (pre-spec-16 behaviour).
+	IdentitySeedHex string `toml:"identity_seed_hex"`
 }
 
 // BSVSection holds BSV node connection configuration.
@@ -142,6 +163,11 @@ func DefaultNodeConfig() *NodeConfig {
 		Database: DatabaseSection{
 			Engine:  "leveldb",
 			CacheMB: 256,
+		},
+		Indexer: IndexerSection{
+			Enabled:    true,
+			CacheMB:    16,
+			MaxResults: 500,
 		},
 		// Governance defaults to zero value (Mode "", no keys, threshold 0)
 		// which is treated as "none" -- fully trustless, no governance keys.
@@ -243,6 +269,12 @@ func (c *NodeConfig) ToNetworkConfig(chainID int64) network.Config {
 	}
 	if c.Network.MaxPeers > 0 {
 		nc.MaxPeers = c.Network.MaxPeers
+	}
+	if c.Network.IdentitySeedHex != "" {
+		seed, err := hex.DecodeString(c.Network.IdentitySeedHex)
+		if err == nil && len(seed) == 32 {
+			nc.IdentitySeed = seed
+		}
 	}
 
 	return nc

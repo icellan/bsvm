@@ -249,6 +249,56 @@ func (pm *PeerManager) AllPeers() []peer.ID {
 	return ids
 }
 
+// PeerSnapshot is a stable, copyable view of a peer used for RPC
+// responses. Unlike PeerInfo it exposes string-formatted addresses so
+// callers don't need to import go-multiaddr.
+type PeerSnapshot struct {
+	ID        string   // libp2p peer ID (base58)
+	Addrs     []string // multiaddr strings
+	ChainTip  uint64   // last known L2 tip reported by this peer
+	LastSeen  time.Time
+	Score     int
+	Direction string // "inbound" | "outbound" | "" if unknown
+}
+
+// Snapshot returns a deterministically-ordered copy of the current
+// peer set. Used by bsv_getPeers to render the Network page's peers
+// table without exposing the libp2p types.
+func (pm *PeerManager) Snapshot() []PeerSnapshot {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	out := make([]PeerSnapshot, 0, len(pm.peers))
+	for id, info := range pm.peers {
+		addrs := make([]string, 0, len(info.Addrs))
+		for _, a := range info.Addrs {
+			addrs = append(addrs, a.String())
+		}
+		dir := ""
+		if pm.host != nil {
+			for _, c := range pm.host.Network().ConnsToPeer(id) {
+				switch c.Stat().Direction.String() {
+				case "Inbound":
+					dir = "inbound"
+				case "Outbound":
+					dir = "outbound"
+				}
+				break
+			}
+		}
+		out = append(out, PeerSnapshot{
+			ID:        id.String(),
+			Addrs:     addrs,
+			ChainTip:  info.ChainTip,
+			LastSeen:  info.LastSeen,
+			Score:     pm.scores[id],
+			Direction: dir,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ChainTip > out[j].ChainTip })
+	return out
+}
+
 // errMaxPeersReached is returned when AddPeer is called but the maximum
 // peer count has already been reached.
 type errMaxPeersReachedType struct{}

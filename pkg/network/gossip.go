@@ -72,6 +72,12 @@ type GossipManager struct {
 	mu         sync.RWMutex
 	started    bool
 	mdnsCancel context.CancelFunc
+
+	// genesis caches the raw genesis tx this node is running under,
+	// so it can answer GenesisRequest streams from peers that are
+	// booting without BSV RPC access. Set via SetLocalGenesis after
+	// the boot layer has successfully derived the shard.
+	genesis genesisStore
 }
 
 // NewGossipManager creates a new GossipManager with the given configuration
@@ -160,6 +166,12 @@ func (g *GossipManager) Start(ctx context.Context) error {
 	// Register the stream handler for our protocol.
 	pid := protocol.ID(ProtocolID(g.config.ChainID))
 	g.host.SetStreamHandler(pid, g.handleStream)
+
+	// Always-on chain-agnostic genesis-sync handler. Lets a brand-
+	// new node ask this one for its raw genesis transaction without
+	// needing to know the chain ID (followers that never talk to
+	// BSV rely on this to bootstrap).
+	g.registerGenesisSyncHandler()
 
 	slog.Info("gossip manager started",
 		"listenAddrs", g.host.Addrs(),

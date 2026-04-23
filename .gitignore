@@ -3,6 +3,7 @@
 
 # Compiled binaries
 /bsvm
+/bsvm-sim
 /evm-cli
 
 # Local data

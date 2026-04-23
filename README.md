@@ -204,6 +204,33 @@ cd test/integration
 go test -tags integration -v -timeout 600s
 ```
 
+## Traffic simulator (`bsvm-sim`)
+
+TUI-driven load generator for the devnet. Spins up a pool of users and
+a library of common EVM contracts (ERC-20, ERC-721, WETH, Uniswap V2-
+style AMM, multisig, storage, plain transfers), deploys them once, then
+runs continuous randomised traffic. Operators can add/remove users and
+start/stop workloads live via keybinds.
+
+```bash
+# Boot the devnet first (docker compose up), then:
+go run ./cmd/bsvm-sim
+
+# Headless mode (CI / logs to file):
+go run ./cmd/bsvm-sim --headless --duration 60s --tps 3
+
+# Limit workloads or target a single node:
+go run ./cmd/bsvm-sim --nodes http://localhost:8546 \
+    --workloads value-transfer,erc20-transfer,amm-swap
+```
+
+TUI keybinds: `a`/`x` add/drop user, `w` toggle selected workload,
+`+`/`-` adjust rate, `]`/`[` adjust rate by 10, `p`/`r` pause/resume,
+`tab` cycle panels, `?` help, `q` quit.
+
+Contract sources live in `contracts/src/` — regenerate bytecode via
+`contracts/README.md` after edits (pinned to solc 0.8.28, 200 runs).
+
 ## Dependencies
 
 - Go 1.22+

@@ -1,7 +1,5 @@
-//go:build integration
-
 // Package covenant: real BroadcastClient implementation backed by the Rúnar
-// Go SDK and a BSV regtest node (integration build tag only).
+// Go SDK and a BSV node.
 //
 // The client holds a single deployed contract reference. Each instance is
 // configured with a ProofMode at construction time and rejects BroadcastAdvance
@@ -26,8 +24,17 @@ import (
 	"github.com/icellan/bsvm/pkg/types"
 
 	runar "github.com/icellan/runar/packages/runar-go"
-	"runar-integration/helpers"
 )
+
+// ConfirmationSource looks up the BSV-network confirmation count for a
+// broadcast txid. RunarBroadcastClient uses it to decide when an advance
+// is finalized. pkg/bsvclient.RPCProvider satisfies this via its
+// GetRawTransactionVerbose method — the broadcast client holds its own
+// ConfirmationSource reference so it doesn't depend on global process
+// state.
+type ConfirmationSource interface {
+	GetRawTransactionVerbose(txid string) (map[string]interface{}, error)
+}
 
 // ---------------------------------------------------------------------------
 // Back-compat synthetic Merkle scaffolding exposed for the regtest deploy
@@ -87,16 +94,17 @@ func buildRunarBroadcastDepth20Proof(leafHex string, index int) (proofHex, rootH
 }
 
 // RunarBroadcastClient is a real BroadcastClient implementation that talks
-// to a BSV regtest node via the Rúnar Go SDK. It attaches to a pre-deployed
+// to a BSV node via the Rúnar Go SDK. It attaches to a pre-deployed
 // rollup contract of a single ProofMode and drives it through
 // contract.Call("advanceState", args) where args comes from
 // req.Proof.ContractCallArgs.
 type RunarBroadcastClient struct {
-	contract *runar.RunarContract
-	provider runar.Provider
-	signer   runar.Signer
-	chainID  int64
-	mode     ProofMode
+	contract      *runar.RunarContract
+	provider      runar.Provider
+	signer        runar.Signer
+	confirmations ConfirmationSource
+	chainID       int64
+	mode          ProofMode
 
 	mu        sync.Mutex
 	confs     map[types.Hash]uint32
@@ -109,6 +117,11 @@ type RunarBroadcastClientOpts struct {
 	Contract *runar.RunarContract
 	Provider runar.Provider
 	Signer   runar.Signer
+	// Confirmations is the source for BSV confirmation-count lookups.
+	// Typically the same underlying RPC connection as Provider — in the
+	// production binary, pkg/bsvclient.RPCProvider satisfies both
+	// interfaces from a single instance. Required.
+	Confirmations ConfirmationSource
 	// ChainID is the chain id embedded in the rollup contract's public-values
 	// binding. It MUST match the chainID constructor arg used at deploy time.
 	ChainID int64
@@ -129,13 +142,17 @@ func NewRunarBroadcastClient(opts RunarBroadcastClientOpts) (*RunarBroadcastClie
 	if opts.Signer == nil {
 		return nil, errors.New("signer required")
 	}
+	if opts.Confirmations == nil {
+		return nil, errors.New("confirmations source required")
+	}
 	return &RunarBroadcastClient{
-		contract: opts.Contract,
-		provider: opts.Provider,
-		signer:   opts.Signer,
-		chainID:  opts.ChainID,
-		mode:     opts.Mode,
-		confs:    make(map[types.Hash]uint32),
+		contract:      opts.Contract,
+		provider:      opts.Provider,
+		signer:        opts.Signer,
+		confirmations: opts.Confirmations,
+		chainID:       opts.ChainID,
+		mode:          opts.Mode,
+		confs:         make(map[types.Hash]uint32),
 	}, nil
 }
 
@@ -213,26 +230,33 @@ func (c *RunarBroadcastClient) BroadcastAdvance(_ context.Context, req Broadcast
 }
 
 // GetConfirmations returns the BSV confirmation count for a broadcast
-// advance txid via getrawtransaction (verbose=1). Zero confirmations means
-// the tx is in the mempool but not yet mined. An unknown txid produces an
-// RPC error propagated to the caller.
+// advance txid via the injected ConfirmationSource (backed by
+// getrawtransaction verbose=1). Zero confirmations means the tx is in the
+// mempool but not yet mined. An unknown txid produces an RPC error
+// propagated to the caller.
 func (c *RunarBroadcastClient) GetConfirmations(ctx context.Context, txid types.Hash) (uint32, error) {
 	txidHex := hex.EncodeToString(txid[:])
 
-	raw, err := helpers.RPCCall("getrawtransaction", txidHex, 1)
+	raw, err := c.confirmations.GetRawTransactionVerbose(txidHex)
 	if err != nil {
 		return 0, fmt.Errorf("getrawtransaction %s: %w", txidHex, err)
 	}
 
-	var resp struct {
-		Confirmations *uint32 `json:"confirmations"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return 0, fmt.Errorf("decoding getrawtransaction response: %w", err)
-	}
+	// getrawtransaction returns confirmations as a JSON number, decoded
+	// into interface{} as float64. It is absent (or null) while the tx
+	// is unconfirmed; treat that as zero confirmations.
 	var confs uint32
-	if resp.Confirmations != nil {
-		confs = *resp.Confirmations
+	if v, ok := raw["confirmations"]; ok && v != nil {
+		switch n := v.(type) {
+		case float64:
+			if n > 0 {
+				confs = uint32(n)
+			}
+		case json.Number:
+			if f, cerr := n.Float64(); cerr == nil && f > 0 {
+				confs = uint32(f)
+			}
+		}
 	}
 
 	c.mu.Lock()

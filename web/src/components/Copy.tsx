@@ -6,7 +6,9 @@ import { useState } from "react";
 export default function Copy(props: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
 
-  async function onClick() {
+  async function onClick(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
     try {
       await navigator.clipboard.writeText(props.value);
       setCopied(true);
@@ -22,10 +24,21 @@ export default function Copy(props: { value: string; label?: string }) {
     <button
       onClick={onClick}
       title={props.value}
-      className="inline-flex items-center gap-1 font-mono text-xs text-muted hover:text-fg"
+      className="mono"
+      style={{
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        cursor: "pointer",
+        color: "inherit",
+        fontSize: "inherit",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+      }}
     >
       <span>{display}</span>
-      <span className="text-[0.7rem] text-muted">
+      <span style={{ fontSize: 10, color: copied ? "var(--ts-ok)" : "var(--ts-text-4)" }}>
         {copied ? "✓" : "⎘"}
       </span>
     </button>

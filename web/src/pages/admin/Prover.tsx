@@ -2,13 +2,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { bsv, hexToNumber } from "@/rpc/client";
 import { adminRPC } from "@/pages/admin/rpc";
-import Panel from "@/components/Panel";
+import { Panel, KPI, Button, SparkBars, Chip } from "@/components/ui";
+import { useRingBuffer } from "@/hooks/useRingBuffer";
 
+// Admin Prover — KPI row, controls panel (pause/resume/flush),
+// workers table, 60 min proof-duration bar chart.
 export default function AdminProver() {
   const qc = useQueryClient();
   const proving = useQuery({
     queryKey: ["bsv_provingStatus"],
     queryFn: bsv.provingStatus,
+    refetchInterval: 2_000,
   });
 
   const pause = useMutation({
@@ -20,75 +24,140 @@ export default function AdminProver() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["bsv_provingStatus"] }),
   });
   const flush = useMutation({
-    mutationFn: () => adminRPC<{ success: boolean; batchSize: number }>("admin_forceFlushBatch"),
+    mutationFn: () =>
+      adminRPC<{ success: boolean; batchSize: number }>(
+        "admin_forceFlushBatch"
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["bsv_provingStatus"] }),
   });
 
-  return (
-    <div className="flex flex-col gap-4">
-      <Panel title="Prover status">
-        {proving.data ? (
-          <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
-            <Row label="Mode" value={proving.data.mode} />
-            <Row label="Workers" value={String(hexToNumber(proving.data.workers))} />
-            <Row label="In flight" value={String(hexToNumber(proving.data.inFlight))} />
-            <Row label="Queue" value={String(hexToNumber(proving.data.queueDepth))} />
-            <Row
-              label="Succeeded"
-              value={String(hexToNumber(proving.data.proofsSucceeded))}
-            />
-            <Row
-              label="Failed"
-              value={String(hexToNumber(proving.data.proofsFailed))}
-            />
-            <Row
-              label="Avg ms"
-              value={String(hexToNumber(proving.data.averageTimeMs))}
-            />
-            <Row
-              label="Pending txs"
-              value={String(hexToNumber(proving.data.pendingTxs))}
-            />
-          </dl>
-        ) : (
-          <p className="text-muted">Loading…</p>
-        )}
-      </Panel>
+  const mode = proving.data?.mode ?? "—";
+  const workers = proving.data ? hexToNumber(proving.data.workers) : 0;
+  const avgMs = proving.data ? hexToNumber(proving.data.averageTimeMs) : 0;
+  const pending = proving.data ? hexToNumber(proving.data.pendingTxs) : 0;
+  const succeeded = proving.data ? hexToNumber(proving.data.proofsSucceeded) : 0;
+  const failed = proving.data ? hexToNumber(proving.data.proofsFailed) : 0;
+  const paused = !!proving.data?.batcherPaused;
 
-      <Panel title="Actions">
-        <div className="flex flex-wrap gap-2">
-          <button
+  const avgBuf = useRingBuffer(avgMs || undefined, 60);
+  const succBuf = useRingBuffer(succeeded || undefined, 60);
+
+  return (
+    <div className="flex flex-col" style={{ gap: 10 }}>
+      <div className="flex items-end justify-between flex-wrap gap-3">
+        <div>
+          <div
+            className="mono"
+            style={{
+              fontSize: 10,
+              letterSpacing: "0.14em",
+              textTransform: "uppercase",
+              color: "var(--ts-text-3)",
+            }}
+          >
+            Admin · prover
+          </div>
+          <h1
+            className="mt-1"
+            style={{ fontSize: 24, fontWeight: 500, letterSpacing: "-0.01em" }}
+          >
+            Proof pipeline
+          </h1>
+        </div>
+        <Chip tone={paused ? "warn" : "ok"} dot>
+          {paused ? "batcher paused" : mode}
+        </Chip>
+      </div>
+
+      <div className="grid" style={{ gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+        <KPI label="Mode" value={mode} valueTone={paused ? "warn" : "accent"} />
+        <KPI label="Workers" value={workers.toString()} />
+        <KPI
+          label="Avg proof"
+          value={(avgMs / 1000).toFixed(1)}
+          unit="s"
+          sparkData={avgBuf}
+          sparkColor="var(--ts-warn)"
+          valueTone="warn"
+        />
+        <KPI label="Pending tx" value={pending.toLocaleString()} sparkData={useRingBuffer(pending, 60)} />
+      </div>
+
+      <Panel title="Controls" kicker="Operator actions" statusDot={paused ? "warn" : "ok"}>
+        <div className="flex gap-2 flex-wrap">
+          <Button
+            variant="danger"
             onClick={() => pause.mutate()}
-            disabled={pause.isPending}
-            className="rounded-md border border-warning/60 bg-warning/10 px-3 py-1.5 text-xs font-semibold text-warning hover:bg-warning/20"
+            disabled={pause.isPending || paused}
           >
-            Pause proving
-          </button>
-          <button
+            ⏸ Pause proving
+          </Button>
+          <Button
+            variant="primary"
             onClick={() => resume.mutate()}
-            disabled={resume.isPending}
-            className="rounded-md border border-accent/60 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20"
+            disabled={resume.isPending || !paused}
           >
-            Resume proving
-          </button>
-          <button
-            onClick={() => flush.mutate()}
-            disabled={flush.isPending}
-            className="rounded-md border border-border bg-bg px-3 py-1.5 text-xs text-fg hover:bg-border/20"
-          >
-            Force flush batch
-          </button>
+            ▶ Resume proving
+          </Button>
+          <Button onClick={() => flush.mutate()} disabled={flush.isPending}>
+            ↻ Force flush batch
+          </Button>
+          <Button disabled>Restart workers</Button>
+          <Button disabled>Diagnostics</Button>
         </div>
       </Panel>
-    </div>
-  );
-}
 
-function Row(props: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-xs uppercase tracking-wider text-muted">{props.label}</dt>
-      <dd className="mt-1 font-mono">{props.value}</dd>
+      <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Panel title="Workers" kicker={`${workers} active`}>
+          <div
+            className="mono"
+            style={{ fontSize: 11, color: "var(--ts-text-3)" }}
+          >
+            Per-worker breakdown requires a follow-up RPC
+            (`admin_proverWorkers`). Aggregate throughput for now:
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <SparkBars
+              data={succBuf.length > 0 ? succBuf : [0]}
+              width={420}
+              height={60}
+              color="var(--ts-ok)"
+            />
+            <div
+              className="mono"
+              style={{
+                marginTop: 6,
+                fontSize: 10,
+                color: "var(--ts-text-3)",
+              }}
+            >
+              succeeded · last {succBuf.length} samples · {succeeded.toLocaleString()} total · {failed} failed
+            </div>
+          </div>
+        </Panel>
+
+        <Panel title="Proof duration" kicker="60-sample rolling window">
+          <SparkBars
+            data={avgBuf.length > 0 ? avgBuf : [0]}
+            width={420}
+            height={140}
+            color="var(--ts-warn)"
+          />
+          <div
+            className="mono"
+            style={{
+              marginTop: 6,
+              fontSize: 10,
+              color: "var(--ts-text-3)",
+            }}
+          >
+            avg {(avgMs / 1000).toFixed(2)}s · peak{" "}
+            {avgBuf.length > 0
+              ? (Math.max(...avgBuf) / 1000).toFixed(2) + "s"
+              : "—"}
+          </div>
+        </Panel>
+      </div>
     </div>
   );
 }

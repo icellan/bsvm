@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -13,7 +14,6 @@ import (
 	"github.com/icellan/bsvm/pkg/event"
 	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/prover"
-	"github.com/icellan/bsvm/pkg/rlp"
 	"github.com/icellan/bsvm/pkg/state"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm"
@@ -60,6 +60,17 @@ type OverlayNode struct {
 	// blockAnnouncer broadcasts new block announcements to the P2P network.
 	// Set via SetBlockAnnouncer after construction.
 	blockAnnouncer BlockAnnouncer
+
+	// feeWallet pays BSV mining fees on covenant-advance transactions.
+	// Attached post-construction via SetFeeWallet; nil in follower/test
+	// setups where the node never broadcasts to BSV.
+	feeWallet *FeeWallet
+
+	// feeWalletReconciler is an optional background goroutine that
+	// periodically re-syncs the fee wallet's UTXO set with the BSV
+	// node's listunspent view. Attached via StartFeeWalletReconciler
+	// after SetFeeWallet; nil when the node never broadcasts.
+	feeWalletReconciler *FeeWalletReconciler
 
 	eventFeed *event.Feed
 
@@ -491,30 +502,20 @@ func (n *OverlayNode) GetHeader(hash types.Hash, number uint64) *block.L2Header 
 }
 
 // ReplayBatchData decodes batch data received from a peer and replays
-// the transactions through the EVM. This is called during sync to
-// bring the local state up to date with the network.
+// the transactions through the EVM using the producer's coinbase and
+// timestamp. This is called during sync to bring the local state up
+// to date with the network.
+//
+// The producer's coinbase/timestamp — not the local node's config —
+// are used, otherwise followers would compute different state roots
+// than the producer for the same batch.
 func (n *OverlayNode) ReplayBatchData(batchData []byte) error {
 	batch, err := block.DecodeBatchData(batchData)
 	if err != nil {
 		return fmt.Errorf("failed to decode batch data: %w", err)
 	}
 
-	// Decode transactions from RLP.
-	var txs []*types.Transaction
-	for _, rlpTx := range batch.Transactions {
-		tx := new(types.Transaction)
-		if err := rlp.DecodeBytes(rlpTx, tx); err != nil {
-			slog.Warn("skipping invalid transaction in batch replay", "error", err)
-			continue
-		}
-		txs = append(txs, tx)
-	}
-
-	if len(txs) == 0 {
-		return fmt.Errorf("no valid transactions in batch")
-	}
-
-	_, err = n.ProcessBatch(txs)
+	_, err = n.ReplayBatch(batch)
 	return err
 }
 
@@ -587,13 +588,80 @@ func (n *OverlayNode) SetBlockAnnouncer(a BlockAnnouncer) {
 	n.blockAnnouncer = a
 }
 
+// SetFeeWallet attaches a BSV fee wallet to the overlay node so the
+// covenant broadcast path can pay for covenant-advance transactions.
+// Safe to call once at startup after NewOverlayNode. Passing nil clears
+// the attachment.
+func (n *OverlayNode) SetFeeWallet(fw *FeeWallet) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.feeWallet = fw
+}
+
+// FeeWallet returns the attached fee wallet, or nil when none has been
+// wired. Read by the reconciler and bsvAPI; callers must tolerate nil.
+func (n *OverlayNode) FeeWallet() *FeeWallet {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.feeWallet
+}
+
+// StartFeeWalletReconciler kicks off a background goroutine that keeps
+// the fee wallet in sync with the configured BSV node's listunspent
+// view. Safe to call once after SetFeeWallet. No-op if the fee wallet
+// is not attached. Calling it more than once stops the previous
+// reconciler before starting a new one so an operator can switch the
+// poll interval or the UtxoSource without restarting the node.
+func (n *OverlayNode) StartFeeWalletReconciler(src UtxoSource, address string, interval time.Duration) {
+	fw := n.FeeWallet()
+	if fw == nil {
+		return
+	}
+	n.mu.Lock()
+	old := n.feeWalletReconciler
+	n.mu.Unlock()
+	if old != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		old.Stop(stopCtx)
+		cancel()
+	}
+
+	recon := NewFeeWalletReconciler(fw, src, address, interval)
+	// Pass a background context — the reconciler also responds to Stop
+	// via its own stopCh, so the overlay's Stop() path can tear it down
+	// cleanly without plumbing a node-wide context through NewOverlayNode.
+	recon.Start(context.Background())
+	n.mu.Lock()
+	n.feeWalletReconciler = recon
+	n.mu.Unlock()
+}
+
+// FeeWalletReconcilerRef returns the attached reconciler, or nil. Used
+// by tests to inspect reconciler state without exposing the field.
+func (n *OverlayNode) FeeWalletReconcilerRef() *FeeWalletReconciler {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.feeWalletReconciler
+}
+
 // Stop gracefully stops the overlay node and its components.
 func (n *OverlayNode) Stop() {
 	n.batcher.Stop()
 	n.mu.Lock()
 	watcher := n.confirmationWatcher
+	reconciler := n.feeWalletReconciler
 	n.mu.Unlock()
 	if watcher != nil {
 		watcher.Stop()
+	}
+	if reconciler != nil {
+		// Bound the teardown at 5s so a wedged goroutine can't hang
+		// Stop. The reconciler's poll loop only blocks on a single
+		// HTTP round-trip which is capped by the provider's own
+		// timeout, so this is defence-in-depth rather than the primary
+		// bound.
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		reconciler.Stop(stopCtx)
+		cancel()
 	}
 }
