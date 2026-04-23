@@ -102,7 +102,10 @@ func (api *BsvAPI) ShardInfo() map[string]interface{} {
 		"mode":   gov.Mode.String(),
 		"frozen": cm.CurrentState().Frozen != 0,
 	}
-	if gov.Mode == covenant.GovernanceMultiSig {
+	// Emit threshold / keyCount for every governance mode that has at
+	// least one key (single_key and multisig). The "none" mode omits
+	// them because both are trivially zero.
+	if gov.Mode == covenant.GovernanceSingleKey || gov.Mode == covenant.GovernanceMultiSig {
 		govInfo["threshold"] = EncodeUint64(uint64(gov.Threshold))
 		govInfo["keyCount"] = EncodeUint64(uint64(len(gov.Keys)))
 	}
@@ -111,7 +114,7 @@ func (api *BsvAPI) ShardInfo() map[string]interface{} {
 		"shardId":             EncodeUint64(uint64(api.overlay.Config().ChainID)),
 		"chainId":             EncodeUint64(uint64(api.overlay.Config().ChainID)),
 		"genesisCovenantTxId": cm.GenesisTxID().Hex(),
-		"peerCount":           EncodeUint64(0), // TODO: wire in network peer count
+		"peerCount":           EncodeUint64(uint64(api.peerCount())),
 		"executionTip":        EncodeUint64(api.overlay.ExecutionTip()),
 		"provenTip":           EncodeUint64(api.overlay.ProvenTip()),
 		"cachedChainLength":   EncodeUint64(uint64(api.overlay.TxCacheRef().Len())),
@@ -226,13 +229,20 @@ func (api *BsvAPI) GetCachedChainLength() string {
 	return EncodeUint64(uint64(api.overlay.TxCacheRef().Len()))
 }
 
+// peerCount returns the number of connected peers, or 0 if the peer
+// source hasn't been wired yet. Internal helper used by ShardInfo so
+// the header's peers pill reflects the real mesh size.
+func (api *BsvAPI) peerCount() int {
+	if api.peers == nil {
+		return 0
+	}
+	return api.peers.PeerCount()
+}
+
 // PeerCount returns the number of connected peers. Returns "0x0" until
 // a PeerSource is wired via SetPeerSource. This implements bsv_peerCount.
 func (api *BsvAPI) PeerCount() string {
-	if api.peers == nil {
-		return "0x0"
-	}
-	return EncodeUint64(uint64(api.peers.PeerCount()))
+	return EncodeUint64(uint64(api.peerCount()))
 }
 
 // GetPeers returns the current set of connected peers for the Network

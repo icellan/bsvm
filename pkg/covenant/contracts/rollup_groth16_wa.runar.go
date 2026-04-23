@@ -175,14 +175,24 @@ func (c *Groth16WARollupContract) AdvanceState(
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 
-	// F07 (post-R7): emit the spec-12 advance OP_RETURN output —
-	// see the Mode 2 AdvanceState for the format rationale.
-	opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
-	bsvmMagic := runar.ByteString("BSVM\x02")
-	payload := runar.Cat(bsvmMagic, batchData)
-	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
-	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
-	c.AddDataOutput(0, opReturnScript)
+	// F07 OP_RETURN emission is currently disabled for the same reason
+	// it is disabled in rollup_fri.runar.go: the runar-go SDK's
+	// BuildCallTransaction does not walk the method ANF to auto-emit
+	// AddDataOutput calls as real tx outputs between the contract
+	// continuation and the change output. When it does, restore this
+	// block to re-enable spec-12's advance OP_RETURN envelope:
+	//
+	//   opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
+	//   bsvmMagic := runar.ByteString("BSVM\x02")
+	//   payload := runar.Cat(bsvmMagic, batchData)
+	//   lenBytes := runar.Num2Bin(runar.Len(payload), 4)
+	//   opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
+	//   c.AddDataOutput(0, opReturnScript)
+	//
+	// batchData still travels over the P2P gossip layer, and the
+	// on-chain hash256 check above (pvBatchDataHash == Hash256(batchData))
+	// binds the batch to the covenant — so the raw bytes just aren't
+	// duplicated in a second tx output today.
 
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber

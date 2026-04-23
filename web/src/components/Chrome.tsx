@@ -39,7 +39,10 @@ export default function Chrome(): ReactElement {
   const chainDec = hexToNumber(chainHex);
   const peers = health ? hexToNumber(health.peerCount) : 0;
   const gov = shard?.governance;
-  const quorum =
+  // For multisig shards show the M-of-N threshold; otherwise show the
+  // governance mode name (none / single_key). Label the pill as "gov"
+  // so "gov none" reads as "no governance keys", not as "no quorum".
+  const govLabel =
     gov && gov.threshold !== undefined && gov.keyCount !== undefined
       ? `${hexToNumber(gov.threshold)}/${hexToNumber(gov.keyCount)}`
       : gov?.mode ?? "—";
@@ -148,16 +151,27 @@ export default function Chrome(): ReactElement {
               {chainDec || "—"}
             </span>
           </Pill>
-          <Pill tone={peers > 0 ? "ok" : "warn"} dot>
-            <span style={{ color: "var(--ts-text-3)" }}>peers</span>
-            <span style={{ color: "var(--ts-text)" }} className="mono">
-              {peers}
-            </span>
-          </Pill>
+          <Link
+            to="/network"
+            title="Open Network page"
+            style={{ textDecoration: "none" }}
+          >
+            <Pill tone={peers > 0 ? "ok" : "warn"} dot>
+              <span style={{ color: "var(--ts-text-3)" }}>peers</span>
+              <span style={{ color: "var(--ts-text)" }} className="mono">
+                {peers}
+              </span>
+            </Pill>
+          </Link>
           <Pill tone="info">
-            <span style={{ color: "var(--ts-text-3)" }}>quorum</span>
+            <span
+              style={{ color: "var(--ts-text-3)" }}
+              title="Governance mode (or M/N threshold for multisig)"
+            >
+              gov
+            </span>
             <span style={{ color: "var(--ts-text)" }} className="mono">
-              {quorum}
+              {govLabel}
             </span>
           </Pill>
         </div>

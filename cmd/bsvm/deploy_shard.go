@@ -360,7 +360,19 @@ func resolveVerificationMode(proveMode, verification string) (covenant.Verificat
 	case "groth16":
 		return 0, "", fmt.Errorf("--verification=groth16 not yet wired in deploy-shard (requires VK fixture)")
 	case "groth16-wa":
-		return 0, "", fmt.Errorf("--verification=groth16-wa not yet wired in deploy-shard (requires VK fixture + witness plumbing)")
+		// Mode 3 (Groth16-WA) is mainnet-eligible but unreachable from
+		// the mock / execute prover paths: the rollup covenant's
+		// publicInput[1] == reducePublicValuesToScalarWA(publicValues)
+		// binding requires a fresh SP1 Groth16 proof per batch, and
+		// the only fixtures shipping with this repo (tests/sp1/,
+		// pkg/overlay/testdata/) are the fixed Gate 0b sample whose
+		// public inputs cannot satisfy the binding for a per-batch
+		// publicValues blob. Deploy-shard therefore refuses Mode 3
+		// until a real SP1 prover is wired (GPU, minutes per proof).
+		// Use --verification=fri for the trust-minimized devnet path.
+		return 0, "", fmt.Errorf("--verification=groth16-wa requires a real SP1 prover that produces a fresh " +
+			"Groth16 proof per batch; the mock prover reuses the Gate 0b fixture whose publicInputs cannot " +
+			"bind to per-batch publicValues. Use --verification=fri for devnet until a GPU-backed prover is wired")
 	default:
 		return 0, "", fmt.Errorf("invalid --verification %q", v)
 	}

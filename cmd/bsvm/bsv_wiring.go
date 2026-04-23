@@ -266,7 +266,21 @@ func selectRollupSourceInputs(in rollupSourceInputs) (string, map[string]interfa
 	case covenant.VerifyDevKey:
 		return "", nil, fmt.Errorf("devkey covenant has no broadcast path in Phase 3c; use execute (FRI) or prove (Groth16-WA)")
 	case covenant.VerifyGroth16WA:
-		return "", nil, fmt.Errorf("groth16-wa broadcast not yet wired in Phase 3c")
+		// Groth16-WA requires a per-batch SP1 Groth16 proof whose
+		// publicInput[1] equals reducePublicValuesToScalarWA(publicValues)
+		// for the on-chain pairing check to accept the advance. The
+		// mock prover (pkg/prover/host.go::proveMock) reuses the fixed
+		// Gate 0b fixture proof for every batch, so its publicInput[1]
+		// is locked to the fixture's value and cannot match a per-batch
+		// publicValues blob carrying live state roots + batch hash.
+		// Wiring Mode 3 for the devnet therefore also requires either
+		// a real SP1 prover (GPU, minutes per proof) or a prover that
+		// regenerates the Groth16 witness per batch. Until one exists,
+		// the only mainnet-eligible path through this code is
+		// unreachable with the mock prover.
+		return "", nil, fmt.Errorf("groth16-wa broadcast requires a real SP1 prover to regenerate proofs per batch " +
+			"(mock prover reuses a fixed Gate 0b fixture that cannot satisfy the on-chain publicInput[1] == " +
+			"reducePublicValuesToScalarWA(publicValues) binding); use --verification=fri for devnet mock/execute")
 	case covenant.VerifyGroth16:
 		return "", nil, fmt.Errorf("generic groth16 broadcast not yet wired")
 	default:

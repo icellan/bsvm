@@ -179,57 +179,26 @@ func TestGroth16Rollup_F07_DifferentBatchesProduceDifferentScripts(t *testing.T)
 // Mode 3 WA — F07 coverage
 // ---------------------------------------------------------------------------
 
-// TestGroth16WARollup_F07_EmitsSpec12OpReturn mirrors the Mode 2
-// positive test for Mode 3 WA.
-func TestGroth16WARollup_F07_EmitsSpec12OpReturn(t *testing.T) {
+// TestGroth16WARollup_F07_NoOpReturn — Mode 3 mirrors the Mode 1 FRI
+// regression: the spec-12 OP_RETURN emission was withdrawn because the
+// runar-go SDK's BuildCallTransaction does not honour `add_data_output`
+// ANF bindings (see rollup_fri.runar.go and rollup_groth16_wa.runar.go
+// for the full rationale). The covenant still binds batchData via the
+// pvBatchDataHash == hash256(batchData) check, so the hash commitment
+// is preserved; only the raw-bytes DA channel has moved from BSV to
+// P2P gossip. Restoring the OP_RETURN emission requires the SDK tx
+// builder to walk the method ANF for AddDataOutput calls and emit them
+// as real tx outputs between the continuation and the change output;
+// when that lands, the three historical positive-path tests can be
+// restored verbatim from git history.
+func TestGroth16WARollup_F07_NoOpReturn(t *testing.T) {
 	c := newGroth16WARollup(zeros32(), 0, 0)
 	args := buildGroth16WAArgs(zeros32(), 1)
 	callGroth16WAAdvance(c, args)
 
-	got := extractDataOutputScript(t, c.DataOutputs())
-	want := expectedOpReturnScript([]byte(args.batchData))
-	if string(got) != string(want) {
-		t.Errorf("Mode 3 OP_RETURN script mismatch:\n  got  %x\n  want %x", got, want)
-	}
-}
-
-// TestGroth16WARollup_F07_BatchDataRoundTrip — Mode 3 round-trip.
-func TestGroth16WARollup_F07_BatchDataRoundTrip(t *testing.T) {
-	c := newGroth16WARollup(zeros32(), 0, 0)
-	args := buildGroth16WAArgs(zeros32(), 1)
-	callGroth16WAAdvance(c, args)
-
-	script := extractDataOutputScript(t, c.DataOutputs())
-	recovered := script[3+4+len(advanceMagic):]
-	if string(recovered) != string(args.batchData) {
-		t.Errorf("Mode 3 batchData not recoverable from OP_RETURN:\n  got  %x\n  want %x",
-			recovered, []byte(args.batchData))
-	}
-}
-
-// TestGroth16WARollup_F07_EmptyBatchDataEmitsMagicOnly is an edge case:
-// a zero-byte batchData still produces a well-formed OP_RETURN carrying
-// just the "BSVM\x02" magic. Protects against the pushdata-length=0 corner.
-func TestGroth16WARollup_F07_EmptyBatchDataEmitsMagicOnly(t *testing.T) {
-	c := newGroth16WARollup(zeros32(), 0, 0)
-	args := buildGroth16WAArgs(zeros32(), 1)
-
-	// Swap in empty batchData and rebuild publicValues so the pv hash
-	// check still passes.
-	args.batchData = runar.ByteString("")
-	pv := buildPublicValues(zeros32(), stateRootForBlock(1), "", string(args.proofBlob), chainId)
-	args.publicValues = runar.ByteString(pv)
-
-	callGroth16WAAdvance(c, args)
-
-	script := extractDataOutputScript(t, c.DataOutputs())
-	declaredLen := binary.LittleEndian.Uint32(script[3:7])
-	if declaredLen != uint32(len(advanceMagic)) {
-		t.Errorf("empty batch: got push length %d, want %d", declaredLen, len(advanceMagic))
-	}
-	payload := script[3+4:]
-	if string(payload) != string(advanceMagic) {
-		t.Errorf("empty batch payload: got %x, want %x", payload, advanceMagic)
+	if got := len(c.DataOutputs()); got != 0 {
+		t.Errorf("Mode 3 Groth16-WA AdvanceState must NOT emit any data outputs "+
+			"(SDK limitation — see file header); got %d data outputs", got)
 	}
 }
 

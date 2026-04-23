@@ -549,6 +549,12 @@ func cmdRun(ctx *cli.Context) error {
 		uint64(chainID),
 		verifyMode,
 	)
+	// Propagate the governance config derived from the genesis manifest
+	// onto the covenant manager so bsv_shardInfo / bsv_getGovernanceState
+	// surface the deployed mode (single_key / multisig / none). The
+	// NewCovenantManager constructor defaults to an empty GovernanceConfig
+	// (mode=none) — SetGovernanceConfig corrects that post-hoc.
+	covenantMgr.SetGovernanceConfig(boot.Governance)
 
 	// 4. Create prover.
 	proverCfg := nodeCfg.ToProverConfig()

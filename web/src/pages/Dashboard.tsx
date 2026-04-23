@@ -61,6 +61,12 @@ export default function Dashboard() {
   const frozen = !!shard.data?.governance.frozen;
   const proveMode = proving.data?.mode ?? "—";
   const isMock = proveMode === "mock";
+  // Settlement is considered active when the proven tip is keeping up
+  // with the execution tip (covenant advances are landing on BSV).
+  // A mock-mode shard WITH a wired broadcast client still settles —
+  // the proofs are synthetic FRI blobs, but the on-chain data bindings
+  // (state roots, batch hash, chain id) are verified and advances mine.
+  const settlementActive = !!health.data && exec > 0 && prov >= exec - 2;
 
   const execBuf = useRingBuffer(exec || undefined, 60);
   const provBuf = useRingBuffer(prov || undefined, 60);
@@ -209,11 +215,18 @@ export default function Dashboard() {
                 body="Governance halt active. No new covenant advances accepted."
               />
             ) : null}
-            {isMock ? (
+            {isMock && !settlementActive ? (
               <AlertRow
                 tone="warn"
-                title="Prover in mock mode"
-                body="No SP1 proofs generated and no BSV covenant-advance transactions submitted. Set BSVM_PROVE_MODE=execute or prove for real settlement."
+                title="Prover in mock mode — no BSV settlement"
+                body="Synthetic proofs only and no covenant advances reaching BSV. Set BSVM_PROVE_MODE=execute or prove, and configure BSVM_BSV_RPC, to enable settlement."
+              />
+            ) : null}
+            {isMock && settlementActive ? (
+              <AlertRow
+                tone="warn"
+                title="Synthetic proofs (mock prover)"
+                body="The prover is returning synthetic FRI proofs instead of real SP1 STARKs. BSV covenant advances are still being broadcast and mined — state bindings are correct — but proof validity is not cryptographically enforced on-chain. Use BSVM_PROVE_MODE=prove for real STARK proofs."
               />
             ) : null}
             {!frozen && !isMock && specDepth > maxSpec * 0.75 ? (
