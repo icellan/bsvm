@@ -97,7 +97,31 @@ func waitHealthy(t *testing.T, timeout time.Duration) {
 		}
 		time.Sleep(2 * time.Second)
 	}
+	// Dump diagnostics BEFORE Fatalf so the t.Cleanup tear-down doesn't
+	// race us to remove the containers (CI captures only `t.Log` /
+	// `t.Errorf` output that was emitted before the test exits).
+	dumpClusterDiagnostics(t)
 	t.Fatalf("cluster did not become healthy within %s", timeout)
+}
+
+// dumpClusterDiagnostics writes `docker compose ps` and the tail of each
+// service's logs to the test log. Called from waitHealthy on timeout.
+func dumpClusterDiagnostics(t *testing.T) {
+	t.Helper()
+	if out, err := exec.Command("docker", "compose", "ps").CombinedOutput(); err == nil {
+		t.Logf("docker compose ps:\n%s", out)
+	} else {
+		t.Logf("docker compose ps failed: %v", err)
+	}
+	for _, svc := range []string{"bsv-regtest", "bsv-miner", "node1", "node2", "node3"} {
+		container := "bsvm-" + svc
+		out, err := exec.Command("docker", "logs", "--tail", "120", container).CombinedOutput()
+		if err != nil {
+			t.Logf("docker logs %s failed: %v", container, err)
+			continue
+		}
+		t.Logf("==== %s logs (tail 120) ====\n%s", svc, out)
+	}
 }
 
 func postRPC(t *testing.T, url, method string, params interface{}) json.RawMessage {
