@@ -47,8 +47,7 @@ const CHAIN_ID: u64 = 8453111;
 
 /// The L2 bridge predeploy address (spec 12: bridge contract at 0x4200...0010).
 const BRIDGE_CONTRACT_ADDRESS: Address = Address::new([
-    0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x10,
 ]);
 
@@ -168,9 +167,7 @@ pub fn main() {
             code: if account.code.is_empty() {
                 None
             } else {
-                Some(Bytecode::new_raw(Bytes::from(
-                    account.code.clone(),
-                )))
+                Some(Bytecode::new_raw(Bytes::from(account.code.clone())))
             },
         };
 
@@ -275,8 +272,14 @@ pub fn main() {
             };
 
             // Build the EVM context with our current DB state.
-            let mut ctx: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>, Journal<CacheDB<EmptyDB>>, ()> =
-                Context::new(db.clone(), SpecId::CANCUN);
+            let mut ctx: Context<
+                BlockEnv,
+                TxEnv,
+                CfgEnv,
+                CacheDB<EmptyDB>,
+                Journal<CacheDB<EmptyDB>>,
+                (),
+            > = Context::new(db.clone(), SpecId::CANCUN);
             ctx.block = block_env.clone();
 
             // Build the mainnet EVM.
@@ -384,16 +387,16 @@ pub fn main() {
 
     // ── 9. Commit public values (280 bytes, spec 12 layout) ──────────────
     // ORDER MUST MATCH the Public Values Layout table exactly.
-    sp1_zkvm::io::commit_slice(&input.pre_state_root);             // [0..32]
-    sp1_zkvm::io::commit_slice(&post_state_root);                  // [32..64]
-    sp1_zkvm::io::commit_slice(&receipts_hash);                    // [64..96]
+    sp1_zkvm::io::commit_slice(&input.pre_state_root); // [0..32]
+    sp1_zkvm::io::commit_slice(&post_state_root); // [32..64]
+    sp1_zkvm::io::commit_slice(&receipts_hash); // [64..96]
     sp1_zkvm::io::commit_slice(&cumulative_gas_used.to_be_bytes()); // [96..104]
-    sp1_zkvm::io::commit_slice(&batch_data_hash);                  // [104..136]
-    sp1_zkvm::io::commit_slice(&CHAIN_ID.to_be_bytes());           // [136..144]
-    sp1_zkvm::io::commit_slice(&withdrawal_root);                  // [144..176]
-    sp1_zkvm::io::commit_slice(&inbox_root_before);                // [176..208]
-    sp1_zkvm::io::commit_slice(&inbox_root_after);                 // [208..240]
-    sp1_zkvm::io::commit_slice(&migration_script_hash);            // [240..272]
+    sp1_zkvm::io::commit_slice(&batch_data_hash); // [104..136]
+    sp1_zkvm::io::commit_slice(&CHAIN_ID.to_be_bytes()); // [136..144]
+    sp1_zkvm::io::commit_slice(&withdrawal_root); // [144..176]
+    sp1_zkvm::io::commit_slice(&inbox_root_before); // [176..208]
+    sp1_zkvm::io::commit_slice(&inbox_root_after); // [208..240]
+    sp1_zkvm::io::commit_slice(&migration_script_hash); // [240..272]
     sp1_zkvm::io::commit_slice(&input.block_context.number.to_be_bytes()); // [272..280]
 }
 
@@ -410,16 +413,16 @@ fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
     error_marker[1] = error_code;
 
     // Fill in expected and actual roots for debugging.
-    sp1_zkvm::io::commit_slice(expected);           // [0..32] pre_state_root (expected)
-    sp1_zkvm::io::commit_slice(actual);             // [32..64] what we computed
-    sp1_zkvm::io::commit_slice(&error_marker);      // [64..96] error marker
+    sp1_zkvm::io::commit_slice(expected); // [0..32] pre_state_root (expected)
+    sp1_zkvm::io::commit_slice(actual); // [32..64] what we computed
+    sp1_zkvm::io::commit_slice(&error_marker); // [64..96] error marker
     sp1_zkvm::io::commit_slice(&0u64.to_be_bytes()); // [96..104]
-    sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [104..136]
+    sp1_zkvm::io::commit_slice(&[0u8; 32]); // [104..136]
     sp1_zkvm::io::commit_slice(&CHAIN_ID.to_be_bytes()); // [136..144]
-    sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [144..176]
-    sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [176..208]
-    sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [208..240]
-    sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [240..272]
+    sp1_zkvm::io::commit_slice(&[0u8; 32]); // [144..176]
+    sp1_zkvm::io::commit_slice(&[0u8; 32]); // [176..208]
+    sp1_zkvm::io::commit_slice(&[0u8; 32]); // [208..240]
+    sp1_zkvm::io::commit_slice(&[0u8; 32]); // [240..272]
     sp1_zkvm::io::commit_slice(&0u64.to_be_bytes()); // [272..280] block_number sentinel
 }
 

@@ -1,4 +1,6 @@
-use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProvingKey, ProverClient, SP1Stdin};
+use sp1_sdk::{
+    include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Stdin,
+};
 use std::fs;
 use std::time::Instant;
 
@@ -62,8 +64,7 @@ async fn main() {
     let core_verify_duration = core_verify_start.elapsed();
     println!("CORE proof verified in {:?}", core_verify_duration);
 
-    let core_proof_bytes =
-        bincode::serialize(&core_proof).expect("failed to serialize core proof");
+    let core_proof_bytes = bincode::serialize(&core_proof).expect("failed to serialize core proof");
     fs::write(
         format!("{}/core_proof.bin", artifacts_dir),
         &core_proof_bytes,
@@ -120,8 +121,7 @@ async fn main() {
 
     // Save VK hash.
     let vk_hash = vk.bytes32();
-    fs::write(format!("{}/vk_hash.hex", artifacts_dir), &vk_hash)
-        .expect("failed to write vk hash");
+    fs::write(format!("{}/vk_hash.hex", artifacts_dir), &vk_hash).expect("failed to write vk hash");
 
     // Save public values (same for both proof modes).
     let pv = comp_proof.public_values.as_slice();
@@ -140,11 +140,18 @@ async fn main() {
     println!("Guest program:          a + b = sum (10 + 20 = 30)");
     println!("SP1 version:            {}", core_proof.sp1_version);
     println!("Execution time:         {:?}", exec_duration);
-    println!("Total RISC-V cycles:    {}", report.total_instruction_count());
+    println!(
+        "Total RISC-V cycles:    {}",
+        report.total_instruction_count()
+    );
     println!("Guest ELF size:         {} bytes", GUEST_ELF.len());
     println!("VK size:                {} bytes", vk_bytes.len());
     println!("VK hash:                {}", vk_hash);
-    println!("Public values:          {} bytes (hex: {})", pv.len(), hex::encode(pv));
+    println!(
+        "Public values:          {} bytes (hex: {})",
+        pv.len(),
+        hex::encode(pv)
+    );
     println!();
     println!("  CORE proof:");
     println!("    Proving time:       {:?}", core_prove_duration);
@@ -175,10 +182,7 @@ async fn main() {
             relevant_size_kb
         );
     } else if relevant_size_kb < 500.0 {
-        println!(
-            "  MARGINAL: {:.1} KB (200-500 KB range)",
-            relevant_size_kb
-        );
+        println!("  MARGINAL: {:.1} KB (200-500 KB range)", relevant_size_kb);
     } else {
         println!(
             "  UNACCEPTABLE: {:.1} KB > 500 KB threshold",

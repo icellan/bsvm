@@ -27,15 +27,21 @@ fn main() {
         println!("  CORE PROOF INSPECTION");
         println!("================================================================");
         println!("File: {}", core_path);
-        println!("File size: {} bytes ({:.1} KB)", core_bytes.len(), core_bytes.len() as f64 / 1024.0);
+        println!(
+            "File size: {} bytes ({:.1} KB)",
+            core_bytes.len(),
+            core_bytes.len() as f64 / 1024.0
+        );
         println!();
 
         match bincode::deserialize::<SP1ProofWithPublicValues>(&core_bytes) {
             Ok(proof_with_pv) => {
                 println!("SP1 version: {}", proof_with_pv.sp1_version);
-                println!("Public values: {} bytes (hex: {})",
+                println!(
+                    "Public values: {} bytes (hex: {})",
                     proof_with_pv.public_values.as_slice().len(),
-                    hex::encode(proof_with_pv.public_values.as_slice()));
+                    hex::encode(proof_with_pv.public_values.as_slice())
+                );
 
                 match &proof_with_pv.proof {
                     SP1Proof::Core(shard_proofs) => {
@@ -46,8 +52,11 @@ fn main() {
                         for (i, shard) in shard_proofs.iter().enumerate() {
                             let shard_bytes = bincode::serialize(shard).unwrap_or_default();
                             println!("--- Shard {} ---", i);
-                            println!("  Serialized size: {} bytes ({:.1} KB)",
-                                shard_bytes.len(), shard_bytes.len() as f64 / 1024.0);
+                            println!(
+                                "  Serialized size: {} bytes ({:.1} KB)",
+                                shard_bytes.len(),
+                                shard_bytes.len() as f64 / 1024.0
+                            );
 
                             // Main commitment
                             println!("  Main commitment: {:?}", shard.main_commitment);
@@ -56,24 +65,42 @@ fn main() {
                             println!("  Public values count: {}", shard.public_values.len());
 
                             // Opened values (now a BTreeMap<String, ChipOpenedValues>)
-                            println!("  Opened values ({} chips):", shard.opened_values.chips.len());
+                            println!(
+                                "  Opened values ({} chips):",
+                                shard.opened_values.chips.len()
+                            );
                             for (name, chip_ov) in &shard.opened_values.chips {
                                 println!("    {} :", name);
-                                println!("        preprocessed: local={}",
-                                    chip_ov.preprocessed.local.len());
-                                println!("        main:         local={}",
-                                    chip_ov.main.local.len());
+                                println!(
+                                    "        preprocessed: local={}",
+                                    chip_ov.preprocessed.local.len()
+                                );
+                                println!(
+                                    "        main:         local={}",
+                                    chip_ov.main.local.len()
+                                );
                                 println!("        degree:       {:?}", chip_ov.degree);
                             }
 
                             // Size breakdown estimate
-                            let opened_bytes = bincode::serialize(&shard.opened_values).unwrap_or_default();
-                            let eval_proof_bytes = bincode::serialize(&shard.evaluation_proof).unwrap_or_default();
-                            let pv_bytes = bincode::serialize(&shard.public_values).unwrap_or_default();
+                            let opened_bytes =
+                                bincode::serialize(&shard.opened_values).unwrap_or_default();
+                            let eval_proof_bytes =
+                                bincode::serialize(&shard.evaluation_proof).unwrap_or_default();
+                            let pv_bytes =
+                                bincode::serialize(&shard.public_values).unwrap_or_default();
 
                             println!("  Size breakdown:");
-                            println!("    opened_values:    {} bytes ({:.1} KB)", opened_bytes.len(), opened_bytes.len() as f64 / 1024.0);
-                            println!("    evaluation_proof: {} bytes ({:.1} KB)", eval_proof_bytes.len(), eval_proof_bytes.len() as f64 / 1024.0);
+                            println!(
+                                "    opened_values:    {} bytes ({:.1} KB)",
+                                opened_bytes.len(),
+                                opened_bytes.len() as f64 / 1024.0
+                            );
+                            println!(
+                                "    evaluation_proof: {} bytes ({:.1} KB)",
+                                eval_proof_bytes.len(),
+                                eval_proof_bytes.len() as f64 / 1024.0
+                            );
                             println!("    public_values:    {} bytes", pv_bytes.len());
                             println!();
                         }
@@ -99,15 +126,21 @@ fn main() {
         println!("  COMPRESSED PROOF INSPECTION");
         println!("================================================================");
         println!("File: {}", comp_path);
-        println!("File size: {} bytes ({:.1} KB)", comp_bytes.len(), comp_bytes.len() as f64 / 1024.0);
+        println!(
+            "File size: {} bytes ({:.1} KB)",
+            comp_bytes.len(),
+            comp_bytes.len() as f64 / 1024.0
+        );
         println!();
 
         match bincode::deserialize::<SP1ProofWithPublicValues>(&comp_bytes) {
             Ok(proof_with_pv) => {
                 println!("SP1 version: {}", proof_with_pv.sp1_version);
-                println!("Public values: {} bytes (hex: {})",
+                println!(
+                    "Public values: {} bytes (hex: {})",
                     proof_with_pv.public_values.as_slice().len(),
-                    hex::encode(proof_with_pv.public_values.as_slice()));
+                    hex::encode(proof_with_pv.public_values.as_slice())
+                );
 
                 match &proof_with_pv.proof {
                     SP1Proof::Compressed(recursion_proof) => {
@@ -126,8 +159,11 @@ fn main() {
                         println!("--- Compressed Shard Proof ---");
 
                         let shard_bytes = bincode::serialize(shard).unwrap_or_default();
-                        println!("  Serialized size: {} bytes ({:.1} KB)",
-                            shard_bytes.len(), shard_bytes.len() as f64 / 1024.0);
+                        println!(
+                            "  Serialized size: {} bytes ({:.1} KB)",
+                            shard_bytes.len(),
+                            shard_bytes.len() as f64 / 1024.0
+                        );
 
                         // Main commitment
                         println!("  Main commitment: {:?}", shard.main_commitment);
@@ -136,28 +172,46 @@ fn main() {
                         println!("  Public values count: {}", shard.public_values.len());
 
                         // Opened values (BTreeMap<String, ChipOpenedValues>)
-                        println!("  Opened values ({} chips):", shard.opened_values.chips.len());
+                        println!(
+                            "  Opened values ({} chips):",
+                            shard.opened_values.chips.len()
+                        );
                         for (name, chip_ov) in &shard.opened_values.chips {
                             println!("    {} :", name);
-                            println!("        preprocessed: local={}",
-                                chip_ov.preprocessed.local.len());
-                            println!("        main:         local={}",
-                                chip_ov.main.local.len());
+                            println!(
+                                "        preprocessed: local={}",
+                                chip_ov.preprocessed.local.len()
+                            );
+                            println!("        main:         local={}", chip_ov.main.local.len());
                             println!("        degree:       {:?}", chip_ov.degree);
                         }
 
                         // Size breakdown
                         let vk_bytes = bincode::serialize(vk).unwrap_or_default();
-                        let opened_bytes = bincode::serialize(&shard.opened_values).unwrap_or_default();
-                        let eval_proof_bytes = bincode::serialize(&shard.evaluation_proof).unwrap_or_default();
+                        let opened_bytes =
+                            bincode::serialize(&shard.opened_values).unwrap_or_default();
+                        let eval_proof_bytes =
+                            bincode::serialize(&shard.evaluation_proof).unwrap_or_default();
                         let pv_bytes = bincode::serialize(&shard.public_values).unwrap_or_default();
 
                         println!();
                         println!("--- Size Breakdown ---");
                         println!("  Recursion VK:       {} bytes", vk_bytes.len());
-                        println!("  Shard proof:        {} bytes ({:.1} KB)", shard_bytes.len(), shard_bytes.len() as f64 / 1024.0);
-                        println!("    opened_values:    {} bytes ({:.1} KB)", opened_bytes.len(), opened_bytes.len() as f64 / 1024.0);
-                        println!("    evaluation_proof: {} bytes ({:.1} KB)", eval_proof_bytes.len(), eval_proof_bytes.len() as f64 / 1024.0);
+                        println!(
+                            "  Shard proof:        {} bytes ({:.1} KB)",
+                            shard_bytes.len(),
+                            shard_bytes.len() as f64 / 1024.0
+                        );
+                        println!(
+                            "    opened_values:    {} bytes ({:.1} KB)",
+                            opened_bytes.len(),
+                            opened_bytes.len() as f64 / 1024.0
+                        );
+                        println!(
+                            "    evaluation_proof: {} bytes ({:.1} KB)",
+                            eval_proof_bytes.len(),
+                            eval_proof_bytes.len() as f64 / 1024.0
+                        );
                         println!("    public_values:    {} bytes", pv_bytes.len());
                     }
                     other => println!("Unexpected proof type: {}", other),

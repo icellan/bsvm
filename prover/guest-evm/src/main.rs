@@ -15,8 +15,8 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A simplified account: address + nonce + balance.
 /// Balance is u64 (wei-scale for this gate check; the full guest uses U256).
@@ -70,17 +70,11 @@ pub fn main() {
         .expect("recipient not found in pre-state");
 
     // Validate nonce
-    assert!(
-        accounts[sender_idx].nonce == tx.nonce,
-        "nonce mismatch"
-    );
+    assert!(accounts[sender_idx].nonce == tx.nonce, "nonce mismatch");
 
     // Validate balance (value + gas cost)
     let gas_cost = tx.gas_limit * tx.gas_price;
-    let total_cost = tx
-        .value
-        .checked_add(gas_cost)
-        .expect("total cost overflow");
+    let total_cost = tx.value.checked_add(gas_cost).expect("total cost overflow");
     assert!(
         accounts[sender_idx].balance >= total_cost,
         "insufficient balance"
@@ -102,10 +96,10 @@ pub fn main() {
     let batch_data_hash = sha256(&batch_data);
 
     // ── 6. Commit public values (112 bytes, spec 12 layout) ───────────
-    sp1_zkvm::io::commit_slice(&pre_state_root);              // [0..32]
-    sp1_zkvm::io::commit_slice(&post_state_root);             // [32..64]
-    sp1_zkvm::io::commit_slice(&gas_used.to_be_bytes());      // [64..72]
-    sp1_zkvm::io::commit_slice(&batch_data_hash);             // [72..104]
+    sp1_zkvm::io::commit_slice(&pre_state_root); // [0..32]
+    sp1_zkvm::io::commit_slice(&post_state_root); // [32..64]
+    sp1_zkvm::io::commit_slice(&gas_used.to_be_bytes()); // [64..72]
+    sp1_zkvm::io::commit_slice(&batch_data_hash); // [72..104]
     sp1_zkvm::io::commit_slice(&input.chain_id.to_be_bytes()); // [104..112]
 }
 

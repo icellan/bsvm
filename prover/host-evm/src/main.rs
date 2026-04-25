@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProvingKey, ProverClient, SP1Proof, SP1Stdin};
+use sp1_sdk::{
+    include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Proof,
+    SP1Stdin,
+};
 use std::fs;
 use std::time::Instant;
 
@@ -47,12 +50,12 @@ async fn main() {
     // Gas: 21000 * 1 = 21000
 
     let sender_addr: [u8; 20] = [
-        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11, 0x22, 0x33, 0x44, 0x55,
-        0x66, 0x77, 0x88, 0x99, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
     ];
     let recipient_addr: [u8; 20] = [
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA,
-        0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x11, 0x22, 0x33, 0x44, 0x55,
     ];
 
     let accounts = vec![
@@ -101,13 +104,25 @@ async fn main() {
     println!("Sender:    0x{}", hex::encode(sender_addr));
     println!("Recipient: 0x{}", hex::encode(recipient_addr));
     println!("Value:     {}", transfer.value);
-    println!("Gas:       {} * {} = {}", transfer.gas_limit, transfer.gas_price, gas_cost);
+    println!(
+        "Gas:       {} * {} = {}",
+        transfer.gas_limit, transfer.gas_price, gas_cost
+    );
     println!("Chain ID:  {}", chain_id);
     println!();
-    println!("Expected pre-state root:  {}", hex::encode(expected_pre_root));
-    println!("Expected post-state root: {}", hex::encode(expected_post_root));
+    println!(
+        "Expected pre-state root:  {}",
+        hex::encode(expected_pre_root)
+    );
+    println!(
+        "Expected post-state root: {}",
+        hex::encode(expected_post_root)
+    );
     println!("Expected gas used:        {}", expected_gas_used);
-    println!("Expected batch data hash: {}", hex::encode(expected_batch_hash));
+    println!(
+        "Expected batch data hash: {}",
+        hex::encode(expected_batch_hash)
+    );
 
     // -- 3. Prepare SP1 stdin ---
     let client = ProverClient::builder().cpu().build().await;
@@ -167,8 +182,7 @@ async fn main() {
     println!("CORE proof verified in {:?}", core_verify_duration);
 
     let core_bytes = bincode::serialize(&core_proof).expect("serialize core proof");
-    fs::write(format!("{}/core_proof.bin", artifacts_dir), &core_bytes)
-        .expect("write core proof");
+    fs::write(format!("{}/core_proof.bin", artifacts_dir), &core_bytes).expect("write core proof");
     println!(
         "CORE proof size: {} bytes ({:.1} KB)",
         core_bytes.len(),
@@ -203,8 +217,11 @@ async fn main() {
     println!("COMPRESSED proof verified in {:?}", comp_verify_duration);
 
     let comp_bytes = bincode::serialize(&comp_proof).expect("serialize compressed proof");
-    fs::write(format!("{}/compressed_proof.bin", artifacts_dir), &comp_bytes)
-        .expect("write compressed proof");
+    fs::write(
+        format!("{}/compressed_proof.bin", artifacts_dir),
+        &comp_bytes,
+    )
+    .expect("write compressed proof");
     println!(
         "COMPRESSED proof size: {} bytes ({:.1} KB)",
         comp_bytes.len(),
@@ -222,8 +239,7 @@ async fn main() {
     fs::write(format!("{}/public_values.bin", artifacts_dir), pv_bytes)
         .expect("write public values");
 
-    fs::write(format!("{}/guest_evm.elf", artifacts_dir), &*GUEST_ELF)
-        .expect("write guest ELF");
+    fs::write(format!("{}/guest_evm.elf", artifacts_dir), &*GUEST_ELF).expect("write guest ELF");
 
     // Save public values as hex for inspection
     fs::write(
@@ -246,18 +262,30 @@ async fn main() {
     println!("  Execution:");
     println!("    Time:               {:?}", exec_duration);
     println!("    RISC-V cycles:      {}", cycle_count);
-    println!("    Guest ELF size:     {} bytes ({:.1} KB)", elf_size, elf_size as f64 / 1024.0);
+    println!(
+        "    Guest ELF size:     {} bytes ({:.1} KB)",
+        elf_size,
+        elf_size as f64 / 1024.0
+    );
     println!();
     println!("  CORE proof:");
     println!("    Proving time:       {:?}", core_duration);
     println!("    Verification time:  {:?}", core_verify_duration);
-    println!("    Proof size:         {} bytes ({:.1} KB)", core_bytes.len(), core_bytes.len() as f64 / 1024.0);
+    println!(
+        "    Proof size:         {} bytes ({:.1} KB)",
+        core_bytes.len(),
+        core_bytes.len() as f64 / 1024.0
+    );
     println!("    Shards:             {}", num_shards);
     println!();
     println!("  COMPRESSED proof:");
     println!("    Proving time:       {:?}", comp_duration);
     println!("    Verification time:  {:?}", comp_verify_duration);
-    println!("    Proof size:         {} bytes ({:.1} KB)", comp_bytes.len(), comp_bytes.len() as f64 / 1024.0);
+    println!(
+        "    Proof size:         {} bytes ({:.1} KB)",
+        comp_bytes.len(),
+        comp_bytes.len() as f64 / 1024.0
+    );
     println!();
     println!("  Artifacts:");
     println!("    VK size:            {} bytes", vk_bytes.len());
@@ -268,8 +296,14 @@ async fn main() {
     println!("    preStateRoot:       {}", hex::encode(&pv_bytes[0..32]));
     println!("    postStateRoot:      {}", hex::encode(&pv_bytes[32..64]));
     println!("    gasUsed:            {}", hex::encode(&pv_bytes[64..72]));
-    println!("    batchDataHash:      {}", hex::encode(&pv_bytes[72..104]));
-    println!("    chainId:            {}", hex::encode(&pv_bytes[104..112]));
+    println!(
+        "    batchDataHash:      {}",
+        hex::encode(&pv_bytes[72..104])
+    );
+    println!(
+        "    chainId:            {}",
+        hex::encode(&pv_bytes[104..112])
+    );
     println!("================================================================");
 
     // -- 10. Gate 0b threshold evaluation ---
@@ -467,26 +501,14 @@ fn verify_public_values(
     expected_chain_id: u64,
 ) {
     // [0..32] preStateRoot
-    assert_eq!(
-        &pv[0..32],
-        expected_pre_root,
-        "preStateRoot mismatch"
-    );
+    assert_eq!(&pv[0..32], expected_pre_root, "preStateRoot mismatch");
     // [32..64] postStateRoot
-    assert_eq!(
-        &pv[32..64],
-        expected_post_root,
-        "postStateRoot mismatch"
-    );
+    assert_eq!(&pv[32..64], expected_post_root, "postStateRoot mismatch");
     // [64..72] gasUsed (big-endian u64)
     let gas_used = u64::from_be_bytes(pv[64..72].try_into().unwrap());
     assert_eq!(gas_used, expected_gas_used, "gasUsed mismatch");
     // [72..104] batchDataHash
-    assert_eq!(
-        &pv[72..104],
-        expected_batch_hash,
-        "batchDataHash mismatch"
-    );
+    assert_eq!(&pv[72..104], expected_batch_hash, "batchDataHash mismatch");
     // [104..112] chainId (big-endian u64)
     let chain_id = u64::from_be_bytes(pv[104..112].try_into().unwrap());
     assert_eq!(chain_id, expected_chain_id, "chainId mismatch");

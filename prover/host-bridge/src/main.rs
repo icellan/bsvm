@@ -10,7 +10,9 @@
 //! via stdin/stdout JSON.
 
 use serde::{Deserialize, Serialize};
-use sp1_sdk::{include_elf, Elf, HashableKey, Prover, ProveRequest, ProvingKey, ProverClient, SP1Stdin};
+use sp1_sdk::{
+    include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Stdin,
+};
 use std::io::{self, Read};
 use std::time::Instant;
 
@@ -276,10 +278,7 @@ async fn main() {
     stdin.write(&guest_input);
 
     // Set up proving and verifying keys.
-    let pk = client
-        .setup(GUEST_ELF.clone())
-        .await
-        .expect("setup failed");
+    let pk = client.setup(GUEST_ELF.clone()).await.expect("setup failed");
     let vk = pk.verifying_key().clone();
     let vk_hash = vk.bytes32();
 
@@ -328,10 +327,7 @@ async fn main() {
                         bincode::serialize(&proof).expect("failed to serialize proof");
                     let output = HostOutput {
                         proof: format!("0x{}", hex::encode(&proof_bytes)),
-                        public_values: format!(
-                            "0x{}",
-                            hex::encode(proof.public_values.as_slice())
-                        ),
+                        public_values: format!("0x{}", hex::encode(proof.public_values.as_slice())),
                         vk_hash: vk_hash.to_string(),
                         cycles: 0,
                         proving_time_ms: duration.as_millis() as u64,
@@ -365,10 +361,7 @@ async fn main() {
                         bincode::serialize(&proof).expect("failed to serialize proof");
                     let output = HostOutput {
                         proof: format!("0x{}", hex::encode(&proof_bytes)),
-                        public_values: format!(
-                            "0x{}",
-                            hex::encode(proof.public_values.as_slice())
-                        ),
+                        public_values: format!("0x{}", hex::encode(proof.public_values.as_slice())),
                         vk_hash: vk_hash.to_string(),
                         cycles: 0,
                         proving_time_ms: duration.as_millis() as u64,
