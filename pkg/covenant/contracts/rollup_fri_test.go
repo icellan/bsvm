@@ -77,19 +77,23 @@ func generateBatchData(preStateRoot, newStateRoot string, size int) string {
 	return string(data)
 }
 
-// buildPublicValues constructs a 272-byte public values blob matching the
+// buildPublicValues constructs a 280-byte public values blob matching the
 // spec 12 layout. Offset [64..96] is reserved for receiptsHash per spec
 // 12 (unused by Mode 1; the Groth16 rollups don't consult it either).
-func buildPublicValues(preStateRoot, postStateRoot, batchData, proofBlob string, cid int64) string {
+// blockNumber is serialised into [272..280) as 8 little-endian bytes to
+// match runar.Num2Bin(newBlockNumber, 8) on the covenant side.
+func buildPublicValues(preStateRoot, postStateRoot, batchData, proofBlob string, cid, blockNumber int64) string {
 	z32 := zeros32()
 	z8 := string(make([]byte, 8))
 	proofHash := rawHash256(proofBlob) // occupies the reserved [64..96] slot
 	batchDataHash := rawHash256(batchData)
 	chainIdBytes := num2binLE(cid)
+	blockNumberBytes := num2binLE(blockNumber)
 
 	return preStateRoot + postStateRoot + proofHash + z8 +
 		batchDataHash + chainIdBytes +
-		z32 + z32 + z32 + z32
+		z32 + z32 + z32 + z32 +
+		blockNumberBytes
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +160,7 @@ func buildFRIArgs(preStateRoot string, newBlockNumber int64) friAdvArgs {
 	newStateRoot := stateRootForBlock(int(newBlockNumber))
 	batchData := generateBatchData(preStateRoot, newStateRoot, testBatchDataSize)
 	proofBlob := generateProofBlob(byte(newBlockNumber), testProofBlobSize)
-	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId)
+	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId, newBlockNumber)
 
 	return friAdvArgs{
 		newStateRoot: runar.ByteString(newStateRoot),
@@ -174,7 +178,10 @@ func callFRIAdvance(c *FRIRollupContract, a friAdvArgs) {
 }
 
 // buildFRIUpgradeArgs builds a valid advance args bundle and splices the
-// migration hash into pv[240..272] (which Upgrade verifies).
+// migration hash into pv[240..272] (which Upgrade verifies). The block
+// number slot at pv[272..280] was already populated to newBlockNumber by
+// buildFRIArgs → buildPublicValues, so Upgrade's pvBlockNumber assertion
+// matches without extra splicing.
 func buildFRIUpgradeArgs(c *FRIRollupContract, newScript runar.ByteString) friAdvArgs {
 	preStateRoot := string(c.StateRoot)
 	newBlockNumber := int64(c.BlockNumber) + 1
@@ -316,7 +323,7 @@ func TestFRIRollup_RejectWrongChainId(t *testing.T) {
 	args := buildFRIArgs(zeros32(), 1)
 	newStateRoot := stateRootForBlock(1)
 	badPV := buildPublicValues(zeros32(), newStateRoot,
-		string(args.batchData), string(args.proofBlob), 999)
+		string(args.batchData), string(args.proofBlob), 999, 1)
 	args.publicValues = runar.ByteString(badPV)
 	callFRIAdvance(c, args)
 }
@@ -330,6 +337,29 @@ func TestFRIRollup_RejectPostStateRootMismatch(t *testing.T) {
 	c := newFRIRollup(zeros32(), 0, 0)
 	args := buildFRIArgs(zeros32(), 1)
 	args.newStateRoot = runar.ByteString(rawSha256("garbage"))
+	callFRIAdvance(c, args)
+}
+
+// TestFRIRollup_RejectBlockNumberMismatch pins the C4 binding: the
+// public-values slot at [272..280) must encode the same block number
+// the caller supplies in newBlockNumber. A prover that commits a
+// different block number in the proof cannot replay it at another
+// height.
+func TestFRIRollup_RejectBlockNumberMismatch(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected assertion failure")
+		}
+	}()
+	c := newFRIRollup(zeros32(), 0, 0)
+	args := buildFRIArgs(zeros32(), 1)
+	// Splice a mismatched block number into pv[272..280): claim block 2
+	// in the proof's public values while newBlockNumber = 1 is passed
+	// as the method argument. The covenant's pvBlockNumber assertion
+	// must reject.
+	pv := []byte(args.publicValues)
+	copy(pv[272:280], []byte(num2binLE(2)))
+	args.publicValues = runar.ByteString(string(pv))
 	callFRIAdvance(c, args)
 }
 

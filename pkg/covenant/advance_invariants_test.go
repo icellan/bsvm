@@ -291,13 +291,12 @@ func TestAdvance_SingleOpPushTxBinding(t *testing.T) {
 // more than one would mean an extra data output is bound into the tx
 // shape without a reason.
 //
-// Mode 1 FRI is exempt: the runar-go SDK's tx builder does not (yet)
-// honour `add_data_output` ANF bindings, so compiling a FRI covenant
-// that emits an OP_RETURN output makes every advance fail on-chain
-// (hashOutputs in the preimage disagrees with the in-script
-// computation). The FRI contract commits to batchDataHash only until
-// the SDK catches up; see rollup_fri.runar.go AdvanceState docstring
-// for the restoration path.
+// All three modes now emit exactly one data output for the spec-12
+// OP_RETURN(BSVM\x02) batch envelope. The runar-go SDK's
+// BuildCallTransaction resolves AddDataOutput ANF bindings at call
+// time (R9 / RUNAR-SDK-DATA-OUTPUTS.md), so the on-chain tx carries
+// the data output verbatim and hashOutputs matches the compiled
+// continuation-hash constant.
 func TestAdvance_SingleDataOutput(t *testing.T) {
 	for _, fx := range buildRollupFixtures(t) {
 		t.Run(fx.Name, func(t *testing.T) {
@@ -305,13 +304,9 @@ func TestAdvance_SingleDataOutput(t *testing.T) {
 			if adv == nil {
 				t.Fatal("advanceState method missing from compiled ANF")
 			}
-			wantDataOutputs := 1
-			if fx.Name == "fri" {
-				wantDataOutputs = 0
-			}
-			if adv.AddDataOutput != wantDataOutputs {
-				t.Errorf("advanceState must contain exactly %d add_data_output binding(s), got %d",
-					wantDataOutputs, adv.AddDataOutput)
+			if adv.AddDataOutput != 1 {
+				t.Errorf("advanceState must contain exactly 1 add_data_output binding, got %d",
+					adv.AddDataOutput)
 			}
 		})
 	}
@@ -323,10 +318,11 @@ func TestAdvance_SingleDataOutput(t *testing.T) {
 
 // TestAdvance_PublicValueOffsets pins that advanceState's substr calls
 // cover exactly the spec-12 slots:
-//   - [0..32)   preStateRoot
-//   - [32..64)  postStateRoot
+//   - [0..32)    preStateRoot
+//   - [32..64)   postStateRoot
 //   - [104..136) batchDataHash
 //   - [136..144) chainId (little-endian 8 bytes)
+//   - [272..280) blockNumber (little-endian 8 bytes)
 //
 // The offsets are encoded as load_const bindings resolved from the ANF
 // name graph. A regression that reshuffles the slots (e.g. reads batch
@@ -337,6 +333,7 @@ func TestAdvance_PublicValueOffsets(t *testing.T) {
 		{Start: 32, Length: 32},
 		{Start: 104, Length: 32},
 		{Start: 136, Length: 8},
+		{Start: 272, Length: 8},
 	}
 	for _, fx := range buildRollupFixtures(t) {
 		t.Run(fx.Name, func(t *testing.T) {

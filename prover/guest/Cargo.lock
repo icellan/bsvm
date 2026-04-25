@@ -528,6 +528,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "bincode",
  "revm",
  "revm-primitives",
  "serde",

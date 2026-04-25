@@ -42,10 +42,10 @@ type Model struct {
 	stats sim.EngineStats
 
 	// Focus + selection state.
-	focus        Panel
-	workloadIdx  int
-	userIdx      int
-	showHelp     bool
+	focus         Panel
+	workloadIdx   int
+	userIdx       int
+	showHelp      bool
 	width, height int
 
 	// Workload start/stop palette (kind -> running).

@@ -585,7 +585,7 @@ func TestPrepareGenesisDefaultSats(t *testing.T) {
 		InitialStateRoot: testStateRoot(0),
 		Governance:       GovernanceConfig{Mode: GovernanceNone},
 		Verification:     VerifyFRI, // Basefold compiles; Groth16 needs BN254 not yet in Rúnar
-		CovenantSats:     0,              // Should default to DefaultCovenantSats
+		CovenantSats:     0,         // Should default to DefaultCovenantSats
 	}
 
 	result, err := PrepareGenesis(config)

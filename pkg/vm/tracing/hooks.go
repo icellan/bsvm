@@ -3,8 +3,8 @@ package tracing
 import (
 	"math/big"
 
-	"github.com/icellan/bsvm/pkg/types"
 	"github.com/holiman/uint256"
+	"github.com/icellan/bsvm/pkg/types"
 )
 
 // Hooks is the collection of tracing hooks that can be used to observe EVM execution.

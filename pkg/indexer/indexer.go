@@ -49,11 +49,11 @@ const blockNumZero uint64 = 0
 
 // Entry is one row in the per-address history.
 type Entry struct {
-	TxHash      types.Hash    `json:"txHash"`
-	BlockNumber uint64        `json:"blockNumber"`
-	TxIndex     uint32        `json:"txIndex"`
-	Direction   Direction     `json:"direction"`
-	Status      uint64        `json:"status"`
+	TxHash      types.Hash     `json:"txHash"`
+	BlockNumber uint64         `json:"blockNumber"`
+	TxIndex     uint32         `json:"txIndex"`
+	Direction   Direction      `json:"direction"`
+	Status      uint64         `json:"status"`
 	Other       *types.Address `json:"otherParty,omitempty"`
 }
 
@@ -76,9 +76,9 @@ type store interface {
 // Indexer is the live indexer. Zero value is unusable — always
 // construct via New and call Close when done.
 type Indexer struct {
-	store    store
-	signer   types.Signer
-	chainID  *big.Int
+	store   store
+	signer  types.Signer
+	chainID *big.Int
 
 	ch any // chan *block.L2Block; typed via assertion to avoid a public chan field
 
@@ -299,10 +299,10 @@ func ptr(a types.Address) *types.Address { return &a }
 // putEntry writes one address-side row to the batch.
 // Value layout (fixed 34 bytes):
 //
-//   [0:32]  txHash
-//   [32]    direction code (0=from, 1=to, 2=create)
-//   [33]    status bit (1 = success, 0 = failure)
-//   [34:]   optional counterparty (0 or 20 bytes)
+//	[0:32]  txHash
+//	[32]    direction code (0=from, 1=to, 2=create)
+//	[33]    status bit (1 = success, 0 = failure)
+//	[34:]   optional counterparty (0 or 20 bytes)
 func putEntry(batch db.Batch, addr types.Address, blockNum uint64, txIdx uint32, txHash types.Hash, dir Direction, status uint64, counterparty *types.Address) error {
 	key := encodeKey(addr, blockNum, txIdx)
 	val := make([]byte, 34, 54)

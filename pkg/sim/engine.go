@@ -45,7 +45,7 @@ type Engine struct {
 	Reg  *Registry
 	MC   *rpc.MultiClient
 
-	Deploy *Deployments
+	Deploy  *Deployments
 	ChainID uint64
 
 	// Rolling tx counters for the TPS ticker.

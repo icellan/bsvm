@@ -43,20 +43,22 @@ import (
 // TestHappyPath_DeployAndCallInSameBatch.
 //
 // Init bytecode (12 bytes): 6007600c60003960076000f3
-//   PUSH1 0x07  — runtime length
-//   PUSH1 0x0c  — runtime offset in this init code
-//   PUSH1 0x00  — memory destination
-//   CODECOPY    — copy runtime to memory[0:7]
-//   PUSH1 0x07  — return size
-//   PUSH1 0x00  — return offset
-//   RETURN
+//
+//	PUSH1 0x07  — runtime length
+//	PUSH1 0x0c  — runtime offset in this init code
+//	PUSH1 0x00  — memory destination
+//	CODECOPY    — copy runtime to memory[0:7]
+//	PUSH1 0x07  — return size
+//	PUSH1 0x00  — return offset
+//	RETURN
 //
 // Runtime bytecode (7 bytes): 60043560005500
-//   PUSH1 0x04  — calldata offset (skip 4-byte selector)
-//   CALLDATALOAD — load 32 bytes from calldata[4:36] onto stack
-//   PUSH1 0x00  — storage slot 0
-//   SSTORE      — store top-of-stack value into slot 0
-//   STOP
+//
+//	PUSH1 0x04  — calldata offset (skip 4-byte selector)
+//	CALLDATALOAD — load 32 bytes from calldata[4:36] onto stack
+//	PUSH1 0x00  — storage slot 0
+//	SSTORE      — store top-of-stack value into slot 0
+//	STOP
 var storageContractCreationCode = mustHex("6007600c60003960076000f360043560005500")
 
 func mustHex(s string) []byte {

@@ -33,8 +33,8 @@ func NewERC721Workload(pool *UserPool, reg *Registry, nft types.Address, initial
 	return w
 }
 
-func (w *ERC721Workload) Kind() WorkloadKind { return KindERC721Mint }
-func (w *ERC721Workload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *ERC721Workload) Kind() WorkloadKind   { return KindERC721Mint }
+func (w *ERC721Workload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *ERC721Workload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 func (w *ERC721Workload) Run(ctx context.Context) {

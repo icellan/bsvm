@@ -9,10 +9,14 @@ import (
 )
 
 // PublicValuesSize is the fixed size of the SP1 guest's public values output.
-const PublicValuesSize = 272
+const PublicValuesSize = 280
 
-// PublicValues represents the 272-byte public values committed by the SP1 guest.
+// PublicValues represents the 280-byte public values committed by the SP1 guest.
 // The layout matches the covenant's fixed byte-offset parsing exactly.
+//
+// BlockNumber at [272..280) is the post-state block number committed by the
+// guest. The covenant asserts this equals c.BlockNumber+1 on every advance so
+// the proof is bound to a specific block height and cannot be replayed.
 type PublicValues struct {
 	PreStateRoot      types.Hash // [0..32)
 	PostStateRoot     types.Hash // [32..64)
@@ -24,13 +28,14 @@ type PublicValues struct {
 	InboxRootBefore   types.Hash // [176..208)
 	InboxRootAfter    types.Hash // [208..240)
 	MigrateScriptHash types.Hash // [240..272)
+	BlockNumber       uint64     // [272..280) big-endian
 }
 
-// ParsePublicValues decodes a 272-byte public values blob into a structured
-// PublicValues. Returns an error if the data is not exactly 272 bytes.
+// ParsePublicValues decodes a 280-byte public values blob into a structured
+// PublicValues. Returns an error if the data is not exactly 280 bytes.
 func ParsePublicValues(data []byte) (*PublicValues, error) {
 	if len(data) != PublicValuesSize {
-		return nil, errors.New("public values must be exactly 272 bytes")
+		return nil, errors.New("public values must be exactly 280 bytes")
 	}
 	pv := &PublicValues{}
 	copy(pv.PreStateRoot[:], data[0:32])
@@ -43,10 +48,11 @@ func ParsePublicValues(data []byte) (*PublicValues, error) {
 	copy(pv.InboxRootBefore[:], data[176:208])
 	copy(pv.InboxRootAfter[:], data[208:240])
 	copy(pv.MigrateScriptHash[:], data[240:272])
+	pv.BlockNumber = binary.BigEndian.Uint64(data[272:280])
 	return pv, nil
 }
 
-// Encode serializes PublicValues to a 272-byte blob with big-endian uint64s.
+// Encode serializes PublicValues to a 280-byte blob with big-endian uint64s.
 func (pv *PublicValues) Encode() []byte {
 	buf := make([]byte, PublicValuesSize)
 	copy(buf[0:32], pv.PreStateRoot[:])
@@ -59,6 +65,7 @@ func (pv *PublicValues) Encode() []byte {
 	copy(buf[176:208], pv.InboxRootBefore[:])
 	copy(buf[208:240], pv.InboxRootAfter[:])
 	copy(buf[240:272], pv.MigrateScriptHash[:])
+	binary.BigEndian.PutUint64(buf[272:280], pv.BlockNumber)
 	return buf
 }
 

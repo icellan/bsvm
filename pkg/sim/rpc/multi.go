@@ -38,10 +38,10 @@ func NewMultiClient(urls []string) *MultiClient {
 	return m
 }
 
-func (m *MultiClient) Len() int             { return len(m.clients) }
-func (m *MultiClient) All() []*Client       { return m.clients }
-func (m *MultiClient) At(i int) *Client     { return m.clients[i] }
-func (m *MultiClient) Nth(i int) *Client    { return m.clients[i%len(m.clients)] }
+func (m *MultiClient) Len() int          { return len(m.clients) }
+func (m *MultiClient) All() []*Client    { return m.clients }
+func (m *MultiClient) At(i int) *Client  { return m.clients[i] }
+func (m *MultiClient) Nth(i int) *Client { return m.clients[i%len(m.clients)] }
 
 // ForRead picks an up node, round-robin.
 func (m *MultiClient) ForRead() *Client {

@@ -139,9 +139,9 @@ func reducePublicValuesToScalar(c *Groth16RollupContract, publicValues runar.Byt
 //  3. F08: each g16Input* is in [0, r) (BN254 scalar field order).
 //  4. F01: SP1 public input bindings:
 //     - g16Input0 == SP1ProgramVkHashScalar (proof targets the pinned
-//       SP1 guest program, not an attacker-chosen program).
+//     SP1 guest program, not an attacker-chosen program).
 //     - g16Input1 == reducePublicValuesToScalar(publicValues) (binds the
-//       on-chain publicValues to the SP1-circuit-committed digest).
+//     on-chain publicValues to the SP1-circuit-committed digest).
 //     - g16Input2 == 0 (SP1 exitCode — reject failed-guest proofs).
 //     - g16Input4 == 0 (vkRoot — single-program mode only).
 //     - g16Input3 (proofNonce) left unconstrained per SP1 convention.
@@ -237,11 +237,13 @@ func (c *Groth16RollupContract) AdvanceState(
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	// F07 (post-R7): emit the spec-12 advance OP_RETURN output
 	//   OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4> "BSVM\x02" <batchData>
@@ -429,11 +431,13 @@ func (c *Groth16RollupContract) UpgradeSingleKey(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber
@@ -515,11 +519,13 @@ func (c *Groth16RollupContract) UpgradeMultiSig2(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber
@@ -602,11 +608,13 @@ func (c *Groth16RollupContract) UpgradeMultiSig3(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber

@@ -17,9 +17,9 @@
 package vm
 
 import (
+	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm/tracing"
-	"github.com/holiman/uint256"
 )
 
 // Contract represents an ethereum contract in the state database. It contains

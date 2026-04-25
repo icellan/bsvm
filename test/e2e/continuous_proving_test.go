@@ -270,8 +270,9 @@ func TestContinuousProvingLoop_BroadcastRejection(t *testing.T) {
 
 // TestContinuousProvingLoop_Basefold drives the overlay with the Basefold
 // proof mode and asserts that every broadcast carries a FRIProof whose
-// ContractCallArgs produces the 11-arg slice expected by
-// FRIRollupContract.AdvanceState.
+// ContractCallArgs produces the 5-arg slice expected by
+// FRIRollupContract.AdvanceState (newStateRoot, newBlockNumber,
+// publicValues, batchData, proofBlob).
 func TestContinuousProvingLoop_Basefold(t *testing.T) {
 	cs := newContinuousSetup(t, 5, prover.ProofModeFRI)
 	defer cs.node.Stop()
@@ -306,8 +307,8 @@ func TestContinuousProvingLoop_Basefold(t *testing.T) {
 		if err != nil {
 			t.Fatalf("batch %d: ContractCallArgs: %v", i+1, err)
 		}
-		if got := len(args); got != 11 {
-			t.Errorf("batch %d: ContractCallArgs len = %d, want 11", i+1, got)
+		if got := len(args); got != 5 {
+			t.Errorf("batch %d: ContractCallArgs len = %d, want 5", i+1, got)
 		}
 	}
 }

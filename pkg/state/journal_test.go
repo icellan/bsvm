@@ -76,9 +76,9 @@ func TestRevertStaleSnapshotDoesNotCrash(t *testing.T) {
 		stateObjects: make(map[types.Address]*stateObject),
 	}
 
-	j.snapshot()         // id 0
-	id1 := j.snapshot()  // id 1
-	id2 := j.snapshot()  // id 2
+	j.snapshot()        // id 0
+	id1 := j.snapshot() // id 1
+	id2 := j.snapshot() // id 2
 
 	// Revert to snapshot 1 — removes snapshots at index 1 and beyond.
 	j.revertToSnapshot(id1, s)

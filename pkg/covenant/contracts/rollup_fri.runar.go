@@ -87,22 +87,21 @@ type FRIRollupContract struct {
 //     [32..64)  postStateRoot == newStateRoot
 //     [104..136) batchDataHash == hash256(batchData)
 //     [136..144) chainId       == c.ChainId (little-endian 8 bytes)
+//     [272..280) blockNumber   == newBlockNumber (little-endian 8 bytes)
+//
+// The blockNumber binding (C4) ensures the proof's public-values slot
+// commits to the same block the covenant is advancing to, so a proof
+// produced for one height cannot be replayed against another height.
 //
 // # Data availability
 //
-// The batch bytes themselves are NOT emitted as an on-chain OP_RETURN.
-// The covenant binds only the batch hash via the public-values slot; the
-// raw batch data travels over the P2P gossip layer (chain-scoped genesis
-// sync + block announcements), and any node can verify it matches the
-// committed hash. Emitting the raw batch as a second tx output was
-// intentionally dropped: under the current runar-go SDK the ANF
-// `add_data_output` intrinsic is recorded in the compiled script's
-// continuation-hash check but NOT reproduced as an actual tx output by
-// the SDK's tx builder (BuildCallTransaction), so the on-chain script
-// would reject every advance. When the SDK learns to walk the method's
-// ANF and auto-emit data outputs between the contract continuation and
-// the change output, the OP_RETURN envelope can be restored by adding
-// `c.AddDataOutput(0, buildOpReturn(batchData))` after the bindings.
+// Every advance emits a spec-12 BSVM\x02 OP_RETURN output carrying the
+// raw batchData. The runar-go SDK resolves `addDataOutput` ANF bindings
+// at call time and emits the output between the contract continuation
+// and the change output, so the tx's hashOutputs matches the compiled
+// script's continuation-hash assertion. This gives indexers direct
+// access to batch payloads via BSV tx iteration without needing to
+// parse the covenant input script.
 //
 // proofBlob is accepted as a parameter so the ABI is stable against the
 // future on-chain FRI verifier upgrade (Gate 0a Full). It is not
@@ -121,11 +120,22 @@ func (c *FRIRollupContract) AdvanceState(
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
+
+	// F07 (post-R7/R9): emit the spec-12 advance OP_RETURN output —
+	// see the Mode 2 AdvanceState for the format rationale.
+	opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
+	bsvmMagic := runar.ByteString("BSVM\x02")
+	payload := runar.Cat(bsvmMagic, batchData)
+	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
+	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
+	c.AddDataOutput(0, opReturnScript)
 
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
@@ -254,11 +264,13 @@ func (c *FRIRollupContract) UpgradeSingleKey(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber
@@ -293,11 +305,13 @@ func (c *FRIRollupContract) UpgradeMultiSig2(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber
@@ -333,11 +347,13 @@ func (c *FRIRollupContract) UpgradeMultiSig3(
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
 	pvMigrationHash := runar.Substr(publicValues, 240, 32)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvMigrationHash == runar.Hash256(newCovenantScript))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
 	c.StateRoot = pvPostStateRoot
 	c.BlockNumber = newBlockNumber

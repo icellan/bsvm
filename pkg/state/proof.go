@@ -108,7 +108,7 @@ func (b *errBatch) Write() error {
 	return fmt.Errorf("proofList does not support batch writes")
 }
 
-func (b *errBatch) Reset()        { b.size = 0 }
+func (b *errBatch) Reset()         { b.size = 0 }
 func (b *errBatch) ValueSize() int { return b.size }
 
 // Close is a no-op for proofList.

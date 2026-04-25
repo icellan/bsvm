@@ -46,7 +46,7 @@ type ParallelProver struct {
 	promSucceededTotal prometheus.Counter
 	promFailedTotal    prometheus.Counter
 	promInFlight       prometheus.Gauge
-	promQueueDepth    prometheus.Gauge
+	promQueueDepth     prometheus.Gauge
 	promWorkers        prometheus.Gauge
 	promDurationSecs   prometheus.Observer
 }

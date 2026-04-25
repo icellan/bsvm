@@ -625,7 +625,7 @@ func TestCompileGroth16WARollup_Basic(t *testing.T) {
 	}
 
 	size := len(compiled.LockingScript)
-	const minSize = 50 * 1024        // 50 KB
+	const minSize = 50 * 1024 // 50 KB
 	// Post-R1/R2: the Mode 3 contract opens AdvanceState with the
 	// MSM-binding preamble (AssertGroth16WitnessAssistedWithMSM), which
 	// adds the on-chain IC[0] + Σ pub_i · IC[i+1] computation plus

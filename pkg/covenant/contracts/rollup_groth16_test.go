@@ -123,12 +123,12 @@ type groth16AdvArgs struct {
 	batchData    runar.ByteString
 	proofBlob    runar.ByteString
 
-	proofA    runar.Point
-	proofBX0  runar.Bigint
-	proofBX1  runar.Bigint
-	proofBY0  runar.Bigint
-	proofBY1  runar.Bigint
-	proofC    runar.Point
+	proofA   runar.Point
+	proofBX0 runar.Bigint
+	proofBX1 runar.Bigint
+	proofBY0 runar.Bigint
+	proofBY1 runar.Bigint
+	proofC   runar.Point
 	// R4c: scalar public inputs are BigintBig to run F01 / F08 over the
 	// real 254-bit domain in the Go-mock. Default-zero-value *big.Int is
 	// nil; buildGroth16Args must initialise g16Input2 / g16Input3 /
@@ -169,7 +169,7 @@ func buildGroth16Args(preStateRoot string, newBlockNumber int64) groth16AdvArgs 
 	newStateRoot := stateRootForBlock(int(newBlockNumber))
 	batchData := generateBatchData(preStateRoot, newStateRoot, testBatchDataSize)
 	proofBlob := generateProofBlob(byte(newBlockNumber), testProofBlobSize)
-	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId)
+	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId, newBlockNumber)
 
 	return groth16AdvArgs{
 		newStateRoot: runar.ByteString(newStateRoot),
@@ -351,7 +351,7 @@ func TestGroth16Rollup_RejectWrongChainId(t *testing.T) {
 	args := buildGroth16Args(zeros32(), 1)
 	newStateRoot := stateRootForBlock(1)
 	badPV := buildPublicValues(zeros32(), newStateRoot,
-		string(args.batchData), string(args.proofBlob), 999)
+		string(args.batchData), string(args.proofBlob), 999, 1)
 	args.publicValues = runar.ByteString(badPV)
 	callGroth16Advance(c, args)
 }
@@ -365,6 +365,27 @@ func TestGroth16Rollup_RejectPostStateRootMismatch(t *testing.T) {
 	c := newGroth16Rollup(zeros32(), 0, 0)
 	args := buildGroth16Args(zeros32(), 1)
 	args.newStateRoot = runar.ByteString(rawSha256("garbage"))
+	callGroth16Advance(c, args)
+}
+
+// TestGroth16Rollup_RejectBlockNumberMismatch pins the C4 binding:
+// pv[272..280) must equal num2binLE(newBlockNumber). Mismatched proof
+// block number rejects.
+func TestGroth16Rollup_RejectBlockNumberMismatch(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected assertion failure")
+		}
+	}()
+	c := newGroth16Rollup(zeros32(), 0, 0)
+	args := buildGroth16Args(zeros32(), 1)
+	pv := []byte(args.publicValues)
+	copy(pv[272:280], []byte(num2binLE(2)))
+	args.publicValues = runar.ByteString(string(pv))
+	// g16Input1 binds to sha256(pv) mod r, so reducing the mutated pv
+	// needs a fresh scalar — otherwise the F01 binding assertion fires
+	// before the block-number assertion and masks the regression.
+	args.g16Input1 = expectedG16Input1(string(pv))
 	callGroth16Advance(c, args)
 }
 

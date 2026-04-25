@@ -5,7 +5,7 @@
 //! a STARK proof covering every opcode, every storage write, every balance
 //! transfer, and every gas deduction.
 //!
-//! Public values layout (272 bytes, spec 12):
+//! Public values layout (280 bytes, spec 12):
 //!   [0..32]    preStateRoot
 //!   [32..64]   postStateRoot
 //!   [64..96]   receiptsHash (keccak256 of RLP-encoded receipts)
@@ -16,6 +16,9 @@
 //!   [176..208] inboxRootBefore (inbox queue hash before drain, from host)
 //!   [208..240] inboxRootAfter (inbox queue hash after drain, from host)
 //!   [240..272] migrateScriptHash ([0;32] — reserved for covenant migration)
+//!   [272..280] blockNumber (uint64 big-endian) — post-state block number,
+//!              bound by the covenant to c.BlockNumber+1 so the proof cannot
+//!              be replayed at a different height.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
@@ -379,7 +382,7 @@ pub fn main() {
     // governance flow is implemented.
     let migration_script_hash: [u8; 32] = [0u8; 32];
 
-    // ── 9. Commit public values (272 bytes, spec 12 layout) ──────────────
+    // ── 9. Commit public values (280 bytes, spec 12 layout) ──────────────
     // ORDER MUST MATCH the Public Values Layout table exactly.
     sp1_zkvm::io::commit_slice(&input.pre_state_root);             // [0..32]
     sp1_zkvm::io::commit_slice(&post_state_root);                  // [32..64]
@@ -391,6 +394,7 @@ pub fn main() {
     sp1_zkvm::io::commit_slice(&inbox_root_before);                // [176..208]
     sp1_zkvm::io::commit_slice(&inbox_root_after);                 // [208..240]
     sp1_zkvm::io::commit_slice(&migration_script_hash);            // [240..272]
+    sp1_zkvm::io::commit_slice(&input.block_context.number.to_be_bytes()); // [272..280]
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────
@@ -399,7 +403,7 @@ pub fn main() {
 /// This allows the host to detect the error and retry without the guest
 /// panicking (which would produce no proof and stall the pipeline).
 fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
-    // For error reporting: commit a 272-byte public values block with
+    // For error reporting: commit a 280-byte public values block with
     // the error code in a recognizable pattern.
     let mut error_marker = [0u8; 32];
     error_marker[0] = 0xFF; // Error sentinel
@@ -416,6 +420,7 @@ fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
     sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [176..208]
     sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [208..240]
     sp1_zkvm::io::commit_slice(&[0u8; 32]);         // [240..272]
+    sp1_zkvm::io::commit_slice(&0u64.to_be_bytes()); // [272..280] block_number sentinel
 }
 
 /// Apply state changes from revm's CacheDB back to the MPT.

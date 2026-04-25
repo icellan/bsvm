@@ -1,0 +1,199 @@
+name: Go test
+
+# Runs the default Go test suite — every package without a build tag
+# (so excludes integration/multinode/devnet which need a live BSV
+# regtest node or docker compose, and which are run by other workflows).
+#
+# Three parallel jobs: lint, build, test. A fourth job (race) re-runs
+# the concurrency-heavy packages with -race; a fifth (fuzz-smoke) runs
+# every fuzz target for a fixed budget so corpus regressions surface
+# in CI.
+#
+# All `run:` blocks operate on local repo files — no untrusted GitHub
+# event payloads are interpolated. Safe under the GitHub Actions
+# command-injection guidance.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: go-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: gofmt + go vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar (sibling — go.mod replace targets ../runar)
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: gofmt -l (must produce empty output)
+        working-directory: bsv-evm
+        run: |
+          out=$(gofmt -l $(find . -type f -name '*.go' -not -path './vendor/*'))
+          if [ -n "$out" ]; then
+            echo "gofmt errors in:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet ./...
+        working-directory: bsv-evm
+        run: go vet ./...
+
+  build:
+    name: go build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go build ./...
+        working-directory: bsv-evm
+        run: go build ./...
+
+  test:
+    name: go test (no tags)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test ./...
+        working-directory: bsv-evm
+        # -count=1 disables the test cache so flaky regressions don't
+        # hide behind a stale "ok (cached)". evmtest is the long-pole
+        # (~3 min); covenant + overlay come next.
+        run: go test -count=1 -timeout 20m ./...
+
+  race:
+    name: go test -race (concurrency-heavy packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test -race
+        working-directory: bsv-evm
+        # Limited to packages that exercise concurrency primitives —
+        # overlay (the consensus-race + speculative-receipt machinery),
+        # network (libp2p gossip), prover (parallel proof pipeline),
+        # rpc (concurrent JSON-RPC handlers), shard (multi-shard mgr),
+        # and the e2e harness that drives all of the above.
+        run: |
+          go test -count=1 -race -timeout 20m \
+            ./pkg/overlay/... \
+            ./pkg/network/... \
+            ./pkg/prover/... \
+            ./pkg/rpc/... \
+            ./pkg/shard/... \
+            ./test/e2e/...
+
+  fuzz-smoke:
+    name: fuzz smoke (30s per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: Fuzz smoke — every target for 30s
+        working-directory: bsv-evm
+        # Each go fuzz invocation runs one target. Budget is short
+        # (30s) — enough to catch regressions in the seed corpus and
+        # any new failures during PR review without burning runner
+        # minutes. Long-form fuzzing happens off-CI.
+        run: |
+          set -euo pipefail
+          targets=$(grep -h '^func Fuzz' test/fuzz/*.go | awk '{print $2}' | sed 's/(.*//')
+          for t in $targets; do
+            echo "==== fuzz $t ===="
+            go test -run='^$' -fuzz="^${t}$" -fuzztime=30s ./test/fuzz/
+          done

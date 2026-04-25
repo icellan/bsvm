@@ -5,14 +5,14 @@
 // both outputs, and returns a DerivedShard struct.
 //
 // Cross-validation (in DeriveShardFromTx):
-//   1. manifest.ChainID   must equal the chainId pushed into the
-//      script's readonly slot
-//   2. manifest.Governance must equal the governance mode / threshold
-//      / keys pushed into the script's readonly slots
-//   3. sha256(manifest.SP1VK) must equal the script's SP1VerifyingKey
-//      hash slot
-//   4. manifest.VerificationMode must equal the mode detected from
-//      the script's template pattern (DetectVerificationMode)
+//  1. manifest.ChainID   must equal the chainId pushed into the
+//     script's readonly slot
+//  2. manifest.Governance must equal the governance mode / threshold
+//     / keys pushed into the script's readonly slots
+//  3. sha256(manifest.SP1VK) must equal the script's SP1VerifyingKey
+//     hash slot
+//  4. manifest.VerificationMode must equal the mode detected from
+//     the script's template pattern (DetectVerificationMode)
 //
 // Any mismatch returns an error. The manifest is operator-supplied
 // metadata; the covenant script is the authoritative source for

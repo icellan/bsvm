@@ -235,4 +235,3 @@ func TestGate0_SP1Groth16_VKDigestMatches(t *testing.T) {
 	}
 	t.Logf("VK digest: %s", digest)
 }
-

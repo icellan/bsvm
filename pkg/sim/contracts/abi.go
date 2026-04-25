@@ -30,10 +30,10 @@ var (
 	selERC721Approve      = selector("approve(address,uint256)")
 	selERC721TransferFrom = selector("transferFrom(address,address,uint256)")
 
-	selWETHDeposit    = selector("deposit()")
-	selWETHWithdraw   = selector("withdraw(uint256)")
-	selWETHTransfer   = selector("transfer(address,uint256)")
-	selWETHBalanceOf  = selector("balanceOf(address)")
+	selWETHDeposit   = selector("deposit()")
+	selWETHWithdraw  = selector("withdraw(uint256)")
+	selWETHTransfer  = selector("transfer(address,uint256)")
+	selWETHBalanceOf = selector("balanceOf(address)")
 
 	selAMMAddLiquidity = selector("addLiquidity(uint112,uint112)")
 	selAMMSwap         = selector("swap(address,uint256,uint256)")

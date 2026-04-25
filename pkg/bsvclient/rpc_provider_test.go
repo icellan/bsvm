@@ -92,11 +92,11 @@ func TestNewRPCProvider_Invalid(t *testing.T) {
 // mockRPC is a test double that dispatches JSON-RPC 1.0 requests to
 // per-method handlers supplied by the test.
 type mockRPC struct {
-	t        *testing.T
-	handlers map[string]func(params []interface{}) (interface{}, *rpcErrorBody)
+	t           *testing.T
+	handlers    map[string]func(params []interface{}) (interface{}, *rpcErrorBody)
 	requireUser string
 	requirePass string
-	calls    atomic.Int64
+	calls       atomic.Int64
 }
 
 func newMockRPC(t *testing.T) *mockRPC {

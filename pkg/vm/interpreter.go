@@ -19,10 +19,10 @@ package vm
 import (
 	"fmt"
 
+	"github.com/holiman/uint256"
+	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm/tracing"
-	"github.com/icellan/bsvm/pkg/crypto"
-	"github.com/holiman/uint256"
 )
 
 // ScopeContext contains the things that are per-call, such as stack and memory,
@@ -83,7 +83,7 @@ type EVMInterpreter struct {
 	table *JumpTable
 
 	hasher    crypto.KeccakState // Keccak256 hasher instance shared across opcodes
-	hasherBuf types.Hash        // Keccak256 hasher result array shared across opcodes
+	hasherBuf types.Hash         // Keccak256 hasher result array shared across opcodes
 
 	readOnly   bool   // Whether to throw on stateful modifications
 	returnData []byte // Last CALL's return data for subsequent reuse

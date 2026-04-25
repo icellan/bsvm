@@ -17,8 +17,8 @@ type PipelinedProver struct {
 	base *SP1Prover
 
 	mu       sync.Mutex
-	inflight bool              // true when the prover is currently proving
-	pending  *pipelineRequest  // next request waiting for the prover to become free
+	inflight bool             // true when the prover is currently proving
+	pending  *pipelineRequest // next request waiting for the prover to become free
 }
 
 // pipelineRequest is an enqueued prove request with its result channel.

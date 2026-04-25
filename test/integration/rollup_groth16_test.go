@@ -51,12 +51,12 @@ const groth16RollupContractPath = "pkg/covenant/contracts/rollup_groth16.runar.g
 // ---------------------------------------------------------------------------
 
 var (
-	gate0Groth16GenericOnce     sync.Once
-	gate0Groth16GenericVK       *covenant.Groth16VK
-	gate0Groth16GenericProof    bn254witness.Proof
-	gate0Groth16GenericInputs   covenant.Mode2AdjustedPublicInputs
+	gate0Groth16GenericOnce      sync.Once
+	gate0Groth16GenericVK        *covenant.Groth16VK
+	gate0Groth16GenericProof     bn254witness.Proof
+	gate0Groth16GenericInputs    covenant.Mode2AdjustedPublicInputs
 	gate0Groth16GenericRawInputs []*big.Int
-	gate0Groth16GenericLoadErr  error
+	gate0Groth16GenericLoadErr   error
 )
 
 // loadGate0Groth16Generic loads the canonical Gate 0b SP1 Groth16 fixture
@@ -147,6 +147,7 @@ func (e errSP1PublicInputCount) Error() string {
 //  7. proofBX0        (*big.Int)
 //  8. proofBX1        (*big.Int)
 //  9. proofBY0        (*big.Int)
+//
 // 10. proofBY1        (*big.Int)
 // 11. proofC          (Point, 64-byte G1 hex)
 // 12. g16Input0       (*big.Int)
@@ -292,25 +293,25 @@ func deployGroth16Rollup(t *testing.T) (*runar.RunarContract, runar.Provider, ru
 		z33,                // governanceKey2
 		z33,                // governanceKey3
 		// Readonly: Groth16 VK (Gate 0b SP1 fixture, Mode 2 convention)
-		hex.EncodeToString(vk.AlphaG1),        // alphaG1 (runar.Point → hex)
-		new(big.Int).SetBytes(vk.BetaG2[0]),   // betaG2X0 (runar.Bigint → *big.Int)
-		new(big.Int).SetBytes(vk.BetaG2[1]),   // betaG2X1
-		new(big.Int).SetBytes(vk.BetaG2[2]),   // betaG2Y0
-		new(big.Int).SetBytes(vk.BetaG2[3]),   // betaG2Y1
-		new(big.Int).SetBytes(vk.GammaG2[0]),  // gammaG2X0
-		new(big.Int).SetBytes(vk.GammaG2[1]),  // gammaG2X1
-		new(big.Int).SetBytes(vk.GammaG2[2]),  // gammaG2Y0
-		new(big.Int).SetBytes(vk.GammaG2[3]),  // gammaG2Y1
-		new(big.Int).SetBytes(vk.DeltaG2[0]),  // deltaG2X0
-		new(big.Int).SetBytes(vk.DeltaG2[1]),  // deltaG2X1
-		new(big.Int).SetBytes(vk.DeltaG2[2]),  // deltaG2Y0
-		new(big.Int).SetBytes(vk.DeltaG2[3]),  // deltaG2Y1
-		hex.EncodeToString(vk.IC0),            // iC0 (runar.Point)
-		hex.EncodeToString(vk.IC1),            // iC1
-		hex.EncodeToString(vk.IC2),            // iC2
-		hex.EncodeToString(vk.IC3),            // iC3
-		hex.EncodeToString(vk.IC4),            // iC4
-		hex.EncodeToString(vk.IC5),            // iC5
+		hex.EncodeToString(vk.AlphaG1),       // alphaG1 (runar.Point → hex)
+		new(big.Int).SetBytes(vk.BetaG2[0]),  // betaG2X0 (runar.Bigint → *big.Int)
+		new(big.Int).SetBytes(vk.BetaG2[1]),  // betaG2X1
+		new(big.Int).SetBytes(vk.BetaG2[2]),  // betaG2Y0
+		new(big.Int).SetBytes(vk.BetaG2[3]),  // betaG2Y1
+		new(big.Int).SetBytes(vk.GammaG2[0]), // gammaG2X0
+		new(big.Int).SetBytes(vk.GammaG2[1]), // gammaG2X1
+		new(big.Int).SetBytes(vk.GammaG2[2]), // gammaG2Y0
+		new(big.Int).SetBytes(vk.GammaG2[3]), // gammaG2Y1
+		new(big.Int).SetBytes(vk.DeltaG2[0]), // deltaG2X0
+		new(big.Int).SetBytes(vk.DeltaG2[1]), // deltaG2X1
+		new(big.Int).SetBytes(vk.DeltaG2[2]), // deltaG2Y0
+		new(big.Int).SetBytes(vk.DeltaG2[3]), // deltaG2Y1
+		hex.EncodeToString(vk.IC0),           // iC0 (runar.Point)
+		hex.EncodeToString(vk.IC1),           // iC1
+		hex.EncodeToString(vk.IC2),           // iC2
+		hex.EncodeToString(vk.IC3),           // iC3
+		hex.EncodeToString(vk.IC4),           // iC4
+		hex.EncodeToString(vk.IC5),           // iC5
 	}
 
 	contract := runar.NewRunarContract(artifact, constructorArgs)

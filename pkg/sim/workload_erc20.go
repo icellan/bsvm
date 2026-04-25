@@ -37,8 +37,8 @@ func NewERC20Workload(pool *UserPool, reg *Registry, token types.Address, initia
 	return w
 }
 
-func (w *ERC20Workload) Kind() WorkloadKind { return KindERC20Transfer }
-func (w *ERC20Workload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *ERC20Workload) Kind() WorkloadKind   { return KindERC20Transfer }
+func (w *ERC20Workload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *ERC20Workload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 // SeedFromFaucet distributes `perUser` tokens to every sim user from

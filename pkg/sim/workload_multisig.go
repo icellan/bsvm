@@ -51,8 +51,8 @@ func NewMultisigWorkload(pool *UserPool, reg *Registry, addr types.Address, requ
 	return w
 }
 
-func (w *MultisigWorkload) Kind() WorkloadKind { return KindMultisig }
-func (w *MultisigWorkload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *MultisigWorkload) Kind() WorkloadKind   { return KindMultisig }
+func (w *MultisigWorkload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *MultisigWorkload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 func (w *MultisigWorkload) Run(ctx context.Context) {

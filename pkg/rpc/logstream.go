@@ -74,10 +74,18 @@ func (s *LogStreamer) Handle(ctx context.Context, record slog.Record) error {
 			return err
 		}
 	}
+	s.deliver(toLogRecord(record))
+	return nil
+}
 
-	rec := toLogRecord(record)
-
+// deliver pushes the LogRecord into the ring and fans it out to every
+// current subscriber. Shared between LogStreamer.Handle and the
+// derivedStreamer wrappers returned by WithAttrs / WithGroup so they
+// see the same buffer + subscriber set as the root handler.
+func (s *LogStreamer) deliver(rec LogRecord) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if len(s.buffer) >= s.capacity {
 		copy(s.buffer, s.buffer[1:])
 		s.buffer = s.buffer[:len(s.buffer)-1]
@@ -93,29 +101,59 @@ func (s *LogStreamer) Handle(ctx context.Context, record slog.Record) error {
 		default:
 		}
 	}
-	s.mu.Unlock()
-	return nil
 }
 
 // WithAttrs and WithGroup: delegate to inner when available, otherwise
 // noop. The returned handler wraps the same streamer so every branch
 // shares one subscriber set.
+//
+// Implementation: a derivedStreamer holds a pointer back to the
+// originating LogStreamer for subscriber/buffer state and an
+// independent inner slog.Handler with the requested attrs/group
+// applied. Plain `ls := *s` would copy the LogStreamer's sync.Mutex,
+// which is a vet copylocks violation and would also desync any
+// concurrent Handle calls between the two handler instances.
 func (s *LogStreamer) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if s.inner == nil {
 		return s
 	}
-	ls := *s
-	ls.inner = s.inner.WithAttrs(attrs)
-	return &ls
+	return &derivedStreamer{streamer: s, inner: s.inner.WithAttrs(attrs)}
 }
 
 func (s *LogStreamer) WithGroup(name string) slog.Handler {
 	if s.inner == nil {
 		return s
 	}
-	ls := *s
-	ls.inner = s.inner.WithGroup(name)
-	return &ls
+	return &derivedStreamer{streamer: s, inner: s.inner.WithGroup(name)}
+}
+
+// derivedStreamer is the WithAttrs/WithGroup wrapper. It shares the
+// originating LogStreamer's subscriber + buffer state but applies its
+// own (attrs- or group-augmented) inner slog.Handler.
+type derivedStreamer struct {
+	streamer *LogStreamer
+	inner    slog.Handler
+}
+
+func (d *derivedStreamer) Enabled(ctx context.Context, level slog.Level) bool {
+	return d.inner.Enabled(ctx, level)
+}
+
+func (d *derivedStreamer) Handle(ctx context.Context, record slog.Record) error {
+	if err := d.inner.Handle(ctx, record); err != nil {
+		return err
+	}
+	rec := toLogRecord(record)
+	d.streamer.deliver(rec)
+	return nil
+}
+
+func (d *derivedStreamer) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &derivedStreamer{streamer: d.streamer, inner: d.inner.WithAttrs(attrs)}
+}
+
+func (d *derivedStreamer) WithGroup(name string) slog.Handler {
+	return &derivedStreamer{streamer: d.streamer, inner: d.inner.WithGroup(name)}
 }
 
 // Subscribe registers a channel to receive new log records. It also

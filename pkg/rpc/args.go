@@ -11,15 +11,15 @@ import (
 // TransactionArgs represents arguments to construct a transaction.
 // It is used for eth_call and eth_estimateGas requests.
 type TransactionArgs struct {
-	From                 *types.Address `json:"from"`
-	To                   *types.Address `json:"to"`
-	Gas                  *uint64        `json:"gas"`
-	GasPrice             *big.Int       `json:"gasPrice"`
-	MaxFeePerGas         *big.Int       `json:"maxFeePerGas"`
-	MaxPriorityFeePerGas *big.Int       `json:"maxPriorityFeePerGas"`
-	Value                *big.Int       `json:"value"`
-	Data                 *[]byte        `json:"data"`
-	Input                *[]byte        `json:"input"`
+	From                 *types.Address    `json:"from"`
+	To                   *types.Address    `json:"to"`
+	Gas                  *uint64           `json:"gas"`
+	GasPrice             *big.Int          `json:"gasPrice"`
+	MaxFeePerGas         *big.Int          `json:"maxFeePerGas"`
+	MaxPriorityFeePerGas *big.Int          `json:"maxPriorityFeePerGas"`
+	Value                *big.Int          `json:"value"`
+	Data                 *[]byte           `json:"data"`
+	Input                *[]byte           `json:"input"`
 	Nonce                *uint64           `json:"nonce"`
 	AccessList           *types.AccessList `json:"accessList"`
 	ChainID              *big.Int          `json:"chainId"`

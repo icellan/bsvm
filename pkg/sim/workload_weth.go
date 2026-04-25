@@ -38,8 +38,8 @@ func NewWETHWorkload(pool *UserPool, reg *Registry, weth types.Address, initialR
 	return w
 }
 
-func (w *WETHWorkload) Kind() WorkloadKind { return KindWETHCycle }
-func (w *WETHWorkload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *WETHWorkload) Kind() WorkloadKind   { return KindWETHCycle }
+func (w *WETHWorkload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *WETHWorkload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 func (w *WETHWorkload) Run(ctx context.Context) {

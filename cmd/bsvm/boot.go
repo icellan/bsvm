@@ -301,11 +301,11 @@ func bootFromShardConfig(configPath, dataDir string) (*bootResult, error) {
 	sp1VK, _ := decodeHexOptional(cfg.SP1VerifyingKey)
 
 	return &bootResult{
-		DB:                  joinResult.DB,
-		ChainDB:             joinResult.ChainDB,
-		StateDB:             joinResult.StateDB,
-		ChainConfig:         joinResult.ChainConfig,
-		ChainID:             cfg.ChainID,
+		DB:          joinResult.DB,
+		ChainDB:     joinResult.ChainDB,
+		StateDB:     joinResult.StateDB,
+		ChainConfig: joinResult.ChainConfig,
+		ChainID:     cfg.ChainID,
 		// GenesisCovenantTxID is a BSV txid (big-endian display form in
 		// the shard.json file) — use BSVHashFromHex so in-memory bytes
 		// end up in chainhash little-endian order.
@@ -314,12 +314,12 @@ func bootFromShardConfig(configPath, dataDir string) (*bootResult, error) {
 		CovenantSats:        cfg.CovenantSats,
 		// GenesisStateRoot is an L2 / EVM hash — keep big-endian bytes
 		// matching big-endian hex convention.
-		GenesisStateRoot: types.HexToHash(cfg.GenesisStateRoot),
-		Verification:        verifyMode,
-		Governance:          govConfig,
-		SP1VerifyingKey:     sp1VK,
-		Synced:              joinResult.Synced,
-		LegacyShardConfig:   cfg,
+		GenesisStateRoot:  types.HexToHash(cfg.GenesisStateRoot),
+		Verification:      verifyMode,
+		Governance:        govConfig,
+		SP1VerifyingKey:   sp1VK,
+		Synced:            joinResult.Synced,
+		LegacyShardConfig: cfg,
 	}, nil
 }
 

@@ -170,7 +170,7 @@ type Rules struct {
 	IsByzantium, IsConstantinople, IsPetersburg, IsIstanbul bool
 	IsBerlin, IsLondon                                      bool
 	IsMerge                                                 bool
-	IsShanghai, IsCancun, IsPrague, IsFusaka                 bool
+	IsShanghai, IsCancun, IsPrague, IsFusaka                bool
 	// IsBSVM enables BSVM-specific features: BSV stub precompiles at
 	// 0x80-0x82. Set automatically for chains using DefaultL2Config.
 	// Not set when running ethereum/tests (where 0x80 is a regular address).

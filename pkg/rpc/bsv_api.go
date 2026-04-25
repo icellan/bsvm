@@ -70,7 +70,7 @@ type PeerSnapshot struct {
 	ID        string
 	Addrs     []string
 	ChainTip  uint64
-	LastSeenS int64  // unix seconds
+	LastSeenS int64 // unix seconds
 	Score     int
 	Direction string
 }
@@ -193,7 +193,6 @@ func (api *BsvAPI) FeeWalletBalance() map[string]interface{} {
 		"address": api.feeWallet.Address(),
 	}
 }
-
 
 // GetCovenantTip returns the current covenant UTXO information including
 // the BSV transaction ID, L2 block number, state root, and confirmation

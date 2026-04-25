@@ -18,7 +18,6 @@ package vm
 
 import (
 	"fmt"
-
 )
 
 type (
@@ -86,9 +85,6 @@ func validate(jt JumpTable) JumpTable {
 	}
 	return jt
 }
-
-
-
 
 func newPragueInstructionSet() JumpTable {
 	instructionSet := newCancunInstructionSet()

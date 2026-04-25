@@ -5,11 +5,11 @@ package vm
 import "github.com/icellan/bsvm/pkg/types"
 
 const (
-	CallValueTransferGas  uint64 = 9000  // Paid for CALL when the value transfer is non-zero.
-	CallNewAccountGas     uint64 = 25000 // Paid for CALL when the destination address didn't exist prior.
-	QuadCoeffDiv          uint64 = 512   // Divisor for the quadratic particle of the memory cost equation.
-	LogDataGas            uint64 = 8     // Per byte in a LOG* operation's data.
-	CallStipend           uint64 = 2300  // Free gas given at beginning of call.
+	CallValueTransferGas uint64 = 9000  // Paid for CALL when the value transfer is non-zero.
+	CallNewAccountGas    uint64 = 25000 // Paid for CALL when the destination address didn't exist prior.
+	QuadCoeffDiv         uint64 = 512   // Divisor for the quadratic particle of the memory cost equation.
+	LogDataGas           uint64 = 8     // Per byte in a LOG* operation's data.
+	CallStipend          uint64 = 2300  // Free gas given at beginning of call.
 
 	Keccak256Gas     uint64 = 30 // Once per KECCAK256 operation.
 	Keccak256WordGas uint64 = 6  // Once per word of the KECCAK256 operation's data.
@@ -107,15 +107,15 @@ const (
 
 	BlobTxPointEvaluationPrecompileGas = 50000 // Gas price for the point evaluation precompile.
 
-	TxGas                 uint64 = 21000 // Per transaction not creating a contract.
-	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract.
-	TxDataZeroGas         uint64 = 4     // Per byte of data attached to a transaction that equals zero.
-	TxDataNonZeroGasFrontier  uint64 = 68   // Per byte of non-zero data (pre-Istanbul)
-	TxDataNonZeroGasEIP2028   uint64 = 16   // Per byte of non-zero data (post-Istanbul)
-	TxAccessListAddressGas    uint64 = 2400 // Per address in EIP-2930 access list
+	TxGas                    uint64 = 21000 // Per transaction not creating a contract.
+	TxGasContractCreation    uint64 = 53000 // Per transaction that creates a contract.
+	TxDataZeroGas            uint64 = 4     // Per byte of data attached to a transaction that equals zero.
+	TxDataNonZeroGasFrontier uint64 = 68    // Per byte of non-zero data (pre-Istanbul)
+	TxDataNonZeroGasEIP2028  uint64 = 16    // Per byte of non-zero data (post-Istanbul)
+	TxAccessListAddressGas   uint64 = 2400  // Per address in EIP-2930 access list
 
-	BlobTxBlobGasPerBlob  uint64 = 1 << 17 // Gas consumption of a single data blob (== blob byte size)
-	MaxBlobGasPerBlock    uint64 = 786432   // Maximum blob gas per block (6 blobs * 131072)
+	BlobTxBlobGasPerBlob uint64 = 1 << 17 // Gas consumption of a single data blob (== blob byte size)
+	MaxBlobGasPerBlock   uint64 = 786432  // Maximum blob gas per block (6 blobs * 131072)
 
 	RefundQuotient        uint64 = 2
 	RefundQuotientEIP3529 uint64 = 5

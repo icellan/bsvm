@@ -103,7 +103,7 @@ type ProveOutput struct {
 	Mode ProofMode `json:"-"`
 	// Proof is the raw SP1 STARK proof bytes.
 	Proof []byte `json:"proof"`
-	// PublicValues is the 272-byte committed public outputs.
+	// PublicValues is the 280-byte committed public outputs.
 	PublicValues []byte `json:"public_values"`
 	// VKHash is the verification key hash.
 	VKHash types.Hash `json:"vk_hash"`
@@ -201,9 +201,12 @@ func (p *SP1Prover) proveNetwork(_ context.Context, _ *ProveInput) (*ProveOutput
 func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutput, error) {
 	start := time.Now()
 
-	// Build a mock public values blob with the correct 272-byte layout.
+	// Build a mock public values blob with the correct 280-byte layout.
 	// When ExpectedResults are provided, use them for accurate post-state
 	// values. Otherwise fall back to pre-state root and zero values.
+	// BlockNumber is always sourced from input.BlockContext.Number — the
+	// real guest commits the same value, and the covenant binds it to
+	// c.BlockNumber+1 on advance.
 	pv := &PublicValues{
 		PreStateRoot:      input.PreStateRoot,
 		BatchDataHash:     hashTransactions(input.Transactions),
@@ -211,6 +214,7 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 		InboxRootBefore:   input.InboxRootBefore,
 		InboxRootAfter:    input.InboxRootAfter,
 		MigrateScriptHash: types.Hash{},
+		BlockNumber:       input.BlockContext.Number,
 	}
 
 	if input.ExpectedResults != nil {

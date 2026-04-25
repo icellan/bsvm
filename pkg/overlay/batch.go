@@ -71,16 +71,16 @@ type Batcher struct {
 // BatcherStats is a point-in-time snapshot of batcher activity used by
 // the RPC layer.
 type BatcherStats struct {
-	Pending         int
-	Paused          bool
-	MaxBatchSize    int
-	FlushDelayMs    int64
-	Accepted        uint64
-	Duplicates      uint64
-	PausedRejected  uint64
-	DepthRejected   uint64
-	Flushes         uint64
-	FlushedTxs      uint64
+	Pending        int
+	Paused         bool
+	MaxBatchSize   int
+	FlushDelayMs   int64
+	Accepted       uint64
+	Duplicates     uint64
+	PausedRejected uint64
+	DepthRejected  uint64
+	Flushes        uint64
+	FlushedTxs     uint64
 }
 
 // NewBatcher creates a new batcher for the given overlay node. The

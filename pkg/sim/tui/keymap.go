@@ -5,20 +5,20 @@ import "github.com/charmbracelet/bubbles/key"
 // KeyMap is the TUI's complete command surface. Help text surfaces via
 // the `help` bubble in the footer.
 type KeyMap struct {
-	Quit         key.Binding
-	Help         key.Binding
-	TabCycle     key.Binding
-	UserAdd      key.Binding
-	UserDrop     key.Binding
-	WorkloadTog  key.Binding
-	RateUp       key.Binding
-	RateDown     key.Binding
-	RateUpBig    key.Binding
-	RateDownBig  key.Binding
-	Pause        key.Binding
-	Resume       key.Binding
-	Up           key.Binding
-	Down         key.Binding
+	Quit        key.Binding
+	Help        key.Binding
+	TabCycle    key.Binding
+	UserAdd     key.Binding
+	UserDrop    key.Binding
+	WorkloadTog key.Binding
+	RateUp      key.Binding
+	RateDown    key.Binding
+	RateUpBig   key.Binding
+	RateDownBig key.Binding
+	Pause       key.Binding
+	Resume      key.Binding
+	Up          key.Binding
+	Down        key.Binding
 }
 
 // DefaultKeyMap constructs the keymap used by the simulator TUI.

@@ -31,22 +31,22 @@ type BlockAnnouncer interface {
 // transaction submission, batch processing, and state management
 // without BSV network connectivity.
 type OverlayNode struct {
-	config         OverlayConfig
-	chainDB        *block.ChainDB
-	stateDB        *state.StateDB
-	rawDB          db.Database
-	executor       *block.BlockExecutor
-	prover         *prover.SP1Prover
-	covenantMgr    *covenant.CovenantManager
-	batcher        *Batcher
-	txCache        *TxCache
-	gasPriceOracle *GasPriceOracle
-	parallelProver *prover.ParallelProver
-	dsMonitor      *DoubleSpendMonitor
-	circuitBreaker    *CircuitBreaker
-	raceDetector      *RaceDetector
-	inboxMonitor      *InboxMonitor
-	executionVerifier *ExecutionVerifier
+	config              OverlayConfig
+	chainDB             *block.ChainDB
+	stateDB             *state.StateDB
+	rawDB               db.Database
+	executor            *block.BlockExecutor
+	prover              *prover.SP1Prover
+	covenantMgr         *covenant.CovenantManager
+	batcher             *Batcher
+	txCache             *TxCache
+	gasPriceOracle      *GasPriceOracle
+	parallelProver      *prover.ParallelProver
+	dsMonitor           *DoubleSpendMonitor
+	circuitBreaker      *CircuitBreaker
+	raceDetector        *RaceDetector
+	inboxMonitor        *InboxMonitor
+	executionVerifier   *ExecutionVerifier
 	signer              types.Signer
 	followerMode        bool
 	confirmationWatcher *ConfirmationWatcher

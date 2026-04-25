@@ -132,7 +132,7 @@ func TestKZGEndToEndInvalidProof(t *testing.T) {
 		CanTransfer: func(db StateDB, addr types.Address, amount *uint256.Int) bool {
 			return db.GetBalance(addr).Cmp(amount) >= 0
 		},
-		Transfer: func(db StateDB, sender, recipient types.Address, amount *uint256.Int) {},
+		Transfer:    func(db StateDB, sender, recipient types.Address, amount *uint256.Int) {},
 		GetHash:     func(n uint64) types.Hash { return types.Hash{} },
 		BlockNumber: big.NewInt(1),
 		Time:        1000,
@@ -231,8 +231,8 @@ func (s *kzgTestStateDB) GetCodeHash(addr types.Address) types.Hash {
 	}
 	return types.BytesToHash(crypto.Keccak256(code))
 }
-func (s *kzgTestStateDB) GetCodeSize(addr types.Address) int              { return len(s.GetCode(addr)) }
-func (s *kzgTestStateDB) GetState(types.Address, types.Hash) types.Hash   { return types.Hash{} }
+func (s *kzgTestStateDB) GetCodeSize(addr types.Address) int            { return len(s.GetCode(addr)) }
+func (s *kzgTestStateDB) GetState(types.Address, types.Hash) types.Hash { return types.Hash{} }
 func (s *kzgTestStateDB) GetCommittedState(types.Address, types.Hash) types.Hash {
 	return types.Hash{}
 }
@@ -244,19 +244,21 @@ func (s *kzgTestStateDB) GetTransientState(types.Address, types.Hash) types.Hash
 	return types.Hash{}
 }
 func (s *kzgTestStateDB) SetTransientState(types.Address, types.Hash, types.Hash) {}
-func (s *kzgTestStateDB) SelfDestruct(types.Address)                               {}
-func (s *kzgTestStateDB) HasSelfDestructed(types.Address) bool                     { return false }
-func (s *kzgTestStateDB) Selfdestruct6780(types.Address)                           {}
-func (s *kzgTestStateDB) AddLog(*types.Log)                                        {}
-func (s *kzgTestStateDB) AddRefund(gas uint64)                                     { s.refund += gas }
-func (s *kzgTestStateDB) SubRefund(gas uint64)                                     { s.refund -= gas }
-func (s *kzgTestStateDB) GetRefund() uint64                                        { return s.refund }
-func (s *kzgTestStateDB) AddPreimage(types.Hash, []byte)                           {}
-func (s *kzgTestStateDB) AddressInAccessList(types.Address) bool                   { return false }
-func (s *kzgTestStateDB) SlotInAccessList(types.Address, types.Hash) (bool, bool)  { return false, false }
-func (s *kzgTestStateDB) AddAddressToAccessList(types.Address)                     {}
-func (s *kzgTestStateDB) AddSlotToAccessList(types.Address, types.Hash)            {}
-func (s *kzgTestStateDB) Snapshot() int                                            { return 0 }
-func (s *kzgTestStateDB) RevertToSnapshot(int)                                     {}
+func (s *kzgTestStateDB) SelfDestruct(types.Address)                              {}
+func (s *kzgTestStateDB) HasSelfDestructed(types.Address) bool                    { return false }
+func (s *kzgTestStateDB) Selfdestruct6780(types.Address)                          {}
+func (s *kzgTestStateDB) AddLog(*types.Log)                                       {}
+func (s *kzgTestStateDB) AddRefund(gas uint64)                                    { s.refund += gas }
+func (s *kzgTestStateDB) SubRefund(gas uint64)                                    { s.refund -= gas }
+func (s *kzgTestStateDB) GetRefund() uint64                                       { return s.refund }
+func (s *kzgTestStateDB) AddPreimage(types.Hash, []byte)                          {}
+func (s *kzgTestStateDB) AddressInAccessList(types.Address) bool                  { return false }
+func (s *kzgTestStateDB) SlotInAccessList(types.Address, types.Hash) (bool, bool) {
+	return false, false
+}
+func (s *kzgTestStateDB) AddAddressToAccessList(types.Address)          {}
+func (s *kzgTestStateDB) AddSlotToAccessList(types.Address, types.Hash) {}
+func (s *kzgTestStateDB) Snapshot() int                                 { return 0 }
+func (s *kzgTestStateDB) RevertToSnapshot(int)                          {}
 func (s *kzgTestStateDB) Prepare(Rules, types.Address, types.Address, *types.Address, []types.Address, types.AccessList) {
 }

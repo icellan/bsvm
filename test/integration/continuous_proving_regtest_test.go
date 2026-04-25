@@ -197,9 +197,9 @@ func deployFRIRollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.Run
 	z33 := "000000000000000000000000000000000000000000000000000000000000000000"
 	constructorArgs := []interface{}{
 		// Mutable state
-		stateRootHex,      // stateRoot (caller-supplied)
-		int64(0),          // blockNumber
-		int64(0),          // frozen
+		stateRootHex, // stateRoot (caller-supplied)
+		int64(0),     // blockNumber
+		int64(0),     // frozen
 		// Readonly: shared
 		fullMerkleRootHex, // sP1VerifyingKeyHash = depth-20 Merkle root
 		chainID,           // chainId
@@ -372,13 +372,13 @@ func deployGroth16WARollupWithStateRoot(t *testing.T, stateRootHex string) (*run
 
 	z33 := "000000000000000000000000000000000000000000000000000000000000000000"
 	constructorArgs := []interface{}{
-		stateRootHex,      // stateRoot (caller-supplied)
-		int64(0),          // blockNumber
-		int64(0),          // frozen
-		fullMerkleRootHex, // sP1VerifyingKeyHash — bsv-evm tracking hash
-		chainID,           // chainId
-		int64(1),          // governanceMode = 1 (single_key)
-		int64(1),          // governanceThreshold = 1
+		stateRootHex,       // stateRoot (caller-supplied)
+		int64(0),           // blockNumber
+		int64(0),           // frozen
+		fullMerkleRootHex,  // sP1VerifyingKeyHash — bsv-evm tracking hash
+		chainID,            // chainId
+		int64(1),           // governanceMode = 1 (single_key)
+		int64(1),           // governanceThreshold = 1
 		wallet.PubKeyHex(), // governanceKey
 		z33,                // governanceKey2 (unused)
 		z33,                // governanceKey3 (unused)

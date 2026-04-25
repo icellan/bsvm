@@ -7,38 +7,41 @@ import runar "github.com/icellan/runar/packages/runar-go"
 // designed for Gate 0 validation of the BN254 multi-pairing check on BSV.
 //
 // SP1's Groth16 circuit has 5 public inputs:
-//   [0] vkeyHash — hash of the SP1 guest program verifying key
-//   [1] committedValuesDigest — hash of the public values committed by the guest
-//   [2] exitCode — guest exit status (0 = success)
-//   [3] proofNonce — replay prevention nonce
-//   [4] vkRoot — Merkle root of verification keys (0 for single-program proofs)
+//
+//	[0] vkeyHash — hash of the SP1 guest program verifying key
+//	[1] committedValuesDigest — hash of the public values committed by the guest
+//	[2] exitCode — guest exit status (0 = success)
+//	[3] proofNonce — replay prevention nonce
+//	[4] vkRoot — Merkle root of verification keys (0 for single-program proofs)
 //
 // The verification equation checks:
-//   e(-A, B) * e(prepared_inputs, gamma) * e(C, delta) * e(alpha, -beta) == 1
+//
+//	e(-A, B) * e(prepared_inputs, gamma) * e(C, delta) * e(alpha, -beta) == 1
+//
 // where prepared_inputs = IC0 + sum(input[i] * IC[i+1]) for i=0..4.
 type SP1Groth16Verifier struct {
 	runar.SmartContract
 
 	// Verification key (baked into locking script at compile time)
-	AlphaG1    runar.Point  `runar:"readonly"`
-	BetaG2X0   runar.Bigint `runar:"readonly"`
-	BetaG2X1   runar.Bigint `runar:"readonly"`
-	BetaG2Y0   runar.Bigint `runar:"readonly"`
-	BetaG2Y1   runar.Bigint `runar:"readonly"`
-	GammaG2X0  runar.Bigint `runar:"readonly"`
-	GammaG2X1  runar.Bigint `runar:"readonly"`
-	GammaG2Y0  runar.Bigint `runar:"readonly"`
-	GammaG2Y1  runar.Bigint `runar:"readonly"`
-	DeltaG2X0  runar.Bigint `runar:"readonly"`
-	DeltaG2X1  runar.Bigint `runar:"readonly"`
-	DeltaG2Y0  runar.Bigint `runar:"readonly"`
-	DeltaG2Y1  runar.Bigint `runar:"readonly"`
-	IC0        runar.Point  `runar:"readonly"`
-	IC1        runar.Point  `runar:"readonly"`
-	IC2        runar.Point  `runar:"readonly"`
-	IC3        runar.Point  `runar:"readonly"`
-	IC4        runar.Point  `runar:"readonly"`
-	IC5        runar.Point  `runar:"readonly"`
+	AlphaG1   runar.Point  `runar:"readonly"`
+	BetaG2X0  runar.Bigint `runar:"readonly"`
+	BetaG2X1  runar.Bigint `runar:"readonly"`
+	BetaG2Y0  runar.Bigint `runar:"readonly"`
+	BetaG2Y1  runar.Bigint `runar:"readonly"`
+	GammaG2X0 runar.Bigint `runar:"readonly"`
+	GammaG2X1 runar.Bigint `runar:"readonly"`
+	GammaG2Y0 runar.Bigint `runar:"readonly"`
+	GammaG2Y1 runar.Bigint `runar:"readonly"`
+	DeltaG2X0 runar.Bigint `runar:"readonly"`
+	DeltaG2X1 runar.Bigint `runar:"readonly"`
+	DeltaG2Y0 runar.Bigint `runar:"readonly"`
+	DeltaG2Y1 runar.Bigint `runar:"readonly"`
+	IC0       runar.Point  `runar:"readonly"`
+	IC1       runar.Point  `runar:"readonly"`
+	IC2       runar.Point  `runar:"readonly"`
+	IC3       runar.Point  `runar:"readonly"`
+	IC4       runar.Point  `runar:"readonly"`
+	IC5       runar.Point  `runar:"readonly"`
 }
 
 // Verify checks an SP1 Groth16 proof with 5 public inputs.

@@ -19,8 +19,8 @@ package vm
 import (
 	"math"
 
-	"github.com/icellan/bsvm/pkg/types"
 	"github.com/holiman/uint256"
+	"github.com/icellan/bsvm/pkg/types"
 )
 
 // calcMemSize64 calculates the required memory size, and returns

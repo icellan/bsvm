@@ -26,7 +26,7 @@ type Genesis struct {
 	Coinbase      types.Address                    `json:"coinbase"`
 	Alloc         map[types.Address]GenesisAccount `json:"alloc"`
 	BridgeAddress types.Address                    `json:"bridgeAddress"`
-	Governance    covenant.GovernanceConfig         `json:"governance"`
+	Governance    covenant.GovernanceConfig        `json:"governance"`
 	BSVAnchorTxID types.Hash                       `json:"bsvAnchorTxId,omitempty"`
 }
 

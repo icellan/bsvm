@@ -31,21 +31,25 @@ import (
 // expectations. Mode 1, Mode 2, and Mode 3 all share the same layout,
 // assembled by buildAdvancePublicValues below.
 func syntheticFRIProof(proverValues, batch, blob []byte) *covenant.FRIProof {
-	// Parse the pre/post state roots and chain ID from the prover's
-	// 272-byte PublicValues blob so we can re-serialise them in the
-	// rollup contract layout. The prover writes:
+	// Parse the pre/post state roots, chain ID, and block number from the
+	// prover's 280-byte PublicValues blob so we can re-serialise them in
+	// the rollup contract layout. The prover writes:
 	//   [0..32]   PreStateRoot
 	//   [32..64]  PostStateRoot
 	//   [136..144] ChainID (big-endian uint64)
+	//   [272..280] BlockNumber (big-endian uint64)
 	var preRoot, postRoot [32]byte
-	var chainID uint64
+	var chainID, blockNumber uint64
 	if len(proverValues) >= 144 {
 		copy(preRoot[:], proverValues[0:32])
 		copy(postRoot[:], proverValues[32:64])
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
+	if len(proverValues) >= 280 {
+		blockNumber = binary.BigEndian.Uint64(proverValues[272:280])
+	}
 
-	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID, blockNumber)
 
 	return &covenant.FRIProof{
 		Values: pv,
@@ -54,14 +58,14 @@ func syntheticFRIProof(proverValues, batch, blob []byte) *covenant.FRIProof {
 	}
 }
 
-// buildAdvancePublicValues returns the 272-byte public-values blob
+// buildAdvancePublicValues returns the 280-byte public-values blob
 // expected by every rollup contract's AdvanceState on-chain checks.
-// chainID is serialised as 8 little-endian bytes to match
-// runar.Num2Bin(chainId, 8). The hash256 helper implements Bitcoin's
+// chainID and blockNumber are serialised as 8 little-endian bytes to
+// match runar.Num2Bin(…, 8). The hash256 helper implements Bitcoin's
 // OP_HASH256 (sha256(sha256(data))) matching runar.Hash256 on the
 // contract side.
-func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob []byte, chainID uint64) []byte {
-	buf := make([]byte, 272)
+func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob []byte, chainID, blockNumber uint64) []byte {
+	buf := make([]byte, 280)
 	copy(buf[0:32], preStateRoot)
 	copy(buf[32:64], postStateRoot)
 	proofHash := hash256(proofBlob)
@@ -71,6 +75,7 @@ func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob 
 	copy(buf[104:136], batchHash[:])
 	binary.LittleEndian.PutUint64(buf[136:144], chainID)
 	// [144..272) four 32-byte zero slots (reserved)
+	binary.LittleEndian.PutUint64(buf[272:280], blockNumber)
 	return buf
 }
 
@@ -79,9 +84,9 @@ func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob 
 // SP1 fixture (applied via covenant.ApplyZeroInputWorkaround), so the produced
 // proof actually satisfies the on-chain pairing check in the Mode 2 rollup
 // contract. The publicValues blob is rebuilt in the Mode 2 contract's expected
-// layout (same as Mode 1 / Mode 3), and the pre/post state roots and chainID
-// are extracted from the prover's 272-byte PublicValues blob at the SP1 layout
-// offsets.
+// layout (same as Mode 1 / Mode 3), and the pre/post state roots, chainID and
+// block number are extracted from the prover's 280-byte PublicValues blob at
+// the SP1 layout offsets.
 //
 // The mock prover does not regenerate a different BN254 proof per batch: the
 // Mode 2 contract binds the proof only to the fixed SP1 public inputs (no
@@ -96,14 +101,17 @@ func syntheticGroth16GenericProof(proverValues, batch, blob []byte) (*covenant.G
 	}
 
 	var preRoot, postRoot [32]byte
-	var chainID uint64
+	var chainID, blockNumber uint64
 	if len(proverValues) >= 144 {
 		copy(preRoot[:], proverValues[0:32])
 		copy(postRoot[:], proverValues[32:64])
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
+	if len(proverValues) >= 280 {
+		blockNumber = binary.BigEndian.Uint64(proverValues[272:280])
+	}
 
-	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID, blockNumber)
 
 	return &covenant.Groth16GenericProof{
 		Values:   pv,
@@ -313,9 +321,9 @@ func loadSyntheticGroth16GenericFixture() (*syntheticGroth16GenericFixture, erro
 // bundle. The caller MUST have already ensured the overlay is wired up
 // for Mode 3 (chainID / contract VK match Gate 0b's SP1 fixture).
 //
-// In the mock prover path the preStateRoot / postStateRoot / chainID are
-// read from the prover's 272-byte PublicValues blob at the SP1 layout
-// offsets and re-serialized in the on-chain layout.
+// In the mock prover path the preStateRoot / postStateRoot / chainID /
+// blockNumber are read from the prover's 280-byte PublicValues blob at
+// the SP1 layout offsets and re-serialized in the on-chain layout.
 func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth16WitnessProof, error) {
 	witness, err := loadSyntheticGroth16WAWitness()
 	if err != nil {
@@ -323,14 +331,17 @@ func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth1
 	}
 
 	var preRoot, postRoot [32]byte
-	var chainID uint64
+	var chainID, blockNumber uint64
 	if len(proverValues) >= 144 {
 		copy(preRoot[:], proverValues[0:32])
 		copy(postRoot[:], proverValues[32:64])
 		chainID = binary.BigEndian.Uint64(proverValues[136:144])
 	}
+	if len(proverValues) >= 280 {
+		blockNumber = binary.BigEndian.Uint64(proverValues[272:280])
+	}
 
-	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID)
+	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID, blockNumber)
 
 	return &covenant.Groth16WitnessProof{
 		Values:  pv,
@@ -364,4 +375,3 @@ type unknownProofModeError prover.ProofMode
 func (e unknownProofModeError) Error() string {
 	return "overlay: unknown proof mode " + prover.ProofMode(e).String()
 }
-

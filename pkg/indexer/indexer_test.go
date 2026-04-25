@@ -33,15 +33,15 @@ func mkTx(t *testing.T, key *ecdsa.PrivateKey, chainID uint64, nonce uint64, to 
 
 func mkHeader(number uint64) *block.L2Header {
 	return &block.L2Header{
-		Number:       new(big.Int).SetUint64(number),
-		ParentHash:   types.Hash{},
-		Coinbase:     types.Address{},
-		StateRoot:    types.Hash{},
-		TxHash:       types.Hash{},
-		ReceiptHash:  types.Hash{},
-		Timestamp:    1000 + number,
-		GasLimit:     1_000_000,
-		GasUsed:      0,
+		Number:      new(big.Int).SetUint64(number),
+		ParentHash:  types.Hash{},
+		Coinbase:    types.Address{},
+		StateRoot:   types.Hash{},
+		TxHash:      types.Hash{},
+		ReceiptHash: types.Hash{},
+		Timestamp:   1000 + number,
+		GasLimit:    1_000_000,
+		GasUsed:     0,
 	}
 }
 

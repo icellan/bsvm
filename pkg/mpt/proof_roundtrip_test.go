@@ -451,8 +451,8 @@ func (l byteSliceList) EncodeIndex(i int, buf *bytes.Buffer) {
 // emptyList is a list with zero entries.
 type emptyList struct{}
 
-func (emptyList) Len() int                         { return 0 }
-func (emptyList) EncodeIndex(int, *bytes.Buffer)   {}
+func (emptyList) Len() int                       { return 0 }
+func (emptyList) EncodeIndex(int, *bytes.Buffer) {}
 
 func TestDeriveShaEmptyMatchesKeccakOfRLPEmpty(t *testing.T) {
 	got := DeriveSha(emptyList{})

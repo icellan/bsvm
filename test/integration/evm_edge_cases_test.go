@@ -21,30 +21,33 @@ import (
 // error data (0xdeadbeef).
 //
 // Init (12 bytes): 600d600c600039600d6000f3
-//   PUSH1 0x0d   — runtime length (13)
-//   PUSH1 0x0c   — runtime starts at byte 12
-//   PUSH1 0x00   — memory destination
-//   CODECOPY
-//   PUSH1 0x0d   — return size
-//   PUSH1 0x00   — return offset
-//   RETURN
+//
+//	PUSH1 0x0d   — runtime length (13)
+//	PUSH1 0x0c   — runtime starts at byte 12
+//	PUSH1 0x00   — memory destination
+//	CODECOPY
+//	PUSH1 0x0d   — return size
+//	PUSH1 0x00   — return offset
+//	RETURN
 //
 // Runtime (13 bytes): 63deadbeef6000526004601cfd
-//   PUSH4 0xdeadbeef
-//   PUSH1 0x00
-//   MSTORE        — stores deadbeef right-aligned in mem[0:32] (bytes 28-31)
-//   PUSH1 0x04    — revert data size
-//   PUSH1 0x1c    — revert data offset (28)
-//   REVERT
+//
+//	PUSH4 0xdeadbeef
+//	PUSH1 0x00
+//	MSTORE        — stores deadbeef right-aligned in mem[0:32] (bytes 28-31)
+//	PUSH1 0x04    — revert data size
+//	PUSH1 0x1c    — revert data offset (28)
+//	REVERT
 var revertContractCode = mustHex("600d600c600039600d6000f363deadbeef6000526004601cfd")
 
 // infiniteLoopContractCode deploys a contract that loops forever.
 //
 // Init (12 bytes): 6004600c60003960046000f3
 // Runtime (4 bytes): 5b600056
-//   JUMPDEST (offset 0)
-//   PUSH1 0x00
-//   JUMP (back to 0)
+//
+//	JUMPDEST (offset 0)
+//	PUSH1 0x00
+//	JUMP (back to 0)
 var infiniteLoopContractCode = mustHex("6004600c60003960046000f35b600056")
 
 // create2FactoryCode deploys a factory that uses CREATE2 to deploy a child
@@ -53,14 +56,15 @@ var infiniteLoopContractCode = mustHex("6004600c60003960046000f35b600056")
 //
 // Init (12 bytes): 6017600c60003960176000f3
 // Runtime (23 bytes): 6000600053600035600160006000f56000526014600cf3
-//   PUSH1 0x00 ; PUSH1 0x00 ; MSTORE8    — mem[0] = 0x00
-//   PUSH1 0x00 ; CALLDATALOAD             — salt from calldata[0:32]
-//   PUSH1 0x01                             — code length 1
-//   PUSH1 0x00                             — code mem offset
-//   PUSH1 0x00                             — value 0
-//   CREATE2
-//   PUSH1 0x00 ; MSTORE                   — store returned address at mem[0:32]
-//   PUSH1 0x14 ; PUSH1 0x0c ; RETURN      — return 20 bytes from offset 12
+//
+//	PUSH1 0x00 ; PUSH1 0x00 ; MSTORE8    — mem[0] = 0x00
+//	PUSH1 0x00 ; CALLDATALOAD             — salt from calldata[0:32]
+//	PUSH1 0x01                             — code length 1
+//	PUSH1 0x00                             — code mem offset
+//	PUSH1 0x00                             — value 0
+//	CREATE2
+//	PUSH1 0x00 ; MSTORE                   — store returned address at mem[0:32]
+//	PUSH1 0x14 ; PUSH1 0x0c ; RETURN      — return 20 bytes from offset 12
 var create2FactoryCode = mustHex("6017600c60003960176000f36000600053600035600160006000f56000526014600cf3")
 
 // callerContractCode deploys a contract that CALLs another contract address
@@ -68,16 +72,17 @@ var create2FactoryCode = mustHex("6017600c60003960176000f36000600053600035600160
 //
 // Init (12 bytes): 6017600c60003960176000f3
 // Runtime (23 bytes):
-//   PUSH1 0 (retSize)
-//   PUSH1 0 (retOffset)
-//   PUSH1 0 (argSize)
-//   PUSH1 0 (argOffset)
-//   PUSH1 0 (value)
-//   PUSH1 0 ; CALLDATALOAD (loads address from calldata)
-//   GAS
-//   CALL
-//   PUSH1 0 ; MSTORE       — store call result
-//   PUSH1 0x20 ; PUSH1 0 ; RETURN
+//
+//	PUSH1 0 (retSize)
+//	PUSH1 0 (retOffset)
+//	PUSH1 0 (argSize)
+//	PUSH1 0 (argOffset)
+//	PUSH1 0 (value)
+//	PUSH1 0 ; CALLDATALOAD (loads address from calldata)
+//	GAS
+//	CALL
+//	PUSH1 0 ; MSTORE       — store call result
+//	PUSH1 0x20 ; PUSH1 0 ; RETURN
 var callerContractCode = mustHex("6017600c60003960176000f3600060006000600060006000355af160005260206000f3")
 
 // ---------------------------------------------------------------------------
@@ -297,10 +302,11 @@ func TestEVM_ZeroValueContractCreation(t *testing.T) {
 //
 // Init (12 bytes): 6005600c60003960056000f3
 // Runtime (5 bytes): 600160005500
-//   PUSH1 0x01
-//   PUSH1 0x00  (slot)
-//   SSTORE
-//   STOP
+//
+//	PUSH1 0x01
+//	PUSH1 0x00  (slot)
+//	SSTORE
+//	STOP
 var delegateTargetCode = mustHex("6005600c60003960056000f3600160005500")
 
 // delegateProxyCode deploys a contract whose runtime DELEGATECALLs an
@@ -308,14 +314,15 @@ var delegateTargetCode = mustHex("6005600c60003960056000f3600160005500")
 //
 // Init (12 bytes): 600e600c600039600e6000f3
 // Runtime (14 bytes): 60006000600060006000355af400
-//   PUSH1 0x00 (retSize)
-//   PUSH1 0x00 (retOffset)
-//   PUSH1 0x00 (argSize)
-//   PUSH1 0x00 (argOffset)
-//   PUSH1 0x00 ; CALLDATALOAD (target address)
-//   GAS
-//   DELEGATECALL
-//   STOP
+//
+//	PUSH1 0x00 (retSize)
+//	PUSH1 0x00 (retOffset)
+//	PUSH1 0x00 (argSize)
+//	PUSH1 0x00 (argOffset)
+//	PUSH1 0x00 ; CALLDATALOAD (target address)
+//	GAS
+//	DELEGATECALL
+//	STOP
 var delegateProxyCode = mustHex("600e600c600039600e6000f360006000600060006000355af400")
 
 // staticCallProxyCode deploys a contract whose runtime STATICCALLs an
@@ -323,15 +330,16 @@ var delegateProxyCode = mustHex("600e600c600039600e6000f360006000600060006000355
 //
 // Init (12 bytes): 6015600c60003960156000f3
 // Runtime (21 bytes): 60006000600060006000355afa60005260206000f3
-//   PUSH1 0x00 (retSize)
-//   PUSH1 0x00 (retOffset)
-//   PUSH1 0x00 (argSize)
-//   PUSH1 0x00 (argOffset)
-//   PUSH1 0x00 ; CALLDATALOAD (target address)
-//   GAS
-//   STATICCALL
-//   PUSH1 0x00 ; MSTORE  — store success flag (0 or 1) at mem[0:32]
-//   PUSH1 0x20 ; PUSH1 0x00 ; RETURN
+//
+//	PUSH1 0x00 (retSize)
+//	PUSH1 0x00 (retOffset)
+//	PUSH1 0x00 (argSize)
+//	PUSH1 0x00 (argOffset)
+//	PUSH1 0x00 ; CALLDATALOAD (target address)
+//	GAS
+//	STATICCALL
+//	PUSH1 0x00 ; MSTORE  — store success flag (0 or 1) at mem[0:32]
+//	PUSH1 0x20 ; PUSH1 0x00 ; RETURN
 var staticCallProxyCode = mustHex("6015600c60003960156000f360006000600060006000355afa60005260206000f3")
 
 // maxCodeSizeInitCode is init code that RETURNs 25000 zero bytes as the
@@ -339,9 +347,10 @@ var staticCallProxyCode = mustHex("6015600c60003960156000f3600060006000600060003
 // fail.
 //
 // Init (6 bytes): 6161a86000f3
-//   PUSH2 0x61A8 (25000)
-//   PUSH1 0x00 (offset)
-//   RETURN
+//
+//	PUSH2 0x61A8 (25000)
+//	PUSH1 0x00 (offset)
+//	RETURN
 var maxCodeSizeInitCode = mustHex("6161a86000f3")
 
 // ---------------------------------------------------------------------------

@@ -11,18 +11,18 @@ import (
 
 // Key prefixes for the chain database.
 var (
-	headerPrefix       = []byte("h") // h + blockNum(8) + blockHash(32) -> RLP header
-	canonicalHashKey   = []byte("H") // H + blockNum(8) -> canonical hash (32 bytes)
-	bodyPrefix         = []byte("b") // b + blockNum(8) + blockHash(32) -> RLP body
-	receiptPrefix      = []byte("r") // r + blockNum(8) + blockHash(32) -> RLP receipts
-	headBlockHashKey   = []byte("l") // l -> head block hash (32 bytes)
-	headBlockNumberKey = []byte("n") // n -> head block number (8 bytes big-endian)
+	headerPrefix       = []byte("h")  // h + blockNum(8) + blockHash(32) -> RLP header
+	canonicalHashKey   = []byte("H")  // H + blockNum(8) -> canonical hash (32 bytes)
+	bodyPrefix         = []byte("b")  // b + blockNum(8) + blockHash(32) -> RLP body
+	receiptPrefix      = []byte("r")  // r + blockNum(8) + blockHash(32) -> RLP receipts
+	headBlockHashKey   = []byte("l")  // l -> head block hash (32 bytes)
+	headBlockNumberKey = []byte("n")  // n -> head block number (8 bytes big-endian)
 	hashToNumberPrefix = []byte("H#") // H# + blockHash(32) -> blockNum (8 bytes)
-	txLookupPrefix     = []byte("t") // t + txHash(32) -> RLP TxLookupEntry
-	anchorPrefix       = []byte("a") // a + blockNum(8) -> RLP AnchorRecord
-	covenantTxIDKey    = []byte("c") // c -> current covenant UTXO txid (32 bytes)
-	covenantStateKey   = []byte("C") // C -> current covenant state (serialized)
-	syncCheckpointKey  = []byte("S") // S -> RLP-encoded SyncCheckpoint
+	txLookupPrefix     = []byte("t")  // t + txHash(32) -> RLP TxLookupEntry
+	anchorPrefix       = []byte("a")  // a + blockNum(8) -> RLP AnchorRecord
+	covenantTxIDKey    = []byte("c")  // c -> current covenant UTXO txid (32 bytes)
+	covenantStateKey   = []byte("C")  // C -> current covenant state (serialized)
+	syncCheckpointKey  = []byte("S")  // S -> RLP-encoded SyncCheckpoint
 )
 
 // TxLookupEntry maps a transaction hash to its containing block.

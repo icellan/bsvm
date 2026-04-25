@@ -39,18 +39,18 @@ const maxRequestSize = 5 * 1024 * 1024
 // RPCServer is the HTTP JSON-RPC server that exposes the Ethereum-compatible
 // API to clients like MetaMask, ethers.js, Hardhat, and Foundry.
 type RPCServer struct {
-	config     RPCConfig
-	ethAPI     *EthAPI
-	netAPI     *NetAPI
-	web3API    *Web3API
-	bsvAPI     *BsvAPI
-	debugAPI   *DebugAPI
-	adminAPI   *AdminAPI
-	overlay    *overlay.OverlayNode
-	wsManager  *WSManager
-	httpServer *http.Server
-	wsServer   *http.Server // separate WebSocket server on WSAddr
-	limiter    *rateLimiter // per-IP rate limiting
+	config      RPCConfig
+	ethAPI      *EthAPI
+	netAPI      *NetAPI
+	web3API     *Web3API
+	bsvAPI      *BsvAPI
+	debugAPI    *DebugAPI
+	adminAPI    *AdminAPI
+	overlay     *overlay.OverlayNode
+	wsManager   *WSManager
+	httpServer  *http.Server
+	wsServer    *http.Server // separate WebSocket server on WSAddr
+	limiter     *rateLimiter // per-IP rate limiting
 	registry    *metrics.Registry
 	authConfig  auth.Config
 	logStreamer *LogStreamer
@@ -1380,15 +1380,15 @@ func parseBlockNrOrHash(data json.RawMessage) (BlockNumberOrHash, error) {
 func parseTransactionArgs(data json.RawMessage, out *TransactionArgs) error {
 	// Parse using a raw struct to handle hex-encoded fields.
 	var raw struct {
-		From                 *types.Address `json:"from"`
-		To                   *types.Address `json:"to"`
-		Gas                  *string        `json:"gas"`
-		GasPrice             *string        `json:"gasPrice"`
-		MaxFeePerGas         *string        `json:"maxFeePerGas"`
-		MaxPriorityFeePerGas *string        `json:"maxPriorityFeePerGas"`
-		Value                *string        `json:"value"`
-		Data                 *string        `json:"data"`
-		Input                *string        `json:"input"`
+		From                 *types.Address    `json:"from"`
+		To                   *types.Address    `json:"to"`
+		Gas                  *string           `json:"gas"`
+		GasPrice             *string           `json:"gasPrice"`
+		MaxFeePerGas         *string           `json:"maxFeePerGas"`
+		MaxPriorityFeePerGas *string           `json:"maxPriorityFeePerGas"`
+		Value                *string           `json:"value"`
+		Data                 *string           `json:"data"`
+		Input                *string           `json:"input"`
 		Nonce                *string           `json:"nonce"`
 		AccessList           *types.AccessList `json:"accessList"`
 		ChainID              *string           `json:"chainId"`
@@ -1556,10 +1556,10 @@ func writeJSONResponse(w http.ResponseWriter, resp *jsonrpcResponse) {
 
 // rateLimiter provides per-IP rate limiting using a token bucket algorithm.
 type rateLimiter struct {
-	mu             sync.Mutex
-	buckets        map[string]*tokenBucket
-	ratePerSecond  int
-	burstSize      int
+	mu            sync.Mutex
+	buckets       map[string]*tokenBucket
+	ratePerSecond int
+	burstSize     int
 }
 
 // tokenBucket is a simple token bucket for rate limiting.

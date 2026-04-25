@@ -205,11 +205,11 @@ type Receipt struct {
 
 // Raw is the decoded JSON object; nil if the receipt is not yet known.
 type rawReceipt struct {
-	Status            string `json:"status"`
-	BlockNumber       string `json:"blockNumber"`
-	GasUsed           string `json:"gasUsed"`
-	ContractAddress   string `json:"contractAddress"`
-	TransactionHash   string `json:"transactionHash"`
+	Status          string `json:"status"`
+	BlockNumber     string `json:"blockNumber"`
+	GasUsed         string `json:"gasUsed"`
+	ContractAddress string `json:"contractAddress"`
+	TransactionHash string `json:"transactionHash"`
 }
 
 // GetReceipt returns nil when the receipt is not yet available.

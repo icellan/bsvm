@@ -13,17 +13,17 @@ import (
 // or data loss in the RLP codec.
 func FuzzRLPRoundtrip(f *testing.F) {
 	// Seed with known values covering RLP edge cases.
-	f.Add([]byte{})                                  // empty bytes
-	f.Add([]byte{0x00})                              // single zero byte
-	f.Add([]byte{0x7f})                              // single byte < 0x80 (direct encoding)
-	f.Add([]byte{0x80})                              // single byte = 0x80
-	f.Add([]byte{0xff})                              // single byte max
-	f.Add(make([]byte, 55))                          // exactly 55 bytes (short string boundary)
-	f.Add(make([]byte, 56))                          // 56 bytes (long string threshold)
-	f.Add(bytes.Repeat([]byte{0xAB}, 256))           // longer string
-	f.Add(bytes.Repeat([]byte{0xCD}, 1024))          // 1KB string
-	f.Add([]byte("hello world"))                     // ASCII text
-	f.Add([]byte{0x01, 0x02, 0x03, 0x04, 0x05})     // short sequence
+	f.Add([]byte{})                             // empty bytes
+	f.Add([]byte{0x00})                         // single zero byte
+	f.Add([]byte{0x7f})                         // single byte < 0x80 (direct encoding)
+	f.Add([]byte{0x80})                         // single byte = 0x80
+	f.Add([]byte{0xff})                         // single byte max
+	f.Add(make([]byte, 55))                     // exactly 55 bytes (short string boundary)
+	f.Add(make([]byte, 56))                     // 56 bytes (long string threshold)
+	f.Add(bytes.Repeat([]byte{0xAB}, 256))      // longer string
+	f.Add(bytes.Repeat([]byte{0xCD}, 1024))     // 1KB string
+	f.Add([]byte("hello world"))                // ASCII text
+	f.Add([]byte{0x01, 0x02, 0x03, 0x04, 0x05}) // short sequence
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Encode the input bytes.
@@ -119,15 +119,15 @@ func FuzzRLPStringRoundtrip(f *testing.F) {
 // an error -- never panic.
 func FuzzRLPDecodeRobustness(f *testing.F) {
 	// Seed with valid RLP encodings and malformed data.
-	f.Add([]byte{0x80})       // empty string
-	f.Add([]byte{0xc0})       // empty list
-	f.Add([]byte{0x00})       // single zero byte
-	f.Add([]byte{0x83, 0x64, 0x6f, 0x67}) // "dog"
+	f.Add([]byte{0x80})                                                 // empty string
+	f.Add([]byte{0xc0})                                                 // empty list
+	f.Add([]byte{0x00})                                                 // single zero byte
+	f.Add([]byte{0x83, 0x64, 0x6f, 0x67})                               // "dog"
 	f.Add([]byte{0xc8, 0x83, 0x63, 0x61, 0x74, 0x83, 0x64, 0x6f, 0x67}) // ["cat","dog"]
-	f.Add([]byte{0xbf})       // malformed long string
-	f.Add([]byte{0xff})       // malformed long list
-	f.Add([]byte{0xb8, 0x00}) // long string with zero length
-	f.Add([]byte{0xb9, 0x01, 0x00}) // long string 256 bytes (truncated)
+	f.Add([]byte{0xbf})                                                 // malformed long string
+	f.Add([]byte{0xff})                                                 // malformed long list
+	f.Add([]byte{0xb8, 0x00})                                           // long string with zero length
+	f.Add([]byte{0xb9, 0x01, 0x00})                                     // long string 256 bytes (truncated)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Try decoding as bytes -- must not panic.

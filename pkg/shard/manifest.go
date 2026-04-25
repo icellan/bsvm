@@ -21,7 +21,7 @@
 //
 // On-chain layout (vout 1 of the deploy tx, OP_RETURN):
 //
-//   OP_FALSE OP_RETURN <pushdata: [5 magic][4 len-be][len bytes JSON]>
+//	OP_FALSE OP_RETURN <pushdata: [5 magic][4 len-be][len bytes JSON]>
 //
 // The deriver reads the OP_RETURN payload, strips the pushdata opcode,
 // matches the 5-byte magic, reads the 4-byte big-endian length prefix,

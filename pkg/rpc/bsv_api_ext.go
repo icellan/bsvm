@@ -32,13 +32,13 @@ type BridgeSnapshotProvider interface {
 // Kept free of BSV SDK types so the RPC package does not grow heavy
 // imports.
 type WithdrawalSummary struct {
-	Nonce         uint64
-	AmountWei     string // decimal
-	BsvAddress    string // hex
-	L2TxHash      string // 0x-prefixed
-	Claimed       bool
-	ClaimBsvTxid  string // hex, empty if not yet claimed
-	CsvRemaining  uint64
+	Nonce        uint64
+	AmountWei    string // decimal
+	BsvAddress   string // hex
+	L2TxHash     string // 0x-prefixed
+	Claimed      bool
+	ClaimBsvTxid string // hex, empty if not yet claimed
+	CsvRemaining uint64
 }
 
 // SetBridgeProvider attaches the bridge snapshot source. When unset
@@ -87,13 +87,13 @@ func (api *BsvAPI) GetDeposits(fromBlock, toBlock uint64) []map[string]interface
 			l2Wei = d.L2WeiAmount.Dec()
 		}
 		out = append(out, map[string]interface{}{
-			"bsvTxId":         bsvTxIDHex(d.BSVTxID),
-			"vout":            EncodeUint64(uint64(d.Vout)),
-			"bsvBlockHeight":  EncodeUint64(d.BSVBlockHeight),
-			"l2Address":       d.L2Address.Hex(),
-			"satoshiAmount":   EncodeUint64(d.SatoshiAmount),
-			"l2WeiAmount":     l2Wei,
-			"confirmed":       d.Confirmed,
+			"bsvTxId":        bsvTxIDHex(d.BSVTxID),
+			"vout":           EncodeUint64(uint64(d.Vout)),
+			"bsvBlockHeight": EncodeUint64(d.BSVBlockHeight),
+			"l2Address":      d.L2Address.Hex(),
+			"satoshiAmount":  EncodeUint64(d.SatoshiAmount),
+			"l2WeiAmount":    l2Wei,
+			"confirmed":      d.Confirmed,
 		})
 	}
 	return out
@@ -134,13 +134,13 @@ func (api *BsvAPI) NetworkHealth() map[string]interface{} {
 	specDepth := uint64(api.overlay.TxCacheRef().SpeculativeDepth())
 
 	result := map[string]interface{}{
-		"peerCount":              EncodeUint64(uint64(api.peerCount())),
-		"executionTip":           EncodeUint64(exec),
-		"provenTip":              EncodeUint64(proven),
-		"confirmedTip":           EncodeUint64(confirmed),
-		"finalizedTip":           EncodeUint64(finalized),
-		"speculativeDepth":       EncodeUint64(specDepth),
-		"maxSpeculativeDepth":    EncodeUint64(uint64(api.overlay.Config().MaxSpeculativeDepth)),
+		"peerCount":           EncodeUint64(uint64(api.peerCount())),
+		"executionTip":        EncodeUint64(exec),
+		"provenTip":           EncodeUint64(proven),
+		"confirmedTip":        EncodeUint64(confirmed),
+		"finalizedTip":        EncodeUint64(finalized),
+		"speculativeDepth":    EncodeUint64(specDepth),
+		"maxSpeculativeDepth": EncodeUint64(uint64(api.overlay.Config().MaxSpeculativeDepth)),
 	}
 
 	// Fold in prover telemetry where available so the single RPC

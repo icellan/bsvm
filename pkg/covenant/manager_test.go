@@ -14,9 +14,9 @@ import (
 
 // mockPersister implements CovenantPersister for testing.
 type mockPersister struct {
-	state     []byte
-	txID      types.Hash
-	writeFail bool // if true, Write methods return an error
+	state      []byte
+	txID       types.Hash
+	writeFail  bool // if true, Write methods return an error
 	stateCalls int
 	txIDCalls  int
 }

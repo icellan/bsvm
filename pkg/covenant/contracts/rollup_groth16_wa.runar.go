@@ -105,22 +105,22 @@ func reducePublicValuesToScalarWA(c *Groth16WARollupContract, publicValues runar
 // enforced (in order):
 //  1. MSM-binding Groth16 verifier preamble (inlined by codegen). MUST
 //     be the first statement of the method body. The preamble:
-//       - on-curve checks proof.A / proof.C (G1),
-//       - on-curve + subgroup checks proof.B (G2),
-//       - recomputes IC[0] + Σ pub_i · IC[i+1] on-chain from the 5
-//         witness-pushed scalars and binds it to prepared_inputs,
-//       - runs triple Miller loop × precomputed α·β Fp12 × final exp,
-//       - leaves the 5 pub_i scalars reachable from the method body via
-//         runar.Groth16PublicInput(i).
+//     - on-curve checks proof.A / proof.C (G1),
+//     - on-curve + subgroup checks proof.B (G2),
+//     - recomputes IC[0] + Σ pub_i · IC[i+1] on-chain from the 5
+//     witness-pushed scalars and binds it to prepared_inputs,
+//     - runs triple Miller loop × precomputed α·β Fp12 × final exp,
+//     - leaves the 5 pub_i scalars reachable from the method body via
+//     runar.Groth16PublicInput(i).
 //  2. Shard must not be frozen.
 //  3. New block number must be exactly previous + 1.
 //  4. F08: each Groth16PublicInput(i) is in [0, r).
 //  5. F01: the 5 SP1 public inputs are bound to domain values:
-//       - Groth16PublicInput(0) == SP1ProgramVkHashScalar
-//       - Groth16PublicInput(1) == reducePublicValuesToScalarWA(publicValues)
-//       - Groth16PublicInput(2) == 0 (exit code)
-//       - Groth16PublicInput(4) == 0 (vkRoot — single-program mode)
-//       - Groth16PublicInput(3) (proofNonce) unconstrained per SP1 convention.
+//     - Groth16PublicInput(0) == SP1ProgramVkHashScalar
+//     - Groth16PublicInput(1) == reducePublicValuesToScalarWA(publicValues)
+//     - Groth16PublicInput(2) == 0 (exit code)
+//     - Groth16PublicInput(4) == 0 (vkRoot — single-program mode)
+//     - Groth16PublicInput(3) (proofNonce) unconstrained per SP1 convention.
 //  6. Public values offsets 0/32/104/136 must match StateRoot /
 //     newStateRoot / hash256(batchData) / ChainId (little-endian 8 bytes).
 //
@@ -169,30 +169,22 @@ func (c *Groth16WARollupContract) AdvanceState(
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
+	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
 	runar.Assert(pvPostStateRoot == newStateRoot)
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
+	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
-	// F07 OP_RETURN emission is currently disabled for the same reason
-	// it is disabled in rollup_fri.runar.go: the runar-go SDK's
-	// BuildCallTransaction does not walk the method ANF to auto-emit
-	// AddDataOutput calls as real tx outputs between the contract
-	// continuation and the change output. When it does, restore this
-	// block to re-enable spec-12's advance OP_RETURN envelope:
-	//
-	//   opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
-	//   bsvmMagic := runar.ByteString("BSVM\x02")
-	//   payload := runar.Cat(bsvmMagic, batchData)
-	//   lenBytes := runar.Num2Bin(runar.Len(payload), 4)
-	//   opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
-	//   c.AddDataOutput(0, opReturnScript)
-	//
-	// batchData still travels over the P2P gossip layer, and the
-	// on-chain hash256 check above (pvBatchDataHash == Hash256(batchData))
-	// binds the batch to the covenant — so the raw bytes just aren't
-	// duplicated in a second tx output today.
+	// F07 (post-R7/R9): emit the spec-12 advance OP_RETURN output —
+	// see the Mode 2 AdvanceState for the format rationale.
+	opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
+	bsvmMagic := runar.ByteString("BSVM\x02")
+	payload := runar.Cat(bsvmMagic, batchData)
+	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
+	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
+	c.AddDataOutput(0, opReturnScript)
 
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber

@@ -1227,15 +1227,15 @@ func wrapInOpReturn(data []byte) []byte {
 	// Use OP_PUSHDATA2 for larger data.
 	if len(data) > 0x4b {
 		script := make([]byte, 0, 4+len(data))
-		script = append(script, 0x6a)      // OP_RETURN
-		script = append(script, 0x4d)      // OP_PUSHDATA2
+		script = append(script, 0x6a)                                     // OP_RETURN
+		script = append(script, 0x4d)                                     // OP_PUSHDATA2
 		script = append(script, byte(len(data)&0xff), byte(len(data)>>8)) // Little-endian length
 		script = append(script, data...)
 		return script
 	}
 	// Direct push for small data.
 	script := make([]byte, 0, 2+len(data))
-	script = append(script, 0x6a)           // OP_RETURN
+	script = append(script, 0x6a)            // OP_RETURN
 	script = append(script, byte(len(data))) // Push length
 	script = append(script, data...)
 	return script

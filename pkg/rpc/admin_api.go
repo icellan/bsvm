@@ -101,9 +101,9 @@ func (a *AdminAPI) SetConfig(key string, value json.RawMessage) (map[string]inte
 func (a *AdminAPI) PauseProving() map[string]interface{} {
 	a.overlay.BatcherPause()
 	return map[string]interface{}{
-		"success":        true,
-		"pending":        a.overlay.BatcherPendingCount(),
-		"batcherPaused":  true,
+		"success":       true,
+		"pending":       a.overlay.BatcherPendingCount(),
+		"batcherPaused": true,
 	}
 }
 

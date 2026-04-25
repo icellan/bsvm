@@ -1,0 +1,82 @@
+name: Rust check
+
+# Lightweight Rust verification: cargo fmt + cargo metadata on the
+# four crates under prover/. A full `cargo build` requires the SP1
+# RISC-V toolchain (because every host crate's build.rs calls
+# sp1_build::build_program, which compiles the guest to RISC-V) and
+# is intentionally not part of PR-gate CI — it would pull multi-GB
+# toolchain artifacts every run. Operators do full builds locally.
+#
+# All `run:` blocks operate on local repo files. The matrix `crate`
+# values are workflow-author-controlled (not user-supplied), so the
+# `${{ matrix.crate }}` interpolation in `working-directory:` is
+# safe under the GitHub Actions command-injection guidance.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "prover/**"
+      - ".github/workflows/rust-check.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "prover/**"
+      - ".github/workflows/rust-check.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: rust-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - prover/guest
+          - prover/guest-evm
+          - prover/host
+          - prover/host-bridge
+          - prover/host-evm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (rustfmt only)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        working-directory: ${{ matrix.crate }}
+        run: cargo fmt --check
+
+  metadata:
+    name: cargo metadata (no compile)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - prover/guest
+          - prover/guest-evm
+          - prover/host
+          - prover/host-bridge
+          - prover/host-evm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo metadata (validates Cargo.toml + Cargo.lock)
+        working-directory: ${{ matrix.crate }}
+        # `--locked` enforces Cargo.lock matches Cargo.toml so an
+        # accidentally-stale lockfile fails CI before the real build
+        # would. `--offline` would also work for the lock check but
+        # GitHub-hosted runners don't pre-cache crates, so let cargo
+        # fetch the index here.
+        run: cargo metadata --locked --format-version 1 > /dev/null

@@ -281,7 +281,7 @@ func TestReduceSP1ProgramVkHashScalar_Bigint254(t *testing.T) {
 // TestReducePublicValuesToBn254Scalar_Bigint254 same invariant for the
 // publicValues-digest reducer.
 func TestReducePublicValuesToBn254Scalar_Bigint254(t *testing.T) {
-	pv := make([]byte, 272)
+	pv := make([]byte, 280)
 	for i := range pv {
 		pv[i] = byte(i)
 	}

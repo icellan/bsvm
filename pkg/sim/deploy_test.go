@@ -15,8 +15,8 @@ import (
 // live devnet. It is skipped unless BSVM_SIM_TEST_NODES is set so the
 // regular `go test` run stays hermetic.
 //
-// Run with: BSVM_SIM_TEST_NODES=http://localhost:8545,http://localhost:8546 \
-//           go test -run TestDeploy_AgainstDevnet -count=1 ./pkg/sim
+//	Run with: BSVM_SIM_TEST_NODES=http://localhost:8545,http://localhost:8546 \
+//	          go test -run TestDeploy_AgainstDevnet -count=1 ./pkg/sim
 func TestDeploy_AgainstDevnet(t *testing.T) {
 	raw := os.Getenv("BSVM_SIM_TEST_NODES")
 	if raw == "" {

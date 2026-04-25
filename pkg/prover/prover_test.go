@@ -13,7 +13,7 @@ import (
 	"github.com/icellan/bsvm/pkg/types"
 )
 
-// TestPublicValuesParsing verifies that encoding and decoding 272-byte
+// TestPublicValuesParsing verifies that encoding and decoding 280-byte
 // public values is a perfect roundtrip.
 func TestPublicValuesParsing(t *testing.T) {
 	original := &PublicValues{
@@ -27,6 +27,7 @@ func TestPublicValuesParsing(t *testing.T) {
 		InboxRootBefore:   types.HexToHash("0x6666666666666666666666666666666666666666666666666666666666666666"),
 		InboxRootAfter:    types.HexToHash("0x7777777777777777777777777777777777777777777777777777777777777777"),
 		MigrateScriptHash: types.HexToHash("0x8888888888888888888888888888888888888888888888888888888888888888"),
+		BlockNumber:       42,
 	}
 
 	// Encode.
@@ -72,6 +73,9 @@ func TestPublicValuesParsing(t *testing.T) {
 	if decoded.MigrateScriptHash != original.MigrateScriptHash {
 		t.Errorf("MigrateScriptHash mismatch: got %s, want %s", decoded.MigrateScriptHash.Hex(), original.MigrateScriptHash.Hex())
 	}
+	if decoded.BlockNumber != original.BlockNumber {
+		t.Errorf("BlockNumber mismatch: got %d, want %d", decoded.BlockNumber, original.BlockNumber)
+	}
 
 	// Re-encode and compare bytes.
 	reEncoded := decoded.Encode()
@@ -89,8 +93,8 @@ func TestPublicValuesParsingErrors(t *testing.T) {
 	}{
 		{"nil", nil},
 		{"empty", []byte{}},
-		{"too short", make([]byte, 271)},
-		{"too long", make([]byte, 273)},
+		{"too short", make([]byte, 279)},
+		{"too long", make([]byte, 281)},
 	}
 
 	for _, tt := range tests {
@@ -419,10 +423,10 @@ func TestProofSerialization(t *testing.T) {
 	original := &Proof{
 		Data: []byte("some-proof-data"),
 		PublicValues: PublicValues{
-			PreStateRoot: types.HexToHash("0x01"),
+			PreStateRoot:  types.HexToHash("0x01"),
 			PostStateRoot: types.HexToHash("0x02"),
-			GasUsed: 21000,
-			ChainID: 1337,
+			GasUsed:       21000,
+			ChainID:       1337,
 		},
 		VKHash: types.HexToHash("0xab"),
 		Mode:   "compressed",

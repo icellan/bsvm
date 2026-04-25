@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/icellan/bsvm/pkg/types"
 	"github.com/holiman/uint256"
+	"github.com/icellan/bsvm/pkg/types"
 )
 
 var activators = map[int]func(*JumpTable){
@@ -318,4 +318,3 @@ func enable6780(jt *JumpTable) {
 		maxStack:    maxStack(1, 0),
 	}
 }
-

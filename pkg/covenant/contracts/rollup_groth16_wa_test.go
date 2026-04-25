@@ -103,7 +103,7 @@ func buildGroth16WAArgs(preStateRoot string, newBlockNumber int64) groth16WAAdvA
 	newStateRoot := stateRootForBlock(int(newBlockNumber))
 	batchData := generateBatchData(preStateRoot, newStateRoot, testBatchDataSize)
 	proofBlob := generateProofBlob(byte(newBlockNumber), testProofBlobSize)
-	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId)
+	pv := buildPublicValues(preStateRoot, newStateRoot, batchData, proofBlob, chainId, newBlockNumber)
 
 	return groth16WAAdvArgs{
 		newStateRoot: runar.ByteString(newStateRoot),
@@ -217,7 +217,7 @@ func TestGroth16WARollup_RejectWrongChainId(t *testing.T) {
 	args := buildGroth16WAArgs(zeros32(), 1)
 	newStateRoot := stateRootForBlock(1)
 	badPV := buildPublicValues(zeros32(), newStateRoot,
-		string(args.batchData), string(args.proofBlob), 999)
+		string(args.batchData), string(args.proofBlob), 999, 1)
 	args.publicValues = runar.ByteString(badPV)
 	callGroth16WAAdvance(c, args)
 }
@@ -231,6 +231,23 @@ func TestGroth16WARollup_RejectPostStateRootMismatch(t *testing.T) {
 	c := newGroth16WARollup(zeros32(), 0, 0)
 	args := buildGroth16WAArgs(zeros32(), 1)
 	args.newStateRoot = runar.ByteString(rawSha256("garbage"))
+	callGroth16WAAdvance(c, args)
+}
+
+// TestGroth16WARollup_RejectBlockNumberMismatch pins the C4 binding:
+// pv[272..280) must equal num2binLE(newBlockNumber). Mismatched proof
+// block number rejects.
+func TestGroth16WARollup_RejectBlockNumberMismatch(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected assertion failure")
+		}
+	}()
+	c := newGroth16WARollup(zeros32(), 0, 0)
+	args := buildGroth16WAArgs(zeros32(), 1)
+	pv := []byte(args.publicValues)
+	copy(pv[272:280], []byte(num2binLE(2)))
+	args.publicValues = runar.ByteString(string(pv))
 	callGroth16WAAdvance(c, args)
 }
 

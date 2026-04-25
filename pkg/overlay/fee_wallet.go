@@ -28,7 +28,7 @@ type FeeUTXO struct {
 // and supports consolidation of small UTXOs.
 type FeeWallet struct {
 	mu    sync.Mutex
-	db    db.Database       // Persistent storage for UTXOs
+	db    db.Database         // Persistent storage for UTXOs
 	utxos map[string]*FeeUTXO // key: txid_hex + ":" + vout
 
 	// Configuration

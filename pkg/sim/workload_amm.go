@@ -24,13 +24,13 @@ import (
 // nonces on approvals every round.
 type AMMWorkload struct {
 	baseStats
-	pool    *UserPool
-	reg     *Registry
-	token0  types.Address
-	token1  types.Address
-	amm     types.Address
-	rng     *rand.Rand
-	seeded  atomic.Bool
+	pool     *UserPool
+	reg      *Registry
+	token0   types.Address
+	token1   types.Address
+	amm      types.Address
+	rng      *rand.Rand
+	seeded   atomic.Bool
 	approved sync.Map // types.Address -> struct{}
 }
 
@@ -47,8 +47,8 @@ func NewAMMWorkload(pool *UserPool, reg *Registry, token0, token1, amm types.Add
 	return w
 }
 
-func (w *AMMWorkload) Kind() WorkloadKind { return KindAMMSwap }
-func (w *AMMWorkload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *AMMWorkload) Kind() WorkloadKind   { return KindAMMSwap }
+func (w *AMMWorkload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *AMMWorkload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 // SeedLiquidity seeds liquidity from the faucet. Must be called once

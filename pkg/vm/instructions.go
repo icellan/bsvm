@@ -19,10 +19,10 @@ package vm
 import (
 	"math"
 
+	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm/tracing"
-	"github.com/holiman/uint256"
 )
 
 func opAdd(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {

@@ -33,8 +33,8 @@ func NewStorageWorkload(pool *UserPool, reg *Registry, storage types.Address, in
 	return w
 }
 
-func (w *StorageWorkload) Kind() WorkloadKind { return KindStorageSet }
-func (w *StorageWorkload) SetRate(tps int)    { w.rate.Store(int32(tps)) }
+func (w *StorageWorkload) Kind() WorkloadKind   { return KindStorageSet }
+func (w *StorageWorkload) SetRate(tps int)      { w.rate.Store(int32(tps)) }
 func (w *StorageWorkload) Stats() WorkloadStats { return w.baseStats.snapshot() }
 
 func (w *StorageWorkload) Run(ctx context.Context) {
