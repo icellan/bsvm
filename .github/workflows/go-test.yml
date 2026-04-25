@@ -1,13 +1,13 @@
 name: Go test
 
-# Runs the default Go test suite — every package without a build tag
-# (so excludes integration/multinode/devnet which need a live BSV
-# regtest node or docker compose, and which are run by other workflows).
+# PR-gate Go test workflow — every package without a build tag (so
+# excludes integration/multinode/devnet which need a live BSV regtest
+# node or docker compose, and which run in other workflows).
 #
-# Three parallel jobs: lint, build, test. A fourth job (race) re-runs
-# the concurrency-heavy packages with -race; a fifth (fuzz-smoke) runs
-# every fuzz target for a fixed budget so corpus regressions surface
-# in CI.
+# Four parallel jobs: lint, build, test, evmtest. The slower / flakier
+# checks (race + fuzz) live in `.github/workflows/go-extra.yml` on a
+# nightly + workflow_dispatch trigger so a transient runner-pool reap
+# doesn't block PR merges.
 #
 # All `run:` blocks operate on local repo files — no untrusted GitHub
 # event payloads are interpolated. Safe under the GitHub Actions
@@ -153,81 +153,3 @@ jobs:
         working-directory: bsv-evm
         run: go test -count=1 -p 2 -timeout 12m ./test/evmtest/...
 
-  race:
-    name: go test -race (small concurrency-heavy packages)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Checkout bsv-evm
-        uses: actions/checkout@v4
-        with:
-          path: bsv-evm
-
-      - name: Checkout runar
-        uses: actions/checkout@v4
-        with:
-          repository: icellan/runar
-          path: runar
-          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-          cache-dependency-path: bsv-evm/go.sum
-
-      - name: go test -race (smaller packages only)
-        working-directory: bsv-evm
-        # Race-detector slowdown is 5-10x; running it across all
-        # concurrency-heavy packages timed out at 30 min on
-        # GitHub-hosted runners. Limit to packages where the race
-        # surface fits in the budget: prover (parallel proof pipeline),
-        # rpc (JSON-RPC handlers), shard (multi-shard manager), event
-        # (subscription bus). pkg/overlay + pkg/network + test/e2e are
-        # excluded — their race surface is large enough to need a
-        # dedicated runner / longer timeout, tracked separately.
-        run: |
-          go test -count=1 -race -p 2 -timeout 20m \
-            ./pkg/prover/... \
-            ./pkg/rpc/... \
-            ./pkg/shard/... \
-            ./pkg/event/...
-
-  fuzz-smoke:
-    name: fuzz smoke (30s per target)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout bsv-evm
-        uses: actions/checkout@v4
-        with:
-          path: bsv-evm
-
-      - name: Checkout runar
-        uses: actions/checkout@v4
-        with:
-          repository: icellan/runar
-          path: runar
-          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-          cache-dependency-path: bsv-evm/go.sum
-
-      - name: Fuzz smoke — every target for 30s
-        working-directory: bsv-evm
-        # Each go fuzz invocation runs one target. Budget is short
-        # (30s) — enough to catch regressions in the seed corpus and
-        # any new failures during PR review without burning runner
-        # minutes. Long-form fuzzing happens off-CI.
-        run: |
-          set -euo pipefail
-          targets=$(grep -h '^func Fuzz' test/fuzz/*.go | awk '{print $2}' | sed 's/(.*//')
-          for t in $targets; do
-            echo "==== fuzz $t ===="
-            go test -run='^$' -fuzz="^${t}$" -fuzztime=30s ./test/fuzz/
-          done

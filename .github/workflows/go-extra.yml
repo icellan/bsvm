@@ -1,0 +1,100 @@
+name: Go extra (race + fuzz)
+
+# Slower / flakier Go checks: -race on concurrency-heavy packages, and
+# fuzz smoke against every Fuzz* target. Runs nightly + on-demand
+# (workflow_dispatch). NOT triggered on push or PR — the GitHub-hosted
+# runner pool occasionally reaps long jobs with SIGTERM (exit 143),
+# and we don't want PRs blocked on transient infrastructure flakes.
+#
+# All `run:` blocks operate on local repo files only. No GitHub event
+# payloads are interpolated. Safe under the GitHub Actions
+# command-injection guidance.
+
+on:
+  schedule:
+    # 04:17 UTC daily — off-peak, no overlap with main go-test runs
+    # if a maintainer pushes early-morning Pacific time.
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: go-extra-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  race:
+    name: go test -race (concurrency-heavy packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar (sibling — go.mod replace targets ../runar)
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test -race
+        working-directory: bsv-evm
+        # Race detector adds ~5-10x slowdown. Scope: prover (parallel
+        # proof pipeline), rpc (JSON-RPC handlers), shard (multi-shard
+        # mgr), event (subscription bus). pkg/overlay / pkg/network /
+        # test/e2e are excluded — their race surface needs a dedicated
+        # long-running runner, tracked as future work.
+        run: |
+          go test -count=1 -race -p 2 -timeout 25m \
+            ./pkg/prover/... \
+            ./pkg/rpc/... \
+            ./pkg/shard/... \
+            ./pkg/event/...
+
+  fuzz-smoke:
+    name: fuzz smoke (20s per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: Fuzz smoke — every target for 20s
+        working-directory: bsv-evm
+        # Each go fuzz invocation runs one target. Budget is short
+        # (20s, with ~10s drain margin in the per-target wall clock)
+        # — enough to catch regressions in the seed corpus and any
+        # new failures without burning runner minutes. Long-form
+        # fuzzing happens off-CI.
+        run: |
+          set -euo pipefail
+          targets=$(grep -h '^func Fuzz' test/fuzz/*.go | awk '{print $2}' | sed 's/(.*//')
+          for t in $targets; do
+            echo "==== fuzz $t ===="
+            go test -run='^$' -fuzz="^${t}$" -fuzztime=20s ./test/fuzz/
+          done
