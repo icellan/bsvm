@@ -83,6 +83,34 @@ jobs:
         working-directory: bsv-evm
         run: go test -tags devnet_smoke -v -timeout 5m ./test/devnet/...
 
+      - name: Bring devnet back up for simulator smoke
+        working-directory: bsv-evm
+        # The smoke test above tears the cluster down via t.Cleanup. The
+        # simulator smoke test drives bsvm-sim from the runner host and
+        # expects ports 8545/8546/8547 mapped to live containers, so we
+        # explicitly restart compose here. All `run:` content is
+        # workflow-author-controlled — no untrusted GitHub event payloads
+        # are interpolated.
+        run: |
+          docker compose up -d
+          # Wait until 4 containers report healthy (bsv-regtest is the
+          # slow one — auto-miner kicks regtest at ~30s post-start).
+          deadline=$((SECONDS + 90))
+          while [ $SECONDS -lt $deadline ]; do
+            healthy=$(docker ps \
+              --filter label=com.docker.compose.project=bsv-evm \
+              --filter health=healthy \
+              --format '{{.Names}}' | wc -l)
+            if [ "$healthy" -ge 4 ]; then
+              echo "cluster healthy ($healthy containers)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "cluster did not become healthy in 90s"
+          docker compose ps
+          exit 1
+
       - name: Run simulator smoke test
         working-directory: bsv-evm
         # Drives real traffic against the compose devnet using bsvm-sim
