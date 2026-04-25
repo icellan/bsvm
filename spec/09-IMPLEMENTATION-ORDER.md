@@ -72,22 +72,22 @@ have been implemented in Rúnar and validated on BSV regtest with
 Plonky3-generated test vectors (1,326 total vectors). Measured locking
 script sizes: KoalaBear add/mul 9 bytes, inv 477 bytes, Ext4 mul 509
 bytes, Ext4 inv ~3.1 KB, Merkle proof depth-20 482 bytes, FRI
-colinearity check 1,742 bytes. Poseidon2 confirmed not needed
-on-chain — SP1 v6.0.2 uses Poseidon2 over KoalaBear inside the proof;
-on-chain Merkle paths are SHA-256 via `OP_HASH256` / `OP_SHA256` with
-the SP1 host bridge transcoding Poseidon2 paths into SHA-256 paths
-before submission. The full FRI verifier assembly from these
-primitives is **Gate 0a Full** — unscheduled future work (see spec 13).
+colinearity check 1,742 bytes. Rúnar additionally implements
+Poseidon2 over KoalaBear directly in Bitcoin Script (28-round
+permutation, Plonky3 p3-koala-bear 0.5.2 round constants), so on-chain
+Merkle openings replay the SP1 FRI argument natively without any
+host-side SHA-256 transcoding step.
 
-**Gate 0a Full — not scheduled.** Production Mode 1 shards today use
-the trust-minimized FRI bridge covenant (`rollup_fri.runar.go`, see
-spec 12 "Verification modes"): the covenant binds state roots, batch
-hash, and chain id via public-value slots, emits the `BSVM\x02`
-OP_RETURN for data availability, but does NOT verify the SP1 FRI proof
-on-chain. Mode 1 is mainnet-blocked by a `PrepareGenesis` guardrail
-until Gate 0a Full lands. Mode 2 (`VerifyGroth16`) and Mode 3
-(`VerifyGroth16WA`) perform full BN254 pairing verification on-chain
-and are mainnet-eligible today under the VK pinning policy (F06).
+**Gate 0a Full — COMPLETE.** The full SP1 v6.0.2 STARK / FRI verifier
+ships as a Rúnar DSL intrinsic: `runar.VerifySP1FRI(proofBlob,
+publicValues, sp1VKeyHash) bool` lowers to the production-scale
+Bitcoin Script body (~849 KB compiled for the evm-guest preset; well
+under the 2 MB target). The Mode 1 covenant
+(`pkg/covenant/contracts/rollup_fri.runar.go`) calls this intrinsic on
+every advance, replaying the STARK argument against the pinned
+`SP1VerifyingKeyHash`. The previous `PrepareGenesis` Mode 1 mainnet
+guardrail has been lifted — Mode 1, Mode 2, and Mode 3 are all
+mainnet-eligible under the standard VK pinning policy (F06).
 
 **Gate 0b: SP1 Proof Size and Verification Cost**
 

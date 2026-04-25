@@ -82,16 +82,11 @@ func PrepareGenesis(config *GenesisConfig) (*GenesisResult, error) {
 			config.VKTrustPolicy)
 	}
 
-	// Mode 1 mainnet guardrail — Mode 1 (VerifyFRI) is the trust-minimized
-	// FRI bridge and does NOT verify the SP1 proof on-chain. A malicious
-	// prover can advance to an invalid state; the only recourse is
-	// governance freeze. It is not mainnet-eligible until Gate 0a Full
-	// replaces it with a full on-chain FRI verifier. See spec 12.
-	if config.Mainnet && config.Verification == VerifyFRI {
-		return nil, fmt.Errorf(
-			"mainnet genesis rejects VerifyFRI: Mode 1 is the trust-minimized FRI bridge " +
-				"and has no on-chain proof check; use VerifyGroth16 or VerifyGroth16WA for mainnet")
-	}
+	// Mode 1 (VerifyFRI) is mainnet-eligible. Gate 0a Full has landed:
+	// the FRIRollupContract now invokes runar.VerifySP1FRI on every
+	// advance, replaying the SP1 STARK proof against the pinned
+	// SP1VerifyingKeyHash on-chain. Mainnet is permitted under the
+	// standard VKTrustPolicy=Mainnet check above.
 
 	// Devnet DevKey mainnet guardrail — the DevKey variant collapses the
 	// "prover authorization" and "governance" roles onto a single key. This

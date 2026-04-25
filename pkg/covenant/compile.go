@@ -42,24 +42,20 @@ type Groth16VK struct {
 	IC5     []byte    // 64 bytes: G1 point (PUB_4)
 }
 
-// CompileFRIRollup compiles the Mode 1 rollup covenant contract (trust-
-// minimized FRI bridge).
+// CompileFRIRollup compiles the Mode 1 rollup covenant contract.
 //
-// Mode 1 does NOT verify the SP1 FRI proof on-chain. The covenant binds
-// state transitions (block+1, state roots, batch hash, chain id) via
-// public-value offset checks and emits the spec-12 OP_RETURN batch-data
-// output, but performs no STARK arithmetic. Off-chain nodes verify the
-// proof and trigger governance freeze on an invalid advance. See
-// rollup_fri.runar.go for the full security model and Gate 0a Full
-// upgrade path. Mode 1 is NOT mainnet-eligible — PrepareGenesis rejects
-// Mainnet=true with VerifyFRI.
+// Mode 1 verifies the SP1 v6.0.2 STARK proof on-chain via the
+// runar.VerifySP1FRI intrinsic. The covenant binds shard-specific
+// state (state roots, batch hash, chain id, block number) via
+// public-value offset checks and emits the spec-12 OP_RETURN
+// batch-data output. See rollup_fri.runar.go for the full security
+// model. Mode 1 IS mainnet-eligible under VKTrustPolicy=Mainnet now
+// that Gate 0a Full has landed.
 //
 // The sp1VerifyingKey, chainID, and governanceConfig are parameterized as
 // readonly properties on the contract via ConstructorArgs. The Rúnar
 // compiler bakes these into the locking script as compile-time constants.
-// SP1VerifyingKeyHash is recorded as a readonly property for indexing and
-// future-upgrade continuity; the Mode 1 locking script does not consult
-// it because there is no on-chain proof check.
+// SP1VerifyingKeyHash is consumed by VerifySP1FRI on every advance.
 func CompileFRIRollup(sp1VerifyingKey []byte, chainID uint64, governanceConfig GovernanceConfig) (*CompiledCovenant, error) {
 	if err := governanceConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid governance config: %w", err)

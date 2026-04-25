@@ -2,46 +2,32 @@ package contracts
 
 import runar "github.com/icellan/runar/packages/runar-go"
 
-// FRIRollupContract is Mode 1 of the BSVM rollup covenant: the
-// trust-minimized FRI bridge.
+// FRIRollupContract is Mode 1 of the BSVM rollup covenant: the on-chain
+// SP1 FRI / STARK verifier (Gate 0a Full landed; previously the
+// trust-minimized FRI bridge).
 //
 // # Security model
 //
-// Mode 1 does NOT verify the SP1 FRI proof on-chain. The covenant binds
-// state transitions (block+1, state roots, batch hash, chain id) but
-// performs no STARK arithmetic. Any prover can advance the state with a
-// well-formed public-values blob and matching batchData — a malicious
-// prover can therefore commit an invalid state transition.
+// Mode 1 verifies the SP1 v6.0.2 STARK proof on-chain via the
+// `runar.VerifySP1FRI` intrinsic. The compiled Bitcoin Script absorbs
+// the proof, public values, and the pinned SP1 verifying key hash into
+// the Fiat-Shamir transcript, replays the FRI argument (KoalaBear
+// field arithmetic + Poseidon2 KoalaBear Merkle openings + colinearity
+// folds + final-poly Horner check), and fails OP_VERIFY on any
+// mismatch. This is a complete validity proof, not a trie-integrity-
+// only proof — every opcode, storage write, and balance transfer
+// inside the SP1 guest is covered.
 //
-// The batch data itself is NOT carried on-chain in Mode 1 — see the
-// AdvanceState doc comment for the rationale. The covenant binds the
-// batchDataHash via the public-values slot, and the raw batch travels
-// over the P2P gossip layer.
+// In addition to the proof, the covenant binds shard-specific values
+// (state roots, batch hash, chain id, block number) by extracting
+// fixed offsets from the public-values blob and asserting they match
+// the covenant's current state and the caller-supplied advance args.
+// The proof guarantees the public-values blob is what the guest
+// committed; the covenant guarantees that blob is the right one for
+// THIS shard's advance.
 //
-// The safety model rests on two off-chain layers:
-//
-//  1. Nodes re-execute every batch locally and verify the SP1 FRI proof
-//     (SP1 v6.0.2, KoalaBear field, SHA-256 outer Merkle hashing — see
-//     spec 12). A node that observes an invalid advance can trigger the
-//     on-chain governance freeze path (FreezeSingleKey / FreezeMultiSig*).
-//  2. Governance freeze is the only recourse against a bad advance. Mode
-//     1 shards MUST be configured with non-trivial governance (mode
-//     single_key or multisig). A GovernanceNone shard in Mode 1 has no
-//     safety backstop at all.
-//
-// Mode 1 is NOT mainnet-eligible. PrepareGenesis rejects a mainnet
-// shard configured with VerifyFRI regardless of the VK trust policy.
-// For mainnet, use Mode 2 (Groth16) or Mode 3 (Groth16-WA) which
-// perform full BN254 pairing verification on-chain.
-//
-// # Future path
-//
-// A full on-chain FRI verifier using the primitives validated by Gate
-// 0a (Baby Bear / KoalaBear field arithmetic, SHA-256 Merkle paths,
-// colinearity checks, proof-of-work) is tracked as Gate 0a Full in
-// spec 9 and spec 13. When that lands, Mode 1 upgrades from a bridge
-// to a fully self-verifying rollup and the mainnet guardrail is
-// lifted. Until then Mode 1 is testnet / experimental only.
+// Mode 1 is mainnet-eligible (the previous PrepareGenesis guardrail
+// has been lifted now that the on-chain verifier lands real proofs).
 //
 // # State fields (persisted across UTXO spends via OP_PUSH_TX)
 //
@@ -51,9 +37,9 @@ import runar "github.com/icellan/runar/packages/runar-go"
 //
 // # Readonly properties baked into the locking script
 //
-//   - SP1VerifyingKeyHash: sha256(SP1 verifying key). Recorded for
-//     indexing and future-upgrade continuity; the on-chain script
-//     does NOT consult it in Mode 1 because there is no proof check.
+//   - SP1VerifyingKeyHash: keccak256(SP1 verifying key). Bound at
+//     compile time and consumed by VerifySP1FRI on every advance so a
+//     malicious unlocking script cannot supply it.
 //   - ChainId:             shard chain ID for cross-shard replay prevention
 //   - Governance*:         freeze / unfreeze / upgrade authorization
 type FRIRollupContract struct {
@@ -76,13 +62,18 @@ type FRIRollupContract struct {
 	GovernanceKey3      runar.PubKey `runar:"readonly"` // multisig key 3 (zeros if unused)
 }
 
-// AdvanceState advances the covenant state in Mode 1 (trust-minimized
-// FRI bridge). No SP1 STARK verification is performed on-chain.
+// AdvanceState advances the covenant state in Mode 1 by verifying an
+// SP1 v6.0.2 STARK proof on-chain via runar.VerifySP1FRI.
 //
 // On-chain invariants enforced (in order):
 //  1. Shard must not be frozen.
-//  2. New block number must be exactly previous + 1.
-//  3. Public-value offsets bind to their inputs:
+//  2. SP1 FRI proof verifies against the pinned SP1VerifyingKeyHash
+//     and absorbs publicValues into the Fiat-Shamir transcript. A
+//     mismatched proof, vkey, or pv blob fails OP_VERIFY inside the
+//     verifier body — `runar.VerifySP1FRI` returns false only if the
+//     entire STARK argument replays cleanly.
+//  3. New block number must be exactly previous + 1.
+//  4. Public-value offsets bind to their inputs:
 //     [0..32)   preStateRoot  == c.StateRoot
 //     [32..64)  postStateRoot == newStateRoot
 //     [104..136) batchDataHash == hash256(batchData)
@@ -102,10 +93,6 @@ type FRIRollupContract struct {
 // script's continuation-hash assertion. This gives indexers direct
 // access to batch payloads via BSV tx iteration without needing to
 // parse the covenant input script.
-//
-// proofBlob is accepted as a parameter so the ABI is stable against the
-// future on-chain FRI verifier upgrade (Gate 0a Full). It is not
-// consumed on-chain in Mode 1.
 func (c *FRIRollupContract) AdvanceState(
 	newStateRoot runar.ByteString,
 	newBlockNumber runar.Bigint,
@@ -114,6 +101,13 @@ func (c *FRIRollupContract) AdvanceState(
 	proofBlob runar.ByteString,
 ) {
 	runar.Assert(c.Frozen == 0)
+
+	// Verify the SP1 STARK proof on-chain. VerifySP1FRI absorbs
+	// proofBlob + publicValues + sp1VKeyHash into the Fiat-Shamir
+	// transcript and replays the full FRI argument. Fails OP_VERIFY
+	// internally on any STARK / Merkle / colinearity mismatch.
+	runar.Assert(runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash))
+
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
@@ -140,8 +134,6 @@ func (c *FRIRollupContract) AdvanceState(
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
-
-	_ = proofBlob
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +249,11 @@ func (c *FRIRollupContract) UpgradeSingleKey(
 	runar.Assert(c.GovernanceMode == 1)
 	runar.Assert(runar.CheckSig(sig, c.GovernanceKey))
 
+	// Verify the SP1 STARK proof on-chain. Same VerifySP1FRI binding
+	// as AdvanceState — the upgrade path can only execute on a valid
+	// proof, in addition to the governance signatures above.
+	runar.Assert(runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash))
+
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
@@ -277,7 +274,6 @@ func (c *FRIRollupContract) UpgradeSingleKey(
 	c.Frozen = 0
 
 	_ = newCovenantScript
-	_ = proofBlob
 }
 
 // UpgradeMultiSig2 upgrades the covenant under 2-of-3 multisig governance.
@@ -298,6 +294,11 @@ func (c *FRIRollupContract) UpgradeMultiSig2(
 		[]runar.PubKey{c.GovernanceKey, c.GovernanceKey2, c.GovernanceKey3},
 	))
 
+	// Verify the SP1 STARK proof on-chain. Same VerifySP1FRI binding
+	// as AdvanceState — the upgrade path can only execute on a valid
+	// proof, in addition to the governance signatures above.
+	runar.Assert(runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash))
+
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
@@ -318,7 +319,6 @@ func (c *FRIRollupContract) UpgradeMultiSig2(
 	c.Frozen = 0
 
 	_ = newCovenantScript
-	_ = proofBlob
 }
 
 // UpgradeMultiSig3 upgrades the covenant under 3-of-3 multisig governance.
@@ -340,6 +340,11 @@ func (c *FRIRollupContract) UpgradeMultiSig3(
 		[]runar.PubKey{c.GovernanceKey, c.GovernanceKey2, c.GovernanceKey3},
 	))
 
+	// Verify the SP1 STARK proof on-chain. Same VerifySP1FRI binding
+	// as AdvanceState — the upgrade path can only execute on a valid
+	// proof, in addition to the governance signatures above.
+	runar.Assert(runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash))
+
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
 
 	pvPreStateRoot := runar.Substr(publicValues, 0, 32)
@@ -360,5 +365,4 @@ func (c *FRIRollupContract) UpgradeMultiSig3(
 	c.Frozen = 0
 
 	_ = newCovenantScript
-	_ = proofBlob
 }

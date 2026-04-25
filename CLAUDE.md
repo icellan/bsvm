@@ -99,10 +99,11 @@ user/governance signature as authorization. Anyone with an acceptable
 proof bundle can advance the state. The three verification modes
 differ in what "acceptable" means on-chain (see spec 12):
 
-- **Mode 1 `VerifyFRI`** — trust-minimized FRI bridge. The covenant
-  binds state roots, batch hash, and chain id but does NOT verify the
-  SP1 FRI proof on-chain. Off-chain nodes verify; governance freeze is
-  the safety backstop. NOT mainnet-eligible (PrepareGenesis guardrail).
+- **Mode 1 `VerifyFRI`** — on-chain SP1 STARK verifier (KoalaBear field +
+  Poseidon2 KoalaBear Merkle + colinearity + Fiat-Shamir transcript).
+  The covenant invokes `runar.VerifySP1FRI` on every advance, which
+  replays the FRI argument against the pinned `SP1VerifyingKeyHash`.
+  Mainnet-eligible under VK pinning.
 - **Mode 2 `VerifyGroth16`** — full BN254 multi-pairing of the
   SP1-wrapped Groth16 proof on-chain. Mainnet-eligible under VK pinning.
 - **Mode 3 `VerifyGroth16WA`** — witness-assisted BN254 pairing with
@@ -111,9 +112,8 @@ differ in what "acceptable" means on-chain (see spec 12):
 Optional governance keys (configurable per-shard at genesis) can
 freeze/unfreeze the shard and upgrade the covenant script, but CANNOT
 advance state or access bridge funds. Governance modes: none (fully
-trustless — only safe under Mode 2/3), single_key, or multisig (M-of-N).
-Mode 1 shards should always run with non-trivial governance since the
-freeze path is the only safety backstop. See spec 12.
+trustless — safe under any mode now that all three verify their proof
+on-chain), single_key, or multisig (M-of-N). See spec 12.
 
 BSV is the consensus layer. Nodes don't run their own consensus — they
 execute deterministically and race to advance the covenant on BSV.
@@ -169,20 +169,16 @@ sequencer signature check on the advance path; authorization is proof-
 based.
 
 SP1 v6.0.2 is the pinned upstream. SP1 uses Poseidon2 over the
-KoalaBear field (p = 2^31 - 2^24 + 1 = 2,130,706,433) internally for
-FRI Merkle commitments and Fiat-Shamir challenges. The on-chain
-verifier uses SHA-256 (`OP_HASH256` / `OP_SHA256`) for Merkle paths —
-the SP1 host bridge transcodes Poseidon2 Merkle authentication paths
-into SHA-256 paths before submission. Poseidon2 is NOT implemented in
-Bitcoin Script.
+KoalaBear field (p = 2^31 - 2^24 + 1 = 2,130,706,433) for FRI Merkle
+commitments and Fiat-Shamir challenges. Rúnar implements Poseidon2 +
+KoalaBear arithmetic + Ext4 + colinearity directly in Bitcoin Script,
+so the on-chain Mode 1 verifier replays the SP1 FRI argument natively
+— no host-side Merkle transcoding step.
 
-Mode 2 / Mode 3 perform full BN254 pairing verification of SP1's
-wrapped Groth16 proof. Mode 1 (VerifyFRI) does NOT verify the proof
-on-chain today — it is the trust-minimized FRI bridge. A full on-chain
-FRI verifier (Gate 0a Full — KoalaBear / Ext4 / SHA-256 Merkle / PoW)
-is tracked as future work; Gate 0a primitives are validated on regtest
-but the full verifier composition is unscheduled. Until it lands, Mode
-1 is mainnet-blocked.
+All three modes now verify their proof on-chain. Mode 1 (VerifyFRI)
+runs the full SP1 STARK verifier via `runar.VerifySP1FRI` (~849 KB
+locking script for the evm-guest preset). Mode 2 / Mode 3 perform
+full BN254 pairing verification of SP1's wrapped Groth16 proof.
 
 BSV's native SHA-256 is used throughout for BSVM data bindings
 (batchDataHash, hashOutputs, bridge withdrawal Merkle trees,
