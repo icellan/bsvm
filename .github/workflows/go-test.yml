@@ -113,17 +113,51 @@ jobs:
           cache: true
           cache-dependency-path: bsv-evm/go.sum
 
-      - name: go test (excludes evmtest — runs in its own job)
+      - name: go test (excludes evmtest + covenant — run in dedicated jobs)
         working-directory: bsv-evm
         # -count=1 disables the test cache so flaky regressions don't
         # hide behind a stale "ok (cached)". -p 2 limits package-level
-        # parallelism so the GitHub-hosted runner doesn't get OOM-reaped
-        # while pkg/covenant + pkg/overlay run concurrently. test/evmtest
-        # is the long-pole (~3 min, plus ethereum/tests fixture loading)
-        # and runs in a dedicated job so its failure modes localise.
+        # parallelism so the runner doesn't OOM-reap.
+        # Excludes:
+        #   - test/evmtest (long, dedicated job).
+        #   - pkg/covenant (8+ min on free runners, dedicated job —
+        #     previous runs got reaped at 5 min of stdout silence while
+        #     advance_invariants_test compiled all three rollup modes).
         run: |
-          go test -count=1 -p 2 -timeout 20m \
-            $(go list ./... | grep -v '/test/evmtest')
+          go test -count=1 -p 2 -timeout 15m \
+            $(go list ./... | grep -vE '/test/evmtest|/pkg/covenant(/|$)')
+
+  covenant:
+    name: pkg/covenant (dedicated — long compile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test ./pkg/covenant/...
+        working-directory: bsv-evm
+        # -v streams each test as it runs so the runner's idle-stdout
+        # detector doesn't reap the job during the long compile of
+        # the three rollup contracts. -p 1 forces sequential package
+        # execution to keep memory bounded.
+        run: go test -count=1 -p 1 -v -timeout 20m ./pkg/covenant/...
 
   evmtest:
     name: ethereum/tests (test/evmtest)
