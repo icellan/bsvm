@@ -1,13 +1,16 @@
 name: Go test
 
-# PR-gate Go test workflow — every package without a build tag (so
-# excludes integration/multinode/devnet which need a live BSV regtest
-# node or docker compose, and which run in other workflows).
+# PR-gate Go test workflow.
 #
-# Four parallel jobs: lint, build, test, evmtest. The slower / flakier
-# checks (race + fuzz) live in `.github/workflows/go-extra.yml` on a
-# nightly + workflow_dispatch trigger so a transient runner-pool reap
-# doesn't block PR merges.
+# Five parallel fast jobs (lint, build, test, covenant, evmtest), then
+# a sequential devnet-smoke job gated by `needs:` so the docker image
+# build + compose cluster only run when the unit tests are green.
+# Saves ~5 min of runner time on red PRs and gives a single overall
+# status check.
+#
+# Slower / flakier checks (race + fuzz) live in
+# `.github/workflows/go-extra.yml` on a nightly + workflow_dispatch
+# trigger so a transient runner-pool reap doesn't block PR merges.
 #
 # All `run:` blocks operate on local repo files — no untrusted GitHub
 # event payloads are interpolated. Safe under the GitHub Actions
@@ -186,4 +189,120 @@ jobs:
       - name: go test ./test/evmtest/...
         working-directory: bsv-evm
         run: go test -count=1 -p 2 -timeout 12m ./test/evmtest/...
+
+  devnet-smoke:
+    name: devnet smoke (mock)
+    runs-on: ubuntu-latest
+    # Sequential: only run after every Go check passes, so a red
+    # PR doesn't burn ~5 min of runner time on the docker image
+    # build + compose cluster spin-up.
+    needs: [lint, build, test, covenant, evmtest]
+    timeout-minutes: 20
+
+    env:
+      # Always mock for the automated suite. `execute` and `prove`
+      # require either long CPU time or a GPU and are out of scope
+      # for PR-gate CI.
+      BSVM_PROVE_MODE: mock
+
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar (sibling of bsv-evm for go.mod replace directives)
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          # In private-repo setups the workflow caller needs a PAT with
+          # contents:read for the runar repo. When unset, Actions falls
+          # back to GITHUB_TOKEN, which works for same-org monorepos.
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: Set up Node (for SPA build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: bsv-evm/web/package-lock.json
+
+      - name: Build React SPA
+        working-directory: bsv-evm/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build bsvm:devnet image
+        env:
+          # SPA was built in the previous step; don't rebuild inside
+          # docker-build.sh.
+          SKIP_WEB_BUILD: "1"
+        run: bash bsv-evm/scripts/docker-build.sh
+
+      - name: Pre-pull BSV regtest image
+        run: docker pull bitcoinsv/bitcoin-sv:latest
+
+      - name: Run devnet smoke tests
+        working-directory: bsv-evm
+        run: go test -tags devnet_smoke -v -timeout 5m ./test/devnet/...
+
+      - name: Bring devnet back up for simulator smoke
+        working-directory: bsv-evm
+        # The smoke test above tears the cluster down via t.Cleanup. The
+        # simulator smoke test drives bsvm-sim from the runner host and
+        # expects ports 8545/8546/8547 mapped to live containers, so we
+        # explicitly restart compose here. All `run:` content is
+        # workflow-author-controlled — no untrusted GitHub event payloads
+        # are interpolated.
+        run: |
+          docker compose up -d
+          # Wait until 4 containers report healthy (bsv-regtest is the
+          # slow one — auto-miner kicks regtest at ~30s post-start).
+          deadline=$((SECONDS + 90))
+          while [ $SECONDS -lt $deadline ]; do
+            healthy=$(docker ps \
+              --filter label=com.docker.compose.project=bsv-evm \
+              --filter health=healthy \
+              --format '{{.Names}}' | wc -l)
+            if [ "$healthy" -ge 4 ]; then
+              echo "cluster healthy ($healthy containers)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "cluster did not become healthy in 90s"
+          docker compose ps
+          exit 1
+
+      - name: Run simulator smoke test
+        working-directory: bsv-evm
+        # Drives real traffic against the compose devnet using bsvm-sim
+        # in headless mode. Requires the smoke image to have a loosened
+        # MaxSpeculativeDepth (set via compose env) so the 512-block
+        # buffer doesn't saturate during the 45s window.
+        run: go test -tags devnet_sim -v -timeout 4m ./test/devnet/...
+
+      - name: Capture container logs on failure
+        if: failure()
+        working-directory: bsv-evm
+        run: |
+          docker compose ps || true
+          for svc in bsv-regtest bsv-miner node1 node2 node3; do
+            echo "==== $svc ===="
+            docker logs "bsvm-$svc" 2>&1 | tail -200 || true
+          done
+
+      - name: Tear down
+        if: always()
+        working-directory: bsv-evm
+        run: docker compose down -v || true
 
