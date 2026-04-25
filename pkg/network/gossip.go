@@ -52,7 +52,14 @@ func privKeyFromSeed(seed []byte) (crypto.PrivKey, error) {
 // maxStreamReadSize is the maximum number of bytes read from a single
 // stream in one read operation. This provides an additional layer of
 // protection beyond per-message-type limits.
-const maxStreamReadSize = 1024 * 1024 // 1MB
+//
+// Sized to fit the largest legitimate stream payload: the genesis-sync
+// response, which JSON-wraps the hex-encoded raw genesis tx. The Mode 1
+// covenant locking script is ~1 MB after Gate 0a Full landed (full SP1
+// FRI verifier body), so the genesis tx is ~1 MB raw / ~2 MB hex /
+// ~2 MB JSON-wrapped. 4 MB gives headroom for genesis growth without
+// inviting unbounded reads.
+const maxStreamReadSize = 4 * 1024 * 1024 // 4MB
 
 // MessageHandler is a callback function invoked when a message of a
 // specific type is received from a peer.
