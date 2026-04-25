@@ -283,7 +283,15 @@ func opBlobHash(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([
 
 // opBlobBaseFee implements BLOBBASEFEE opcode
 func opBlobBaseFee(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-	blobBaseFee, _ := uint256.FromBig(interpreter.evm.Context.BlobBaseFee)
+	// BlobBaseFee may be nil when the BlockContext was constructed for a
+	// non-blob-aware caller (e.g. fuzz harnesses, regtest scaffolding).
+	// Treat that as zero rather than nil-derefing on Stack.push.
+	blobBaseFee := new(uint256.Int)
+	if interpreter.evm.Context.BlobBaseFee != nil {
+		if v, _ := uint256.FromBig(interpreter.evm.Context.BlobBaseFee); v != nil {
+			blobBaseFee = v
+		}
+	}
 	scope.Stack.push(blobBaseFee)
 	return nil, nil
 }

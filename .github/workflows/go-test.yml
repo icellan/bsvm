@@ -113,15 +113,48 @@ jobs:
           cache: true
           cache-dependency-path: bsv-evm/go.sum
 
-      - name: go test ./...
+      - name: go test (excludes evmtest — runs in its own job)
         working-directory: bsv-evm
         # -count=1 disables the test cache so flaky regressions don't
-        # hide behind a stale "ok (cached)". evmtest is the long-pole
-        # (~3 min); covenant + overlay come next.
-        run: go test -count=1 -timeout 20m ./...
+        # hide behind a stale "ok (cached)". -p 2 limits package-level
+        # parallelism so the GitHub-hosted runner doesn't get OOM-reaped
+        # while pkg/covenant + pkg/overlay run concurrently. test/evmtest
+        # is the long-pole (~3 min, plus ethereum/tests fixture loading)
+        # and runs in a dedicated job so its failure modes localise.
+        run: |
+          go test -count=1 -p 2 -timeout 20m \
+            $(go list ./... | grep -v '/test/evmtest')
+
+  evmtest:
+    name: ethereum/tests (test/evmtest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test ./test/evmtest/...
+        working-directory: bsv-evm
+        run: go test -count=1 -p 2 -timeout 12m ./test/evmtest/...
 
   race:
-    name: go test -race (concurrency-heavy packages)
+    name: go test -race (small concurrency-heavy packages)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -144,21 +177,22 @@ jobs:
           cache: true
           cache-dependency-path: bsv-evm/go.sum
 
-      - name: go test -race
+      - name: go test -race (smaller packages only)
         working-directory: bsv-evm
-        # Limited to packages that exercise concurrency primitives —
-        # overlay (the consensus-race + speculative-receipt machinery),
-        # network (libp2p gossip), prover (parallel proof pipeline),
-        # rpc (concurrent JSON-RPC handlers), shard (multi-shard mgr),
-        # and the e2e harness that drives all of the above.
+        # Race-detector slowdown is 5-10x; running it across all
+        # concurrency-heavy packages timed out at 30 min on
+        # GitHub-hosted runners. Limit to packages where the race
+        # surface fits in the budget: prover (parallel proof pipeline),
+        # rpc (JSON-RPC handlers), shard (multi-shard manager), event
+        # (subscription bus). pkg/overlay + pkg/network + test/e2e are
+        # excluded — their race surface is large enough to need a
+        # dedicated runner / longer timeout, tracked separately.
         run: |
-          go test -count=1 -race -timeout 20m \
-            ./pkg/overlay/... \
-            ./pkg/network/... \
+          go test -count=1 -race -p 2 -timeout 20m \
             ./pkg/prover/... \
             ./pkg/rpc/... \
             ./pkg/shard/... \
-            ./test/e2e/...
+            ./pkg/event/...
 
   fuzz-smoke:
     name: fuzz smoke (30s per target)

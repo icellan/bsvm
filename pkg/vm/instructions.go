@@ -471,13 +471,27 @@ func opNumber(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]b
 }
 
 func opDifficulty(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-	v, _ := uint256.FromBig(interpreter.evm.Context.Difficulty)
+	// BlockContext.Difficulty is *big.Int; nil for callers that don't supply
+	// it. uint256.FromBig(nil) returns nil; pushing nil onto the stack
+	// panics. Default to zero in that case.
+	v := new(uint256.Int)
+	if interpreter.evm.Context.Difficulty != nil {
+		if w, _ := uint256.FromBig(interpreter.evm.Context.Difficulty); w != nil {
+			v = w
+		}
+	}
 	scope.Stack.push(v)
 	return nil, nil
 }
 
 func opRandom(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-	v := new(uint256.Int).SetBytes(interpreter.evm.Context.Random.Bytes())
+	v := new(uint256.Int)
+	// BlockContext.Random is *types.Hash; may be nil for callers that don't
+	// supply prevrandao (fuzz harnesses, regtest scaffolding). Treat nil as
+	// the zero hash rather than nil-derefing on Bytes().
+	if interpreter.evm.Context.Random != nil {
+		v.SetBytes(interpreter.evm.Context.Random.Bytes())
+	}
 	scope.Stack.push(v)
 	return nil, nil
 }
