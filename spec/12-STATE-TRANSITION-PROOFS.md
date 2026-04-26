@@ -845,6 +845,18 @@ The SP1 proof commits the following public values at fixed offsets:
 | 144 | 32 | withdrawalRoot | SHA256 Merkle root of withdrawal hashes in batch, or `bytes32(0)` if no withdrawals |
 | 176 | 32 | inboxRootBefore | Inbox hash chain root before this batch (from host input). `bytes32(0)` if inbox is empty or inbox is disabled. See Spec 10, "Inbox Integration via STARK Public Values". |
 | 208 | 32 | inboxRootAfter | Inbox hash chain root after this batch. `bytes32(0)` if all inbox txs were included (queue drained). Equals `inboxRootBefore` if no inbox txs were included in this batch. |
+
+<!-- TODO(spec): pin the per-batch inbox witness cap. Implementation
+     enforces `MAX_INBOX_DRAIN_PER_BATCH = 1024` in the SP1 guest
+     (`prover/guest/src/inbox.rs`) and the Go host
+     (`pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch`). The cap
+     is a DoS guard against unbounded `inbox_queue` witnesses
+     exhausting SP1 cycles. Over-cap witnesses are rejected with
+     guest error code 0x13 (`InboxError::QueueExceedsCap`). See
+     `docs/decisions/inbox-drain.md` D6/D7 for rationale. Pin the
+     constant in the normative public-values / verifier text in the
+     next sweep. -->
+
 | 240 | 32 | migrateScriptHash | `SHA256(newScript)` if migration, else `bytes32(0)` |
 
 Total: 272 bytes of public values.

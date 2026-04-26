@@ -151,6 +151,45 @@ func TestProcessBatch_ForcedInboxDrain_WitnessIsCorrect(t *testing.T) {
 	}
 }
 
+// TestProcessBatch_OverCapInboxQueue_FailsFast asserts the W4-3
+// mainnet-hardening behaviour: when the live on-chain inbox queue
+// exceeds prover.MaxInboxDrainPerBatch (= 1024), ProcessBatch returns
+// a hard error rather than silently producing a witness the SP1 guest
+// would reject (error code 0x13). This is the producer-side mirror of
+// the guest cap; failing fast surfaces the cap violation in operator
+// logs the moment it happens, instead of letting it fester until the
+// covenant rejects an advance.
+//
+// We populate the monitor directly via AddInboxTransaction (the same
+// path used by the BSV inbox-covenant watcher) so this test exercises
+// the exact code path a real over-cap queue would hit.
+func TestProcessBatch_OverCapInboxQueue_FailsFast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping inbox cap regression in -short mode")
+	}
+	ts := newTestSetup(t)
+	defer ts.node.Stop()
+
+	monitor := ts.node.InboxMonitor()
+	if monitor == nil {
+		t.Fatal("inbox monitor not initialised")
+	}
+
+	// Pile MaxInboxDrainPerBatch + 1 entries into the monitor. The
+	// no-drain path inside processBatchInternal will snapshot the queue
+	// and call BuildInboxWitness with a length over the cap.
+	for i := 0; i <= prover.MaxInboxDrainPerBatch; i++ {
+		monitor.AddInboxTransaction([]byte{byte(i & 0xff)})
+	}
+
+	userTx := ts.signTx(t, 0, types.HexToAddress("0x3333333333333333333333333333333333333333"),
+		uint256.NewInt(1), nil)
+	if _, err := ts.node.ProcessBatch([]*types.Transaction{userTx}); err == nil {
+		t.Fatalf("ProcessBatch must fail when inbox queue (%d) > MaxInboxDrainPerBatch (%d)",
+			prover.MaxInboxDrainPerBatch+1, prover.MaxInboxDrainPerBatch)
+	}
+}
+
 // TestProcessBatch_NoInboxDrain_RootsUnchanged is the steady-state
 // regression. When no drain happens, before == after must hold so the
 // covenant increments the advancesSinceInbox counter (spec 10).

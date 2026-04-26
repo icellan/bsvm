@@ -378,6 +378,20 @@ pub fn main() {
             commit_error(0x12, &input.inbox_root_before, &[0u8; 32]);
             return;
         }
+        Err(inbox::InboxError::QueueExceedsCap) => {
+            // W4-3 mainnet hardening: the host shipped more than
+            // inbox::MAX_INBOX_DRAIN_PER_BATCH queued txs. Surface the
+            // observed length in `actual` so the operator can debug the
+            // producer-side pagination bug; `expected` carries the cap.
+            let mut expected = [0u8; 32];
+            let cap_bytes = (inbox::MAX_INBOX_DRAIN_PER_BATCH as u64).to_be_bytes();
+            expected[24..32].copy_from_slice(&cap_bytes);
+            let mut actual = [0u8; 32];
+            let len_bytes = (raw_queue.len() as u64).to_be_bytes();
+            actual[24..32].copy_from_slice(&len_bytes);
+            commit_error(0x13, &expected, &actual);
+            return;
+        }
     };
     let inbox_root_after = inbox_plan.root_after;
 

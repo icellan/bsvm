@@ -41,6 +41,30 @@
 
 use sha2::{Digest, Sha256};
 
+/// Hard upper bound on the number of inbox transactions a single batch's
+/// drain witness may carry (W4-3 mainnet hardening).
+///
+/// Why a cap at all: the witness is shipped from the (untrusted) host as
+/// part of [`crate::main::BatchInput::inbox_queue`]. Without a bound a
+/// malicious host could ship millions of entries and exhaust SP1 cycles —
+/// the per-leaf `hash256` cost is small, but the SP1 stdin blob and
+/// proof-witness size scale linearly. Even a benign host needs a fixed
+/// cap so proof-cost budgets and witness-buffer sizes can be plumbed
+/// statically.
+///
+/// Why 1024: this matches typical Ethereum block transaction ceilings
+/// (~1500 tx is the historical L1 max; rollup batches sit comfortably
+/// below 1k). The producer already paginates inbox drains per batch via
+/// `pkg/overlay/process.go`, so 1024 is well above any normal queue
+/// depth for the spec-10 forced-inclusion threshold (10 advances).
+/// `pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch` mirrors this
+/// constant on the host side.
+///
+/// Spec amendment: spec 09 / spec 12 currently leave the cap unspecified
+/// (see `TODO(spec)` markers). Once the spec pins the constant this
+/// note can be replaced with the spec citation.
+pub const MAX_INBOX_DRAIN_PER_BATCH: usize = 1024;
+
 /// Compute hash256 (double-SHA256) — BSV's `OP_HASH256`.
 fn hash256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -90,6 +114,12 @@ pub enum InboxError {
     /// Forced-inclusion was triggered (`must_drain_all`) but the host left
     /// transactions in the queue, violating spec 10's escape-hatch rule.
     PartialDrainWhileForced,
+    /// The host shipped more than [`MAX_INBOX_DRAIN_PER_BATCH`] queued
+    /// inbox txs in a single batch witness (W4-3 mainnet hardening).
+    /// The producer is expected to paginate the queue across multiple
+    /// batches at a depth below the cap; an over-cap witness is a
+    /// configuration bug or a DoS attempt against the SP1 prover.
+    QueueExceedsCap,
 }
 
 /// Drain plan returned by [`verify_and_split`].
@@ -132,6 +162,12 @@ pub fn verify_and_split<'q>(
     drain_count: usize,
     must_drain_all: bool,
 ) -> Result<DrainPlan<'q>, InboxError> {
+    // (0) DoS gate (W4-3 mainnet hardening): refuse over-cap queues
+    // BEFORE any Merkle/PoW work. The check is O(1) so a malicious host
+    // pays no SP1 cycles for an oversized witness.
+    if queue.len() > MAX_INBOX_DRAIN_PER_BATCH {
+        return Err(InboxError::QueueExceedsCap);
+    }
     if drain_count > queue.len() {
         return Err(InboxError::DrainCountExceedsQueue);
     }
@@ -263,6 +299,38 @@ mod tests {
         // Only drain 2 of 3 while the covenant demands a full drain.
         let err = verify_and_split(&txs, &before, 2, true).unwrap_err();
         assert_eq!(err, InboxError::PartialDrainWhileForced);
+    }
+
+    /// A queue at exactly the cap is accepted (W4-3 mainnet hardening).
+    /// Each tx is a tiny payload so the test stays fast while still
+    /// exercising the chain_root walk over MAX_INBOX_DRAIN_PER_BATCH
+    /// leaves.
+    #[test]
+    fn queue_at_cap_is_accepted() {
+        let txs: Vec<Vec<u8>> = (0..MAX_INBOX_DRAIN_PER_BATCH)
+            .map(|i| (i as u32).to_be_bytes().to_vec())
+            .collect();
+        assert_eq!(txs.len(), MAX_INBOX_DRAIN_PER_BATCH);
+        let before = chain_root(&txs);
+        let plan = verify_and_split(&txs, &before, 0, false)
+            .expect("queue at cap must be accepted");
+        assert_eq!(plan.root_after, before);
+    }
+
+    /// A queue one entry over the cap is rejected with the new
+    /// QueueExceedsCap variant — the gate fires before any chain-root
+    /// recomputation so a malicious host pays no SP1 cycles for an
+    /// oversized witness.
+    #[test]
+    fn queue_over_cap_is_rejected() {
+        let txs: Vec<Vec<u8>> = (0..MAX_INBOX_DRAIN_PER_BATCH + 1)
+            .map(|i| (i as u32).to_be_bytes().to_vec())
+            .collect();
+        // Use a deliberately bogus claimed_before to confirm the cap
+        // check is reached first (otherwise we'd see BeforeRootMismatch).
+        let bogus = [0xAAu8; 32];
+        let err = verify_and_split(&txs, &bogus, 0, false).unwrap_err();
+        assert_eq!(err, InboxError::QueueExceedsCap);
     }
 
     #[test]

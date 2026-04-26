@@ -109,6 +109,55 @@ doesn't need an EIP-2718 decoder of its own — that decoder's
 correctness is part of the `from` binding the host commits to via the
 existing `raw_bytes` field.
 
+### D6. Witness size cap (W4-3 mainnet hardening, follow-up)
+
+**Decision:** Hard-cap inbox queue witnesses at
+**`MAX_INBOX_DRAIN_PER_BATCH = 1024`** entries on both sides.
+
+Rationale:
+- Without an upper bound a malicious / misconfigured host could ship
+  an unbounded `inbox_queue` and exhaust SP1 cycles — a DoS on batch
+  advance. Even on a benign host, an unbounded queue is unsafe to
+  size proofs / witness buffers against.
+- 1024 matches typical Ethereum block transaction ceilings (~1500
+  was the historical L1 max; rollup batches sit comfortably below
+  1k). Cheap arithmetic check inside SP1 (single `usize` compare).
+- Spec 10's forced-inclusion threshold fires after 10 advances, so
+  natural queue depth is well below 1k under any sane operator
+  config. The cap is a DoS guard, not a throughput throttle.
+
+Where the cap is enforced:
+- **Guest** (`prover/guest/src/inbox.rs`): `verify_and_split` rejects
+  over-cap queues with `InboxError::QueueExceedsCap` (error code
+  `0x13`) BEFORE any Merkle/PoW work. A malicious host pays no SP1
+  cycles for an oversized witness.
+- **Host** (`pkg/prover/inbox_witness.go::BuildInboxWitness`):
+  returns a hard error when the queue exceeds
+  `MaxInboxDrainPerBatch` (= 1024). The producer never even tries
+  to prove an unprovable batch.
+- **Overlay producer** (`pkg/overlay/process.go::processBatchInternal`):
+  propagates the witness-build error so `ProcessBatch` fails fast
+  rather than silently producing a batch the guest will reject.
+
+This closes the "Witness size cap" follow-up listed below in the
+"Open questions" section.
+
+### D7. Cap violation → error vs. truncate
+
+**Decision:** **ERROR**, do not silently truncate.
+
+Truncation would hide the configuration bug from the operator and
+risk leaving inbox txs un-drained past spec-10's forced-inclusion
+threshold (10 advances). The covenant would then REJECT every
+subsequent advance until the queue is drained, tipping the producer
+into an unrecoverable state without a clear root cause. Failing
+fast surfaces the bug in the operator's logs the moment it happens.
+
+The expected operator response is to drain the on-chain inbox via
+multiple smaller batches (the producer code in `process.go` already
+paginates via `DrainPending`/`MustDrainInbox`; D6's cap is purely a
+defensive ceiling).
+
 ## What changed
 
 ### Guest (`prover/guest/`)
@@ -204,8 +253,11 @@ behavioural binding that matters for production.
    semantics from the covenant's perspective (`before != after`) but
    the spec text should be updated.
 
-3. **Witness size cap**: No upper bound on `inbox_queue.len()` is
-   enforced today. The per-tx hash chain extension is cheap inside
-   SP1 (one SHA256 precompile call per leaf), but very long queues
-   would inflate the witness blob and SP1 stdin. Pick a hard cap
-   (e.g. 1024 entries) before mainnet.
+3. **Witness size cap**: ~~No upper bound on `inbox_queue.len()` is
+   enforced today~~. **CLOSED in W4-3 mainnet hardening.** See D6 / D7
+   above: the cap is `MAX_INBOX_DRAIN_PER_BATCH = 1024`, enforced in
+   the guest (`InboxError::QueueExceedsCap`, code `0x13`), the host
+   (`BuildInboxWitness` hard error), and the overlay producer
+   (`processBatchInternal` propagates the error). Spec 09 / spec 12
+   carry `TODO(spec)` markers pointing at the canonical constant —
+   pin the value in the spec text in the next spec sweep.
