@@ -80,11 +80,32 @@ type ProveInput struct {
 	BlockContext BlockContext `json:"block_context"`
 
 	// InboxRootBefore is the inbox queue hash before draining pending
-	// inbox transactions. Computed from InboxMonitor state.
+	// inbox transactions. The SP1 guest verifies this against InboxQueue
+	// (W4-3, spec 10): it recomputes the chain root over InboxQueue and
+	// asserts equality. A mismatch aborts the proof, which is the
+	// censorship-resistance gate.
 	InboxRootBefore types.Hash `json:"inbox_root_before"`
-	// InboxRootAfter is the inbox queue hash after draining pending
-	// inbox transactions. Computed from InboxMonitor state.
+	// InboxRootAfter is the inbox queue hash after draining
+	// InboxDrainCount entries off the front of InboxQueue. The guest
+	// recomputes this from the carry-forward remainder; the host
+	// supplies it for cross-check / mock-mode use only.
 	InboxRootAfter types.Hash `json:"inbox_root_after"`
+	// InboxQueue is the full ordered list of currently-queued inbox
+	// transactions, exactly as the on-chain inbox covenant has them
+	// (raw RLP, identical to what `InboxMonitor.AddInboxTransaction`
+	// recorded). The leading InboxDrainCount entries are executed at the
+	// HEAD of the batch (before user txs); the remainder is carried
+	// forward. The guest verifies the chain root over this list against
+	// InboxRootBefore.
+	InboxQueue []InboxQueuedTx `json:"inbox_queue,omitempty"`
+	// InboxDrainCount is how many leading entries to consume from
+	// InboxQueue this batch. Must be <= len(InboxQueue).
+	InboxDrainCount uint32 `json:"inbox_drain_count,omitempty"`
+	// InboxMustDrainAll is set when on-chain `advancesSinceInbox` has
+	// reached the forced-inclusion threshold (spec 10, default 10) and
+	// the covenant will REJECT any advance that doesn't fully drain the
+	// queue. The guest enforces this defensively.
+	InboxMustDrainAll bool `json:"inbox_must_drain_all,omitempty"`
 
 	// Withdrawals is the list of L2 → BSV bridge withdrawals included in
 	// this batch. The SP1 guest folds these into a binary SHA256 Merkle

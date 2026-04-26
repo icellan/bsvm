@@ -70,6 +70,19 @@ struct TransactionExport {
     raw_bytes: String,
 }
 
+/// Inbox witness entry from the Go host.
+///
+/// Mirrors `pkg/prover/inbox_witness.go::InboxQueuedTx`. The host must
+/// supply the FULL ordered queue; the guest recomputes the hash chain
+/// over `raw_tx_rlp` and asserts equality with `inbox_root_before`
+/// (W4-3, spec 10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboxQueuedTxExport {
+    /// Hex-encoded raw EVM tx RLP bytes — the exact `evmTxRLP` argument
+    /// passed to the inbox covenant's `submit` method.
+    raw_tx_rlp: String,
+}
+
 /// Complete input from the Go host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostInput {
@@ -81,8 +94,22 @@ struct HostInput {
     #[serde(default)]
     inbox_root_before: String,
     /// Inbox queue hash after draining (hex, optional — defaults to zeros).
+    /// W4-3: ignored by the production guest; the guest recomputes this
+    /// from `inbox_queue` + `inbox_drain_count`. Kept on the wire for
+    /// host-side cross-check / mock-mode use.
     #[serde(default)]
     inbox_root_after: String,
+    /// Full ordered list of currently-queued inbox txs (W4-3, spec 10).
+    /// Empty when there's nothing in the on-chain inbox.
+    #[serde(default)]
+    inbox_queue: Vec<InboxQueuedTxExport>,
+    /// How many leading entries from `inbox_queue` to consume.
+    #[serde(default)]
+    inbox_drain_count: u32,
+    /// Forced-inclusion guard (spec 10): when true the guest aborts if
+    /// the carry-forward remainder is non-empty.
+    #[serde(default)]
+    inbox_must_drain_all: bool,
     /// Proving mode: "execute" (no proof), "core", "compressed", or "groth16".
     mode: String,
 }
@@ -137,6 +164,15 @@ struct GuestBlockContext {
     prev_randao: [u8; 32],
 }
 
+/// An inbox witness entry as expected by the guest program.
+///
+/// Field order MUST match prover/guest/src/main.rs::InboxTx exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuestInboxTx {
+    tx: GuestTransaction,
+    raw_tx_rlp: Vec<u8>,
+}
+
 /// Complete batch input as expected by the guest program.
 ///
 /// Field order MUST match prover/guest/src/main.rs::BatchInput exactly.
@@ -147,7 +183,9 @@ struct GuestBatchInput {
     transactions: Vec<GuestTransaction>,
     block_context: GuestBlockContext,
     inbox_root_before: [u8; 32],
-    inbox_root_after: [u8; 32],
+    inbox_queue: Vec<GuestInboxTx>,
+    inbox_drain_count: u32,
+    inbox_must_drain_all: bool,
 }
 
 // ─── Output types (JSON to Go host) ──────────────────────────────────────────
@@ -256,16 +294,47 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
     };
 
     // Inbox roots: optional in wire format, default to zeros (no inbox).
+    // Note: `inbox_root_after` from the host is intentionally dropped — the
+    // production guest recomputes it from `inbox_queue`/`inbox_drain_count`
+    // and commits the recomputed value (W4-3, spec 10). The host field
+    // remains on the wire for cross-check / mock-mode use.
     let inbox_root_before = if input.inbox_root_before.is_empty() {
         [0u8; 32]
     } else {
         hex_to_bytes32(&input.inbox_root_before)
     };
-    let inbox_root_after = if input.inbox_root_after.is_empty() {
-        [0u8; 32]
-    } else {
-        hex_to_bytes32(&input.inbox_root_after)
-    };
+
+    // Convert the inbox witness (W4-3). Each entry carries the raw RLP
+    // (used to recompute the chain root) plus a pre-decoded EvmTransaction
+    // ready to feed into revm at the head of the batch.
+    //
+    // Today the host-bridge only receives `raw_tx_rlp` from the Go host —
+    // sender recovery / EIP-2718 envelope decoding for inbox txs lives in
+    // a sister task (W4-2). Until that lands, the pre-decoded `tx` field
+    // is populated as a zeroed placeholder; if the production guest path
+    // exercises the drain branch with a non-zero count the placeholder
+    // will produce an invalid revm tx and the batch will fail. Hosts that
+    // need real drain-then-execute today should keep `inbox_drain_count`
+    // at zero (the queue is still verified against `inbox_root_before`).
+    let inbox_queue: Vec<GuestInboxTx> = input
+        .inbox_queue
+        .iter()
+        .map(|t| GuestInboxTx {
+            tx: GuestTransaction {
+                tx_type: 0x02,
+                from: [0u8; 20],
+                to: None,
+                value: [0u8; 32],
+                data: Vec::new(),
+                nonce: 0,
+                gas_limit: 0,
+                gas_price: 0,
+                max_priority_fee: 0,
+                raw_bytes: hex_decode(&t.raw_tx_rlp),
+            },
+            raw_tx_rlp: hex_decode(&t.raw_tx_rlp),
+        })
+        .collect();
 
     GuestBatchInput {
         pre_state_root,
@@ -273,7 +342,9 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         transactions,
         block_context,
         inbox_root_before,
-        inbox_root_after,
+        inbox_queue,
+        inbox_drain_count: input.inbox_drain_count,
+        inbox_must_drain_all: input.inbox_must_drain_all,
     }
 }
 

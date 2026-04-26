@@ -86,6 +86,22 @@ func (im *InboxMonitor) RecordAdvance() {
 	im.advancesSinceLastDrain++
 }
 
+// PendingTxsSnapshot returns a copy of the currently-queued inbox
+// transactions WITHOUT mutating monitor state. Used by the prover witness
+// builder to recompute the inbox chain root inside the SP1 guest (W4-3).
+// Order matches submission order — identical to DrainPending output.
+func (im *InboxMonitor) PendingTxsSnapshot() [][]byte {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	out := make([][]byte, len(im.pendingTxs))
+	for i, tx := range im.pendingTxs {
+		cp := make([]byte, len(tx))
+		copy(cp, tx)
+		out[i] = cp
+	}
+	return out
+}
+
 // DrainPending returns all pending inbox transactions and resets the queue.
 // Call when building a batch that includes inbox transactions.
 func (im *InboxMonitor) DrainPending() [][]byte {

@@ -205,8 +205,19 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	// Check if forced inbox inclusion is required. Producer-only: on the
 	// replay path the batch already contains whatever the producer chose
 	// to include.
+	//
+	// W4-3 (spec 10): we MUST snapshot the queue and pre-drain root
+	// BEFORE calling DrainPending (which mutates the monitor). The
+	// snapshot is the witness shipped to the SP1 guest so it can verify
+	// `inboxRootBefore` matches the actual on-chain queue.
+	var inboxWitness producerInboxWitness
 	if n.inboxMonitor != nil && n.inboxMonitor.MustDrainInbox() {
+		inboxWitness.preDrainRoot = n.inboxMonitor.QueueHash()
+		inboxWitness.preDrainQueue = n.inboxMonitor.PendingTxsSnapshot()
+		inboxWitness.mustDrainAll = true
+
 		inboxTxsRLP := n.inboxMonitor.DrainPending()
+		inboxWitness.drainedCount = uint32(len(inboxTxsRLP))
 		// Decode and prepend inbox transactions to the batch.
 		for _, rlpTx := range inboxTxsRLP {
 			var inboxTx types.Transaction
@@ -231,7 +242,34 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	}
 	timestamp := parentHeader.Timestamp + interval
 
-	return n.processBatchInternal(n.config.Coinbase, timestamp, txs)
+	return n.processBatchInternal(n.config.Coinbase, timestamp, txs, inboxWitness)
+}
+
+// producerInboxWitness carries the inbox-drain witness from
+// ProcessBatch (which is the only path that touches the InboxMonitor)
+// into processBatchInternal. ReplayBatch passes a zero-value
+// witness — replay batches don't drain the inbox; whatever inbox txs
+// were in the producer's batch are just regular txs at this point.
+type producerInboxWitness struct {
+	// preDrainRoot is the chain root of preDrainQueue (= what the
+	// guest commits as `inboxRootBefore`). Zero-value means "no inbox
+	// drain happened in this batch", in which case the existing
+	// `n.inboxMonitor.QueueHash()` is used as both before and after.
+	preDrainRoot types.Hash
+	// preDrainQueue is the FULL ordered list of inbox txs that were
+	// queued at batch-build time. The guest recomputes the chain over
+	// this list and asserts equality with preDrainRoot.
+	preDrainQueue [][]byte
+	// drainedCount is how many leading entries from preDrainQueue
+	// this batch consumed. The guest applies these as part of the
+	// EVM batch and uses preDrainQueue[drainedCount:] to recompute
+	// `inboxRootAfter`.
+	drainedCount uint32
+	// mustDrainAll is true when on-chain `advancesSinceInbox` was at
+	// the forced-inclusion threshold (spec 10) and the covenant will
+	// REJECT any advance leaving txs in the queue. The guest enforces
+	// this defensively.
+	mustDrainAll bool
 }
 
 // ReplayBatch re-executes a batch produced by a peer, reusing the
@@ -279,17 +317,21 @@ func (n *OverlayNode) ReplayBatch(batch *block.BatchData) (*ProcessResult, error
 			batch.Timestamp, parentHeader.Timestamp)
 	}
 
-	return n.processBatchInternal(batch.Coinbase, batch.Timestamp, txs)
+	// Replay path never drains the inbox — pass a zero-value witness.
+	return n.processBatchInternal(batch.Coinbase, batch.Timestamp, txs, producerInboxWitness{})
 }
 
 // processBatchInternal is the shared execution core for ProcessBatch
 // (producer) and ReplayBatch (follower sync). Caller MUST hold n.mu.
 // The coinbase and timestamp parameters are applied verbatim — the
 // caller is responsible for picking producer-path or replay-path values.
+// The inboxWitness is populated only by ProcessBatch when a forced-
+// inclusion drain happened; ReplayBatch passes a zero-value witness.
 func (n *OverlayNode) processBatchInternal(
 	coinbase types.Address,
 	timestamp uint64,
 	txs []*types.Transaction,
+	inboxWitness producerInboxWitness,
 ) (*ProcessResult, error) {
 	// 1. Get parent header from ChainDB.
 	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
@@ -311,10 +353,17 @@ func (n *OverlayNode) processBatchInternal(
 	n.stateDB.StartAccessRecording()
 
 	// Capture inbox root BEFORE execution so we have the true "before"
-	// state for the SP1 public values. On the producer path any forced
-	// inbox drain has already happened in ProcessBatch before this call.
+	// state for the SP1 public values.
+	//
+	// W4-3 (spec 10): if ProcessBatch drained the inbox above, it
+	// snapshotted the pre-drain root in inboxWitness — use that, NOT
+	// the current monitor state (which has already been reset by
+	// DrainPending). Otherwise (no drain this batch / replay path)
+	// the live monitor hash is the correct "before" value.
 	var inboxRootBefore types.Hash
-	if n.inboxMonitor != nil {
+	if inboxWitness.preDrainRoot != (types.Hash{}) {
+		inboxRootBefore = inboxWitness.preDrainRoot
+	} else if n.inboxMonitor != nil {
 		inboxRootBefore = n.inboxMonitor.QueueHash()
 	}
 
@@ -373,12 +422,58 @@ func (n *OverlayNode) processBatchInternal(
 		rlpTxs = append(rlpTxs, buf)
 	}
 
-	// Capture inbox root AFTER execution. inboxRootBefore was captured
-	// above before the executor ran.
+	// Capture inbox root AFTER execution.
+	//
+	// W4-3 (spec 10): when ProcessBatch drained the queue, the post-
+	// drain root is computed by the prover witness builder below
+	// (`prover.BuildInboxWitness`) — it's the chain over the carry-
+	// forward remainder, or `EmptyInboxRoot()` for a full drain. When
+	// no drain happened this batch, the live monitor hash is the
+	// correct "after" value (it's unchanged from before).
 	var inboxRootAfter types.Hash
-	if n.inboxMonitor != nil {
+	if inboxWitness.preDrainRoot == (types.Hash{}) && n.inboxMonitor != nil {
 		inboxRootAfter = n.inboxMonitor.QueueHash()
 	}
+	// Build the inbox witness for the SP1 guest. When inboxWitness is
+	// empty (no drain), this still seeds the guest with `inbox_queue=[]`
+	// and `drain_count=0`, in which case the guest will assert
+	// `inbox_root_before == hash256(zero32)`. To stay consistent with
+	// existing single-node tests where `inboxRootBefore = QueueHash()`
+	// (the live empty-genesis hash), we ship the live monitor's queue
+	// snapshot as the witness even on no-drain batches — that way the
+	// guest's chain-root recomputation always succeeds.
+	var (
+		inboxQueueWitness    []prover.InboxQueuedTx
+		inboxDrainCount      uint32
+		inboxMustDrainAll    bool
+		inboxRootAfterWitness types.Hash
+	)
+	if inboxWitness.preDrainRoot != (types.Hash{}) {
+		// Forced-drain path: use the snapshot ProcessBatch captured.
+		w, _, rootAfter, werr := prover.BuildInboxWitness(
+			inboxWitness.preDrainQueue, inboxWitness.drainedCount,
+		)
+		if werr != nil {
+			slog.Warn("inbox witness build failed", "error", werr)
+		}
+		inboxQueueWitness = w
+		inboxDrainCount = inboxWitness.drainedCount
+		inboxMustDrainAll = inboxWitness.mustDrainAll
+		inboxRootAfterWitness = rootAfter
+		// Override inboxRootAfter with the witness-derived value.
+		inboxRootAfter = rootAfter
+	} else if n.inboxMonitor != nil {
+		// No-drain path: ship the live queue (which equals the pre-state)
+		// with drainCount=0 so the guest's chain-root recomputation
+		// matches `inboxRootBefore = QueueHash()`.
+		liveQueue := n.inboxMonitor.PendingTxsSnapshot()
+		w, _, rootAfter, _ := prover.BuildInboxWitness(liveQueue, 0)
+		inboxQueueWitness = w
+		inboxDrainCount = 0
+		inboxRootAfterWitness = rootAfter
+		// rootAfter == rootBefore here (drainCount=0), keep inboxRootAfter as-is.
+	}
+	_ = inboxRootAfterWitness // used only as a documentation hook.
 
 	// Read the bridge's pre-batch withdrawalNonce so we can assign each
 	// log emitted in this batch the correct nonce, then scrape the
@@ -393,11 +488,14 @@ func (n *OverlayNode) processBatchInternal(
 	withdrawals := extractWithdrawals(receipts, preBatchWithdrawalNonce)
 
 	proveInput := &prover.ProveInput{
-		PreStateRoot:    preStateRoot,
-		Transactions:    rlpTxs,
-		InboxRootBefore: inboxRootBefore,
-		InboxRootAfter:  inboxRootAfter,
-		Withdrawals:     withdrawals,
+		PreStateRoot:      preStateRoot,
+		Transactions:      rlpTxs,
+		InboxRootBefore:   inboxRootBefore,
+		InboxRootAfter:    inboxRootAfter,
+		InboxQueue:        inboxQueueWitness,
+		InboxDrainCount:   inboxDrainCount,
+		InboxMustDrainAll: inboxMustDrainAll,
+		Withdrawals:       withdrawals,
 		BlockContext: prover.BlockContext{
 			Number:    l2Block.NumberU64(),
 			Timestamp: l2Block.Time(),
