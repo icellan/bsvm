@@ -16,7 +16,9 @@ import (
 // handlers can parse it.
 func buildMinimalBEEFBody() []byte {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, uint32(0x0100BEEF))
+	// BRC-62 V1 magic on the wire is bytes 01 00 BE EF, which reads
+	// as the LE uint32 0xEFBE0001 (matches go-sdk's BEEF_V1 constant).
+	binary.Write(&buf, binary.LittleEndian, uint32(0xEFBE0001))
 	buf.WriteByte(0x00) // 0 bumps
 	buf.WriteByte(0x01) // 1 tx
 	// minimal tx: version + 0 inputs + 0 outputs + locktime

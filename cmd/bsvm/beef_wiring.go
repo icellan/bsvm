@@ -8,18 +8,23 @@
 // The actual envelope parsing, shard-binding check, and store write
 // live inside pkg/rpc/beef_routes.go — this file is the cmd-side glue
 // that decides which consumer fires for each intent and what policy
-// applies (in particular: bridge deposits are NOT credited to L2 on
-// the default path, see "Bridge deposit policy" below).
+// applies. As of W6-4 the bridge-deposit consumer runs full BRC-62
+// graph verification (ancestry against chaintracks, BUMP against
+// confirmed headers, every input script re-executed) before crediting
+// the bridge monitor; intents other than bridge-deposit are still
+// log-only pending their own subsystem wiring (W6-5+).
 package main
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"log/slog"
+	"time"
 
-	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/beef"
 	"github.com/icellan/bsvm/pkg/bridge"
+	"github.com/icellan/bsvm/pkg/chaintracks"
 	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/rpc"
 	"github.com/icellan/bsvm/pkg/types"
@@ -30,7 +35,8 @@ import (
 // and lets the BEEF integration test exercise the same builder.
 type beefWireOpts struct {
 	// Cfg is the operator-supplied [beef] config section. Drives the
-	// enable flag and the bridge-deposit security policy.
+	// enable flag, depth/width limits, anchor depth, and the bridge-
+	// deposit security policy.
 	Cfg BEEFSection
 	// DB is the shared LevelDB used by the rest of the node. The BEEF
 	// store reuses it under the dedicated "beef:" key prefix per spec
@@ -42,12 +48,11 @@ type beefWireOpts struct {
 	// A zero ID disables the shard-binding check (devnet harnesses
 	// only — production shards always have a non-zero ID).
 	ShardID uint64
-	// BridgeMonitor is the optional sink for verified bridge deposits.
-	// When AcceptUnverifiedBridgeDeposits is true AND BridgeMonitor is
-	// non-nil, deposits parsed from the BEEF target tx are forwarded
-	// to the monitor's pending list. Otherwise deposits are stored in
-	// the BEEFStore but NOT credited on L2 — see security rationale on
-	// WireBEEFEndpoints.
+	// BridgeMonitor is the sink for verified bridge deposits. When
+	// non-nil and the BEEF passes the W6-4 verifier, the parsed
+	// deposit is forwarded to the monitor's pending list. When nil,
+	// verified deposits are stored in the BEEF store but not credited
+	// (e.g. the daemon hasn't yet wired the bridge subsystem).
 	BridgeMonitor *bridge.BridgeMonitor
 	// BridgeScriptHash is the bridge covenant script hash used to
 	// identify deposit outputs inside the BEEF target tx. Required
@@ -60,36 +65,54 @@ type beefWireOpts struct {
 	// endpoints still serve traffic but no per-intent counters are
 	// recorded.
 	Metrics *metrics.NetworkMetrics
+	// Chaintracks is the SPV anchor the BEEF verifier consults for
+	// BUMP-to-header binding and confirmation depth. When nil the
+	// verifier cannot run; the bridge consumer then falls back to the
+	// pre-W6-4 fail-closed policy (envelope stored but never
+	// credited) so a misconfigured daemon never silently mints wBSV.
+	Chaintracks chaintracks.ChaintracksClient
 }
 
 // WireBEEFEndpoints constructs the spec-17 BEEF endpoint surface and
 // attaches it to the RPC server. Call BEFORE rpcServer.Start().
 //
-// # Bridge deposit policy
+// # Bridge deposit policy (post-W6-4)
 //
 // The /bsvm/bridge/deposit endpoint is the only consumer with a
 // security implication. A deposit BEEF, if trusted, becomes free wBSV
-// on L2 — so anyone able to push an envelope past the parser could
-// mint wBSV at will until the underlying BSV tx fails inclusion.
+// on L2.
 //
-// Spec 17 §"Bridge Deposits: Push Model via BEEF" requires the node to
-// verify the BEEF (ancestors against chaintracks, BUMP against headers
-// at depth ≥ 6, target script paying the bridge covenant) before the
-// deposit hits the bridge monitor. Today pkg/beef parses the structure
-// but performs none of those checks — that work is W6-4.
+// As of W6-4 the bridge consumer runs the full BRC-62 graph verifier
+// before crediting:
 //
-// Until W6-4 lands the policy is FAIL-CLOSED: bridge deposits are
-// stored (so we can replay them after W6-4 ships) but NOT credited on
-// L2. The monitor only learns about a deposit when the operator opts
-// in via beef.accept_unverified_bridge_deposits = true (devnet
-// harness convenience; never set this on mainnet).
+//  1. Every ancestor BUMP is verified against chaintracks (root binds
+//     to a confirmed header at the BUMP's declared height).
+//  2. Every input's unlocking script is executed against the
+//     corresponding ancestor output's locking script under standard
+//     BSV consensus (post-Genesis, ForkID sighash).
+//  3. The target tx must itself carry a BUMP confirmed at depth
+//     >= cfg.AnchorDepth (default 6).
+//  4. If all checks pass, the parsed deposit is handed to
+//     bridge.BridgeMonitor.PersistDeposit; the monitor then drives the
+//     normal deposit-horizon inclusion flow on the next L2 block.
+//
+// AcceptUnverifiedBridgeDeposits no longer disables ancestry / script
+// verification — it ONLY relaxes the anchor-depth requirement to
+// allow devnet harnesses that mine on demand to credit deposits at 0
+// confirmations. Operators cannot turn off the per-input script
+// engine; that's a hard W6-4 invariant.
+//
+// When Chaintracks is nil OR BridgeMonitor is nil, the bridge consumer
+// falls back to the pre-W6-4 fail-closed policy: store the envelope in
+// the BEEF store and log it. No credit is ever applied. The endpoint
+// still returns HTTP 204 so a wallet retry loop does not back off.
 //
 // Other intents (covenant-advance, fee-wallet-funding, inbox,
 // governance) carry no minting power on their own, so the default is
-// to log + persist. Inbox specifically MAY graduate to forced-
-// inclusion submission once W6-4 wires the BSV-side pre-confirmation
-// check; for now we leave the consumer at log-only too so we don't
-// queue a tx whose BSV-anchored unlock cannot be re-derived.
+// to log + persist. Their consumers will graduate as the matching
+// subsystem wires in (inbox → forced-inclusion submission, governance
+// → governance proposal store, covenant-advance → overlay's covenant
+// manager re-execute path).
 //
 // Returns nil when cfg.Enabled is false — callers can ignore the
 // returned endpoints in that case.
@@ -109,19 +132,13 @@ func WireBEEFEndpoints(opts beefWireOpts, rpcServer *rpc.RPCServer) *rpc.BEEFEnd
 		store = beef.NewMemoryStore()
 	}
 
-	// Bridge consumer. The default fail-closed path logs the envelope
-	// and exits — the deposit sits in the BEEF store waiting for
-	// W6-4's verification gate to credit it on L2. When the operator
-	// opts in via accept_unverified_bridge_deposits the parsed target
-	// tx is funneled to the bridge monitor's pending list AS IF the
-	// ancestry check had passed.
 	bridgeConsumer := makeBridgeConsumer(opts)
 
 	// Inbox / governance / fee-wallet-funding / covenant-advance:
 	// log-only. Each intent will graduate to a real consumer once the
-	// matching subsystem is wired (inbox → forced-inclusion submission
-	// after W6-4; governance → governance proposal store; covenant-
-	// advance → overlay's covenant manager re-execute path).
+	// matching subsystem is wired in a follow-up wave (W6-5+ for
+	// inbox / governance, overlay covenant manager for covenant-
+	// advance).
 	logOnly := func(name string) func(*beef.Envelope) {
 		return func(env *beef.Envelope) {
 			slog.Info("beef envelope received (log-only consumer)",
@@ -130,9 +147,10 @@ func WireBEEFEndpoints(opts beefWireOpts, rpcServer *rpc.RPCServer) *rpc.BEEFEnd
 				"target_txid", env.TargetTxID,
 				"shard_id", env.Header.ShardID,
 				"confirmed", env.Confirmed,
-				// TODO(W6-4): replace with full BRC-62 verification +
-				// real consumer dispatch once chaintracks-backed BUMP
-				// and script re-exec land.
+				// Follow-up (W6-5+): replace with real subsystem
+				// dispatch — inbox forced-inclusion submission,
+				// governance proposal store, covenant-advance
+				// re-execute.
 			)
 		}
 	}
@@ -159,64 +177,83 @@ func WireBEEFEndpoints(opts beefWireOpts, rpcServer *rpc.RPCServer) *rpc.BEEFEnd
 	slog.Info("beef endpoints mounted",
 		"shard_id", opts.ShardID,
 		"accept_unverified_bridge_deposits", opts.Cfg.AcceptUnverifiedBridgeDeposits,
+		"chaintracks_wired", opts.Chaintracks != nil,
+		"bridge_monitor_wired", opts.BridgeMonitor != nil,
+		"anchor_depth", opts.Cfg.AnchorDepth,
+		"max_depth", opts.Cfg.MaxDepth,
+		"max_width", opts.Cfg.MaxWidth,
 	)
 	return endpoints
 }
 
 // makeBridgeConsumer returns the consumer callback the BEEF endpoint
 // dispatches when a /bsvm/bridge/deposit envelope is accepted. The
-// consumer enforces the fail-closed policy described on
-// WireBEEFEndpoints: a deposit BEEF is stored unconditionally, but
-// only routed to the bridge monitor when the operator has opted in to
-// the unverified-deposits relaxation.
+// consumer enforces the W6-4 verification policy:
+//
+//   - When Chaintracks is wired AND BridgeMonitor is non-nil, the
+//     consumer runs the full BRC-62 graph verifier (ancestry + BUMP +
+//     script + anchor depth) and forwards a verified deposit to the
+//     bridge monitor's pending list.
+//   - When either dependency is missing the consumer falls back to the
+//     pre-W6-4 fail-closed policy: log the envelope and return without
+//     crediting anything. The envelope is still stored in the BEEF
+//     store (the rpc layer does that before invoking the consumer) so
+//     a future reconciliation pass can replay it once the dependencies
+//     are wired.
 func makeBridgeConsumer(opts beefWireOpts) func(*beef.Envelope) {
-	if !opts.Cfg.AcceptUnverifiedBridgeDeposits {
+	if opts.Chaintracks == nil || opts.BridgeMonitor == nil {
 		return func(env *beef.Envelope) {
-			slog.Info("bridge deposit BEEF stored, awaiting W6-4 verification",
+			slog.Info("bridge deposit BEEF stored, no verifier wired (chaintracks/bridge monitor missing)",
 				"target_txid", env.TargetTxID,
 				"shard_id", env.Header.ShardID,
 				"confirmed", env.Confirmed,
 				"size", len(env.Beef),
-				// TODO(W6-4): replace with full BRC-62 verification:
-				//   1. walk ancestor BUMPs against chaintracks
-				//   2. re-execute target tx input scripts
-				//   3. confirm target BUMP at depth >= 6
-				//   4. parse OP_RETURN deposit envelope
-				//   5. forward to bridge.BridgeMonitor.PersistDeposit
+				"chaintracks_wired", opts.Chaintracks != nil,
+				"bridge_monitor_wired", opts.BridgeMonitor != nil,
 			)
 		}
 	}
-	if opts.BridgeMonitor == nil {
-		return func(env *beef.Envelope) {
-			slog.Warn("bridge deposit BEEF accepted but no monitor wired; dropping",
-				"target_txid", env.TargetTxID,
-			)
-		}
+
+	// Compute the effective anchor depth. The unverified knob lowers
+	// it to 0 so devnet harnesses can credit immediately, but ancestry
+	// + script verification ALWAYS run regardless.
+	effectiveAnchorDepth := opts.Cfg.AnchorDepth
+	if opts.Cfg.AcceptUnverifiedBridgeDeposits {
+		effectiveAnchorDepth = 0
 	}
-	// Devnet/relaxed path: parse the underlying BSV tx out of the BEEF
-	// body and feed it to the bridge monitor as if W6-4 had verified
-	// it. Caller MUST understand that this opens a free-mint vector if
-	// the parser ever accepts a forged envelope — only flip the config
-	// in environments where the BEEF source is fully trusted.
+	verifier := beef.NewVerifier(opts.Chaintracks, beef.VerifyConfig{
+		MaxDepth:           opts.Cfg.MaxDepth,
+		MaxWidth:           opts.Cfg.MaxWidth,
+		AnchorDepth:        effectiveAnchorDepth,
+		ValidatedCacheSize: opts.Cfg.ValidatedCacheSize,
+	})
+
 	monitor := opts.BridgeMonitor
 	scriptHash := opts.BridgeScriptHash
 	localShardID := opts.LocalShardID
+
 	return func(env *beef.Envelope) {
-		parsed, err := beef.ParseBEEF(env.Beef)
-		if err != nil || parsed.Target() == nil {
-			slog.Warn("bridge deposit BEEF parse failed", "err", err)
-			return
-		}
-		// TODO(W6-4): the call below trusts env.Beef structurally — it
-		// does NOT verify the ancestry, BUMP, or input scripts. Replace
-		// with a verifying BEEF reader before shipping this code path
-		// to mainnet.
-		raw := parsed.Target().RawTx
-		bsvTx, err := decodeBSVTransactionForBridge(raw, parsed.Target().TxID)
+		// Bound verification work per envelope. A single BEEF should
+		// not stall the endpoint for arbitrarily long; 30s is generous
+		// for the largest legitimate envelope (10k ancestors at ~ms
+		// per script execution).
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		verified, err := verifier.Verify(ctx, env.Beef)
 		if err != nil {
-			slog.Warn("bridge deposit BEEF: decode bsv tx failed", "err", err)
+			slog.Warn("bridge deposit BEEF verification failed",
+				"target_txid", env.TargetTxID,
+				"err", err,
+				"reason", classifyVerifyError(err),
+			)
 			return
 		}
+
+		// The verifier returned a fully-validated tx. Walk its outputs
+		// to recover the deposit envelope; we no longer need the
+		// scaffold-quality decoder that lived here pre-W6-4.
+		bsvTx := buildBridgeViewFromVerifiedBEEF(verified, scriptHash, localShardID, env)
 		dep := bridge.ParseDeposit(bsvTx, scriptHash, localShardID)
 		if dep == nil {
 			slog.Debug("bridge deposit BEEF: target tx has no deposit output for this shard",
@@ -224,42 +261,48 @@ func makeBridgeConsumer(opts beefWireOpts) func(*beef.Envelope) {
 			)
 			return
 		}
-		dep.BSVBlockHeight = env.BlockHeight
-		dep.Confirmed = env.Confirmed
+		// Override BSVBlockHeight with the verifier's authoritative
+		// number (env.BlockHeight is taken from the gossip header,
+		// which is unauthenticated). Confirmed iff the verifier saw a
+		// BUMP on the target.
+		dep.BSVBlockHeight = verified.TargetHeight
+		dep.Confirmed = verified.Target.MerklePath != nil
+
 		if perr := monitor.PersistDeposit(dep); perr != nil {
 			slog.Warn("bridge deposit persist failed", "err", perr)
 			return
 		}
-		slog.Info("bridge deposit BEEF persisted (UNVERIFIED PATH)",
+		slog.Info("bridge deposit BEEF verified and persisted",
 			"target_txid", env.TargetTxID,
 			"l2_address", dep.L2Address.Hex(),
 			"satoshis", dep.SatoshiAmount,
+			"bsv_height", dep.BSVBlockHeight,
+			"confirmations", verified.Confirmations,
+			"ancestor_count", verified.AncestorCount,
+			"max_depth", verified.MaxAncestorDepth,
 		)
 	}
 }
 
-// decodeBSVTransactionForBridge unpacks a raw BSV transaction (in BSV
-// wire form) into the bridge package's BSVTransaction shape so
-// bridge.ParseDeposit can run against it. The conversion is
-// scaffold-quality: it copies output scripts + values and the
-// supplied txid; the rest of the bridge code path doesn't read input
-// data.
-//
-// TODO(W6-4): once full BRC-62 verification lands the BEEF reader
-// will yield a fully validated tx representation; this adapter goes
-// away in favour of the verified-tx path.
-func decodeBSVTransactionForBridge(rawTx []byte, txid [32]byte) (*bridge.BSVTransaction, error) {
-	parsed, err := transaction.NewTransactionFromBytes(rawTx)
-	if err != nil {
-		return nil, fmt.Errorf("parse bsv tx: %w", err)
-	}
+// buildBridgeViewFromVerifiedBEEF projects the SDK's verified
+// transaction into the bridge package's BSVTransaction shape so the
+// existing ParseDeposit code path can run against it. We copy output
+// scripts + values and the verifier-derived txid + height; the rest of
+// the bridge code does not read input data.
+func buildBridgeViewFromVerifiedBEEF(
+	v *beef.VerifiedBEEF,
+	_ []byte, // scriptHash kept in signature for symmetry with ParseDeposit
+	_ uint32,
+	env *beef.Envelope,
+) *bridge.BSVTransaction {
 	out := &bridge.BSVTransaction{
-		TxID:    types.Hash(txid),
-		Outputs: make([]bridge.BSVOutput, 0, len(parsed.Outputs)),
+		TxID:        types.Hash(v.TargetTxID),
+		BlockHeight: v.TargetHeight,
+		Outputs:     make([]bridge.BSVOutput, 0, len(v.Target.Outputs)),
 	}
-	for _, o := range parsed.Outputs {
+	for _, o := range v.Target.Outputs {
 		var script []byte
-		if o.LockingScript != nil {
+		if o != nil && o.LockingScript != nil {
 			script = []byte(*o.LockingScript)
 		}
 		out.Outputs = append(out.Outputs, bridge.BSVOutput{
@@ -267,5 +310,49 @@ func decodeBSVTransactionForBridge(rawTx []byte, txid [32]byte) (*bridge.BSVTran
 			Script: script,
 		})
 	}
-	return out, nil
+	// env may carry a populated BlockHeight even when the verifier
+	// disagrees; prefer the verifier's value above and only fall back
+	// to env when the verifier had nothing (unconfirmed envelope under
+	// AcceptUnverifiedBridgeDeposits).
+	if out.BlockHeight == 0 {
+		out.BlockHeight = env.BlockHeight
+	}
+	return out
+}
+
+// classifyVerifyError returns a short label for the metrics layer +
+// log search. Keeps the verifier's error vocabulary out of operator-
+// facing strings.
+func classifyVerifyError(err error) string {
+	switch {
+	case errors.Is(err, beef.ErrParse):
+		return "parse"
+	case errors.Is(err, beef.ErrNoTarget):
+		return "no-target"
+	case errors.Is(err, beef.ErrEmptyBEEF):
+		return "empty"
+	case errors.Is(err, beef.ErrNoChaintracks):
+		return "no-chaintracks"
+	case errors.Is(err, beef.ErrTooDeep):
+		return "too-deep"
+	case errors.Is(err, beef.ErrTooWide):
+		return "too-wide"
+	case errors.Is(err, beef.ErrBUMP):
+		return "bad-bump"
+	case errors.Is(err, beef.ErrMissingAncestor):
+		return "missing-ancestor"
+	case errors.Is(err, beef.ErrScript):
+		return "bad-script"
+	case errors.Is(err, beef.ErrAnchorMissing):
+		return "no-anchor"
+	case errors.Is(err, beef.ErrAnchorTooShallow):
+		return "anchor-shallow"
+	case errors.Is(err, beef.ErrAnchorReorged):
+		return "anchor-reorged"
+	case errors.Is(err, beef.ErrAnchorHeader),
+		errors.Is(err, beef.ErrAnchorConfirms):
+		return "anchor-lookup"
+	default:
+		return "other"
+	}
 }

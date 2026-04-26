@@ -18,7 +18,11 @@ import (
 // less BEEF body with a single empty BSV tx, target without a BUMP.
 func minimalBEEFBody() []byte {
 	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0x0100BEEF))
+	// BRC-62 V1 magic on the wire is bytes 01 00 BE EF, which reads
+	// as the LE uint32 0xEFBE0001 (matches go-sdk's BEEF_V1). Earlier
+	// scaffold revisions used the reversed value; W6-4 corrected the
+	// parser to align with real BSV wallets.
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0xEFBE0001))
 	buf.WriteByte(0x00) // 0 bumps
 	buf.WriteByte(0x01) // 1 tx
 	buf.Write([]byte{1, 0, 0, 0})

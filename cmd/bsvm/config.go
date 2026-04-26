@@ -55,10 +55,29 @@ type BEEFSection struct {
 	// BEEF-producing wallets).
 	Enabled bool `toml:"enabled"`
 	// AcceptUnverifiedBridgeDeposits relaxes the bridge-deposit
-	// security default. Leave false for production; full BRC-62
-	// verification is the W6-4 work item and is REQUIRED before
-	// flipping this to true on mainnet.
+	// anchor-depth requirement only. After W6-4 the BEEF verifier
+	// always runs ancestry + script + BUMP checks; this knob, when
+	// true, lowers the required confirmations on the target tx to
+	// zero so devnet harnesses that mine on demand can credit a
+	// deposit immediately. Leave false for production.
 	AcceptUnverifiedBridgeDeposits bool `toml:"accept_unverified_bridge_deposits"`
+	// MaxDepth caps the longest ancestor chain a BEEF may carry.
+	// Default 32; raise only if a wallet legitimately produces deeper
+	// envelopes.
+	MaxDepth int `toml:"max_depth"`
+	// MaxWidth caps the total ancestor count a BEEF may carry across
+	// all levels. Default 10000; rejects unbounded envelopes from a
+	// malicious peer.
+	MaxWidth int `toml:"max_width"`
+	// AnchorDepth is the minimum BSV confirmations required on the
+	// target tx of a bridge-deposit BEEF before it credits L2.
+	// Default 6 — spec 07's "≥ 6 confirmations" rule. Set to 0 only
+	// when AcceptUnverifiedBridgeDeposits is also true.
+	AnchorDepth uint64 `toml:"anchor_depth"`
+	// ValidatedCacheSize is the LRU bound on the validated-tx cache
+	// the verifier uses to skip re-execution of common ancestors.
+	// Default 4096; ≤0 disables caching.
+	ValidatedCacheSize int `toml:"validated_cache_size"`
 }
 
 // IndexerSection configures the per-address transaction indexer.
@@ -320,10 +339,16 @@ func DefaultNodeConfig() *NodeConfig {
 		},
 		BEEF: BEEFSection{
 			// Endpoints on by default — spec 17 makes them part of
-			// the standard surface. Bridge-deposit verification stays
-			// strict until W6-4 lands.
+			// the standard surface. Bridge-deposit verification is
+			// always strict (ancestry + script + BUMP); the anchor-
+			// depth knob below is the only thing relaxed by
+			// AcceptUnverifiedBridgeDeposits.
 			Enabled:                        true,
 			AcceptUnverifiedBridgeDeposits: false,
+			MaxDepth:                       32,
+			MaxWidth:                       10000,
+			AnchorDepth:                    6,
+			ValidatedCacheSize:             4096,
 		},
 		// Governance defaults to zero value (Mode "", no keys, threshold 0)
 		// which is treated as "none" -- fully trustless, no governance keys.
