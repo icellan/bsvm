@@ -25,15 +25,16 @@
 //   - GetBlockTransactions resolves the height to a block hash via
 //     chaintracks, then calls the BSV-node RPC's `getblock <hash> 2`
 //     to project the verbose vout list into bridge.BSVTransaction.
-//     When no RPC provider is configured (operators on a chaintracks-
-//     + WoC-only deployment) this returns ErrBlockFetchUnsupported —
-//     the BEEF deposit path remains live, but the on-chain block-scan
-//     fallback is not available without an RPC node. WoC's per-tx
-//     fan-out path is left as a follow-up because every WoC GetTx
-//     burns one rate-limited API call; for a 4 MB block that's
-//     multiple thousand calls and operators will routinely hit the
-//     daily quota. RPC is the realistic deployment shape for any
-//     operator who actually wants block-scan-based deposits.
+//     When no RPC provider is configured (operators on a deployment
+//     using only chaintracks plus WoC) this returns
+//     ErrBlockFetchUnsupported — the BEEF deposit path remains live,
+//     but the on-chain block-scan fallback is not available without
+//     an RPC node. WoC's per-tx fan-out path is left as a follow-up
+//     because every WoC GetTx burns one rate-limited API call; for a
+//     4 MB block that's multiple thousand calls and operators will
+//     routinely hit the daily quota. RPC is the realistic deployment
+//     shape for any operator who actually wants block-scan-based
+//     deposits.
 //   - GetTransaction delegates to WoC's cached client (W6-8) which
 //     transparently shares a singleflight gate so concurrent ParseDeposit
 //     ancestor lookups collapse to one RTT.
