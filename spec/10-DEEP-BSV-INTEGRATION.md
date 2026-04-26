@@ -398,17 +398,33 @@ Anyone can submit EVM transactions directly to BSV, bypassing shard nodes
 entirely. Shard nodes are required to include inbox transactions within N
 covenant advances — otherwise the state covenant rejects further advances.
 
-<!-- TODO(spec): pin the per-batch inbox witness cap. Implementation
-     enforces `MAX_INBOX_DRAIN_PER_BATCH = 1024` in the SP1 guest
-     (`prover/guest/src/inbox.rs`) and the Go host
-     (`pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch`). The cap
-     is a DoS guard against unbounded `inbox_queue` witnesses
-     exhausting SP1 cycles. See `docs/decisions/inbox-drain.md` D6/D7
-     for rationale. The producer must paginate the on-chain inbox
-     across multiple batches at depth below this cap; over-cap
-     witnesses are rejected with guest error code 0x13
-     (`InboxError::QueueExceedsCap`). Pin the constant in normative
-     spec text in the next sweep. -->
+### Inbox Drain Cap (Normative)
+
+An inbox drain batch SHALL contain at most **1024 transactions**
+(`MAX_INBOX_DRAIN_PER_BATCH`). The SP1 guest MUST reject witnesses
+exceeding this cap with error `0x13` (`InboxError::QueueExceedsCap`)
+BEFORE performing any Merkle / PoW work, so a malicious host pays no
+SP1 cycles for an oversized witness. Producers (overlay nodes) MUST
+split larger queues across multiple consecutive covenant-advance
+batches; the spec-10 forced-inclusion threshold (10 advances) leaves
+ample headroom for paginated drains under any sane operator config.
+
+The cap is a DoS guard against unbounded `inbox_queue` witnesses
+exhausting SP1 cycles, not a throughput throttle. It is enforced
+identically on three layers (guest, prover host, overlay producer)
+so the failure surfaces in operator logs the moment it happens
+rather than silently truncating and tipping the producer into an
+unrecoverable state past the forced-inclusion threshold.
+
+Cross-references:
+- Implementation (guest): `prover/guest/src/inbox.rs`
+  (`InboxError::QueueExceedsCap`, code `0x13`).
+- Implementation (Go host): `pkg/prover/inbox_witness.go`
+  (`MaxInboxDrainPerBatch`, `BuildInboxWitness`).
+- Implementation (overlay producer):
+  `pkg/overlay/process.go::processBatchInternal`.
+- Decision record: `docs/decisions/inbox-drain.md` (D6, D7).
+- Verifier-correctness mirror: spec 12, "Inbox Drain Cap (Normative)".
 
 
 ### Inbox Covenant (Rúnar)

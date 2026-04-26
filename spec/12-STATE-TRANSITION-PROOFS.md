@@ -846,18 +846,37 @@ The SP1 proof commits the following public values at fixed offsets:
 | 176 | 32 | inboxRootBefore | Inbox hash chain root before this batch (from host input). `bytes32(0)` if inbox is empty or inbox is disabled. See Spec 10, "Inbox Integration via STARK Public Values". |
 | 208 | 32 | inboxRootAfter | Inbox hash chain root after this batch. `bytes32(0)` if all inbox txs were included (queue drained). Equals `inboxRootBefore` if no inbox txs were included in this batch. |
 
-<!-- TODO(spec): pin the per-batch inbox witness cap. Implementation
-     enforces `MAX_INBOX_DRAIN_PER_BATCH = 1024` in the SP1 guest
-     (`prover/guest/src/inbox.rs`) and the Go host
-     (`pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch`). The cap
-     is a DoS guard against unbounded `inbox_queue` witnesses
-     exhausting SP1 cycles. Over-cap witnesses are rejected with
-     guest error code 0x13 (`InboxError::QueueExceedsCap`). See
-     `docs/decisions/inbox-drain.md` D6/D7 for rationale. Pin the
-     constant in the normative public-values / verifier text in the
-     next sweep. -->
-
 | 240 | 32 | migrateScriptHash | `SHA256(newScript)` if migration, else `bytes32(0)` |
+
+#### Inbox Drain Cap (Normative)
+
+An inbox drain witness SHALL contain at most **1024 transactions**
+(`MAX_INBOX_DRAIN_PER_BATCH`). This is a soundness-relevant invariant
+of the verifier: a valid SP1 STARK proof for `inboxRootBefore` /
+`inboxRootAfter` MUST come from a guest execution that received at
+most 1024 entries in `inbox_queue`. The guest MUST reject witnesses
+exceeding this cap with error `0x13`
+(`InboxError::QueueExceedsCap`) BEFORE performing any Merkle / PoW
+work, so a malicious host pays no SP1 cycles for an oversized
+witness, and so the public-values commitment is never produced for
+an over-cap input.
+
+Producers (overlay nodes) MUST split larger queues across multiple
+consecutive covenant-advance batches. The spec-10 forced-inclusion
+threshold (10 advances) leaves ample headroom for paginated drains
+under any sane operator config. Truncation is forbidden — the only
+correct response to an over-cap queue is to fail and paginate.
+
+Cross-references:
+- Implementation (guest): `prover/guest/src/inbox.rs`
+  (`InboxError::QueueExceedsCap`, code `0x13`).
+- Implementation (Go host): `pkg/prover/inbox_witness.go`
+  (`MaxInboxDrainPerBatch`, `BuildInboxWitness`).
+- Implementation (overlay producer):
+  `pkg/overlay/process.go::processBatchInternal`.
+- Decision record: `docs/decisions/inbox-drain.md` (D6, D7).
+- Authoritative description: spec 10,
+  "Forced Inclusion Inbox", "Inbox Drain Cap (Normative)".
 
 Total: 272 bytes of public values.
 
