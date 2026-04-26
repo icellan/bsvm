@@ -398,6 +398,19 @@ Anyone can submit EVM transactions directly to BSV, bypassing shard nodes
 entirely. Shard nodes are required to include inbox transactions within N
 covenant advances — otherwise the state covenant rejects further advances.
 
+<!-- TODO(spec): pin the per-batch inbox witness cap. Implementation
+     enforces `MAX_INBOX_DRAIN_PER_BATCH = 1024` in the SP1 guest
+     (`prover/guest/src/inbox.rs`) and the Go host
+     (`pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch`). The cap
+     is a DoS guard against unbounded `inbox_queue` witnesses
+     exhausting SP1 cycles. See `docs/decisions/inbox-drain.md` D6/D7
+     for rationale. The producer must paginate the on-chain inbox
+     across multiple batches at depth below this cap; over-cap
+     witnesses are rejected with guest error code 0x13
+     (`InboxError::QueueExceedsCap`). Pin the constant in normative
+     spec text in the next sweep. -->
+
+
 ### Inbox Covenant (Rúnar)
 
 ```go

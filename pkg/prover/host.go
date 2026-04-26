@@ -244,7 +244,7 @@ func (p *SP1Prover) proveNetwork(_ context.Context, _ *ProveInput) (*ProveOutput
 // It does not perform any real proving -- the proof bytes are synthetic.
 // When ExpectedResults are provided in the input, the mock prover uses
 // them to populate the PublicValues so the output matches the Go EVM's
-// computed results. Without ExpectedResults, fallback values are used.
+// computed results. Without ExpectedResults, sentinel zero values are used.
 func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutput, error) {
 	start := time.Now()
 
@@ -270,8 +270,8 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 		pv.GasUsed = input.ExpectedResults.GasUsed
 		pv.ChainID = input.ExpectedResults.ChainID
 	} else {
-		pv.PostStateRoot = input.PreStateRoot // fallback: unchanged
-		pv.ReceiptsHash = types.Hash{}        // fallback: empty
+		pv.PostStateRoot = input.PreStateRoot // sentinel: unchanged
+		pv.ReceiptsHash = types.Hash{}        // sentinel: empty
 		pv.GasUsed = 0
 		pv.ChainID = 0
 	}
@@ -302,16 +302,21 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 // The bridge envelope intentionally lives next to its only call-site; the
 // public ProveInput type stays stable so the parallel prover and overlay
 // glue do not need to change.
+//
+// W4-1 mainnet hardening: a non-empty StateExport with Merkle proofs is
+// REQUIRED. The previous "if proofs absent, ship empty accounts" branch
+// has been removed — the guest rejects unwitnessed batches outright, so
+// silently producing one would just stall the pipeline.
 func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
-	// Decode the optional StateExport blob. nil/empty is acceptable; the
-	// guest will fall back to its legacy host-trusted code path.
-	var export *StateExport
-	if len(input.StateExport) > 0 {
-		dec, err := DeserializeExport(input.StateExport)
-		if err != nil {
-			return nil, fmt.Errorf("deserializing state export: %w", err)
-		}
-		export = dec
+	if len(input.StateExport) == 0 {
+		return nil, fmt.Errorf("prove input is missing StateExport: " +
+			"the SP1 guest requires Merkle witnesses for every accessed " +
+			"account (W4-1 mainnet hardening); call " +
+			"prover.ExportStateForProving on the pre-state DB before proving")
+	}
+	export, err := DeserializeExport(input.StateExport)
+	if err != nil {
+		return nil, fmt.Errorf("deserializing state export: %w", err)
 	}
 
 	envelope := bridgeInput{
@@ -331,27 +336,30 @@ func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
 		envelope.Mode = "execute"
 	}
 
-	if export != nil {
-		envelope.Accounts = make([]bridgeAccount, 0, len(export.Accounts))
-		for _, a := range export.Accounts {
-			ba := bridgeAccount{
-				Address:      a.Address.Hex(),
-				Nonce:        a.Nonce,
-				Balance:      uint256ToHex(a.Balance),
-				CodeHash:     a.CodeHash.Hex(),
-				StorageRoot:  a.StorageRoot.Hex(),
-				Code:         "0x" + bytesToHex(a.Code),
-				AccountProof: bytesSliceToHex(a.AccountProof),
-			}
-			for _, s := range a.StorageSlots {
-				ba.StorageSlots = append(ba.StorageSlots, bridgeStorageSlot{
-					Key:   s.Key.Hex(),
-					Value: s.Value.Hex(),
-					Proof: bytesSliceToHex(s.Proof),
-				})
-			}
-			envelope.Accounts = append(envelope.Accounts, ba)
+	envelope.Accounts = make([]bridgeAccount, 0, len(export.Accounts))
+	for _, a := range export.Accounts {
+		if len(a.AccountProof) == 0 {
+			return nil, fmt.Errorf("account %s in StateExport has no AccountProof: "+
+				"the SP1 guest requires a Merkle witness for every account "+
+				"(W4-1 mainnet hardening)", a.Address.Hex())
 		}
+		ba := bridgeAccount{
+			Address:      a.Address.Hex(),
+			Nonce:        a.Nonce,
+			Balance:      uint256ToHex(a.Balance),
+			CodeHash:     a.CodeHash.Hex(),
+			StorageRoot:  a.StorageRoot.Hex(),
+			Code:         "0x" + bytesToHex(a.Code),
+			AccountProof: bytesSliceToHex(a.AccountProof),
+		}
+		for _, s := range a.StorageSlots {
+			ba.StorageSlots = append(ba.StorageSlots, bridgeStorageSlot{
+				Key:   s.Key.Hex(),
+				Value: s.Value.Hex(),
+				Proof: bytesSliceToHex(s.Proof),
+			})
+		}
+		envelope.Accounts = append(envelope.Accounts, ba)
 	}
 
 	return json.Marshal(envelope)

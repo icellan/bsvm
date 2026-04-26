@@ -15,9 +15,9 @@ import (
 // TestBuildBridgeInput_W4_1_ProofsRoundTrip verifies that buildBridgeInput
 // preserves the Merkle witnesses produced by ExportStateForProving end-to-end
 // through the JSON envelope. This is the seam the Rust host bridge consumes —
-// if proofs do not survive the JSON encode/decode the SP1 guest will fall
-// back to its legacy host-trusted code path and the W4-1 / Gate-0 fix is a
-// no-op.
+// the SP1 guest demands these proofs (W4-1 mainnet hardening); if they do
+// not survive the JSON encode/decode the guest aborts with error 0x02..0x06
+// and the batch is unprovable.
 //
 // The test:
 //  1. Builds a small committed StateDB.
@@ -158,31 +158,52 @@ func TestBuildBridgeInput_W4_1_ProofsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBuildBridgeInput_NoExportProducesNoProofs verifies that a ProveInput
-// without a StateExport (legacy callers / mock-mode fallback) produces a
-// bridge envelope with an empty accounts array. This keeps the legacy
-// host-trusted SP1 guest path reachable while the W4-1 verifier rolls out.
-func TestBuildBridgeInput_NoExportProducesNoProofs(t *testing.T) {
+// TestBuildBridgeInput_RequiresStateExport verifies that the W4-1
+// mainnet-hardening invariant holds at the host bridge layer:
+// buildBridgeInput refuses inputs that lack a StateExport. The
+// previously-tolerated "legacy host-trusted fallback" branch has been
+// removed — the SP1 guest now demands Merkle witnesses for every
+// accessed account, so any unwitnessed envelope would simply produce
+// an unprovable batch (guest error code 0x06) and stall the pipeline.
+func TestBuildBridgeInput_RequiresStateExport(t *testing.T) {
 	input := &ProveInput{
 		PreStateRoot: types.HexToHash("0xabcd"),
 		BlockContext: BlockContext{Number: 1, Timestamp: 100},
 	}
-	rawJSON, err := buildBridgeInput(input, "core")
+	if _, err := buildBridgeInput(input, "core"); err == nil {
+		t.Fatal("expected error when StateExport is missing — " +
+			"the mainnet-hardened guest requires Merkle witnesses")
+	}
+}
+
+// TestBuildBridgeInput_RequiresProofPerAccount verifies that the
+// per-account Merkle witness invariant is enforced: even if a
+// StateExport is present, an account that lacks its AccountProof
+// triggers a hard error rather than producing a bridge envelope the
+// guest would reject downstream.
+func TestBuildBridgeInput_RequiresProofPerAccount(t *testing.T) {
+	export := &StateExport{
+		PreStateRoot: types.HexToHash("0xabcd"),
+		Accounts: []AccountExport{
+			{
+				Address: types.HexToAddress("0xaaaa"),
+				Nonce:   1,
+				// AccountProof intentionally empty — must be rejected.
+			},
+		},
+	}
+	exportBytes, err := SerializeExport(export)
 	if err != nil {
-		t.Fatalf("buildBridgeInput: %v", err)
+		t.Fatalf("SerializeExport: %v", err)
 	}
-	var envelope struct {
-		Accounts []json.RawMessage `json:"accounts"`
-		Mode     string            `json:"mode"`
+	input := &ProveInput{
+		PreStateRoot: export.PreStateRoot,
+		StateExport:  exportBytes,
+		BlockContext: BlockContext{Number: 1},
 	}
-	if err := json.Unmarshal(rawJSON, &envelope); err != nil {
-		t.Fatalf("decode envelope: %v", err)
-	}
-	if len(envelope.Accounts) != 0 {
-		t.Errorf("accounts: got %d want 0", len(envelope.Accounts))
-	}
-	if envelope.Mode != "core" {
-		t.Errorf("mode: got %q want %q", envelope.Mode, "core")
+	if _, err := buildBridgeInput(input, "core"); err == nil {
+		t.Fatal("expected error when an account in StateExport lacks " +
+			"AccountProof — guest requires per-account Merkle witnesses")
 	}
 }
 

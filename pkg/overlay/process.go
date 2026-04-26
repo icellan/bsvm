@@ -450,11 +450,17 @@ func (n *OverlayNode) processBatchInternal(
 	)
 	if inboxWitness.preDrainRoot != (types.Hash{}) {
 		// Forced-drain path: use the snapshot ProcessBatch captured.
+		// W4-3 mainnet hardening: BuildInboxWitness returns a hard error
+		// when the queue exceeds prover.MaxInboxDrainPerBatch. We fail
+		// the whole batch rather than silently truncating — silent
+		// truncation would hide a producer-side pagination bug and risk
+		// leaving inbox txs un-drained past spec-10's forced-inclusion
+		// threshold (which the covenant would then REJECT).
 		w, _, rootAfter, werr := prover.BuildInboxWitness(
 			inboxWitness.preDrainQueue, inboxWitness.drainedCount,
 		)
 		if werr != nil {
-			slog.Warn("inbox witness build failed", "error", werr)
+			return nil, fmt.Errorf("inbox witness build failed: %w", werr)
 		}
 		inboxQueueWitness = w
 		inboxDrainCount = inboxWitness.drainedCount
@@ -465,9 +471,15 @@ func (n *OverlayNode) processBatchInternal(
 	} else if n.inboxMonitor != nil {
 		// No-drain path: ship the live queue (which equals the pre-state)
 		// with drainCount=0 so the guest's chain-root recomputation
-		// matches `inboxRootBefore = QueueHash()`.
+		// matches `inboxRootBefore = QueueHash()`. The same
+		// MaxInboxDrainPerBatch cap applies — an over-cap live queue
+		// means the producer hasn't drained recently enough and the
+		// operator must intervene (raise the cap or paginate).
 		liveQueue := n.inboxMonitor.PendingTxsSnapshot()
-		w, _, rootAfter, _ := prover.BuildInboxWitness(liveQueue, 0)
+		w, _, rootAfter, werr := prover.BuildInboxWitness(liveQueue, 0)
+		if werr != nil {
+			return nil, fmt.Errorf("inbox witness build failed: %w", werr)
+		}
 		inboxQueueWitness = w
 		inboxDrainCount = 0
 		inboxRootAfterWitness = rootAfter

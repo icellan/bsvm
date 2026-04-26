@@ -186,6 +186,43 @@ func TestBuildInboxWitness_DrainOverflow(t *testing.T) {
 	}
 }
 
+// TestBuildInboxWitness_QueueAtCap_OK verifies the boundary: a queue at
+// exactly MaxInboxDrainPerBatch (= 1024) is accepted. This is the
+// "happy path at the cap" — the SP1 guest mirrors the same boundary in
+// `inbox::MAX_INBOX_DRAIN_PER_BATCH`.
+func TestBuildInboxWitness_QueueAtCap_OK(t *testing.T) {
+	queue := make([][]byte, MaxInboxDrainPerBatch)
+	for i := range queue {
+		queue[i] = []byte{byte(i & 0xff)}
+	}
+	w, _, _, err := BuildInboxWitness(queue, 0)
+	if err != nil {
+		t.Fatalf("queue at cap (%d) must be accepted: %v",
+			MaxInboxDrainPerBatch, err)
+	}
+	if len(w) != MaxInboxDrainPerBatch {
+		t.Fatalf("witness len = %d, want %d", len(w), MaxInboxDrainPerBatch)
+	}
+}
+
+// TestBuildInboxWitness_QueueOverCap_Rejected verifies the W4-3
+// mainnet-hardening invariant: a queue of MaxInboxDrainPerBatch + 1
+// triggers a hard error rather than silent truncation. Silent
+// truncation would hide a producer-side pagination bug from the
+// operator and risk leaving inbox txs un-drained past spec-10's
+// forced-inclusion threshold (10 advances), which the covenant would
+// then REJECT. Documented choice (D7 in docs/decisions/inbox-drain.md):
+// ERROR rather than truncate-and-warn.
+func TestBuildInboxWitness_QueueOverCap_Rejected(t *testing.T) {
+	queue := make([][]byte, MaxInboxDrainPerBatch+1)
+	for i := range queue {
+		queue[i] = []byte{byte(i & 0xff)}
+	}
+	if _, _, _, err := BuildInboxWitness(queue, 0); err == nil {
+		t.Fatalf("queue over cap (%d) must be rejected", len(queue))
+	}
+}
+
 // TestBuildInboxWitness_FixtureThreeDrainTwo is the W4-3 acceptance
 // scenario from the task spec: a fixture inbox of three txs, drain two,
 // verify the witness reconciles end-to-end. We check three things:

@@ -25,6 +25,24 @@ import (
 	"github.com/icellan/bsvm/pkg/types"
 )
 
+// MaxInboxDrainPerBatch is the host-side mirror of the SP1 guest's
+// `inbox::MAX_INBOX_DRAIN_PER_BATCH` constant (W4-3 mainnet hardening).
+//
+// The witness shipped to the guest is bounded so a malicious or
+// misconfigured producer cannot exhaust SP1 cycles via an unbounded
+// inbox queue. The producer (`pkg/overlay/process.go`) MUST paginate
+// the on-chain inbox queue across multiple batches at depth below this
+// cap; `BuildInboxWitness` returns a hard error rather than silently
+// truncating the queue. Silent truncation would hide the configuration
+// bug from the operator and risk leaving inbox txs un-drained past
+// the spec-10 forced-inclusion threshold (10 advances), which the
+// covenant would then REJECT — tipping the producer into an
+// unrecoverable state without a clear root cause.
+//
+// Spec amendment pending: spec 09 / spec 12 currently leave the cap
+// unspecified — see the `TODO(spec)` markers in those files.
+const MaxInboxDrainPerBatch = 1024
+
 // InboxQueuedTx is one entry in the inbox witness shipped to the SP1
 // guest. RawTxRLP is what the on-chain inbox covenant hashed (the
 // `evmTxRLP` parameter of the inbox `submit` call); the guest re-hashes
@@ -88,13 +106,27 @@ func inboxHash256(data []byte) types.Hash {
 //   - rootAfter:  the chain root after draining the leading `drainCount`
 //                 entries — `EmptyInboxRoot()` if all drained, else the
 //                 chain over the trailing remainder.
-//   - err: only when `drainCount` exceeds `len(rawQueue)`.
+//   - err: when `drainCount` exceeds `len(rawQueue)`, OR when
+//          `len(rawQueue) > MaxInboxDrainPerBatch` (W4-3 mainnet
+//          hardening — see the constant doc for why the failure is
+//          hard rather than silent truncation).
 func BuildInboxWitness(rawQueue [][]byte, drainCount uint32) (
 	witness []InboxQueuedTx,
 	rootBefore types.Hash,
 	rootAfter types.Hash,
 	err error,
 ) {
+	// W4-3 mainnet hardening: refuse over-cap queues. The guest enforces
+	// the same cap via `inbox::InboxError::QueueExceedsCap` (error code
+	// 0x13) — failing here means the producer never even tries to prove
+	// an unprovable batch.
+	if len(rawQueue) > MaxInboxDrainPerBatch {
+		return nil, types.Hash{}, types.Hash{}, fmt.Errorf(
+			"inbox queue length %d exceeds MaxInboxDrainPerBatch (%d): "+
+				"producer must paginate the on-chain inbox across multiple "+
+				"batches at depth below the cap (W4-3 mainnet hardening)",
+			len(rawQueue), MaxInboxDrainPerBatch)
+	}
 	if int(drainCount) > len(rawQueue) {
 		return nil, types.Hash{}, types.Hash{}, fmt.Errorf(
 			"inbox drain count %d exceeds queue length %d", drainCount, len(rawQueue))
