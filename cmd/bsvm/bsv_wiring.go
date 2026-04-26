@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/icellan/bsvm/internal/db"
-	"github.com/icellan/bsvm/pkg/bsvclient"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/shard"
@@ -46,7 +45,11 @@ type bsvWireOpts struct {
 	DB          db.Database
 	OverlayNode *overlay.OverlayNode
 	CovenantMgr *covenant.CovenantManager
-	Provider    *bsvclient.RPCProvider
+	// Provider is the BSV-node JSON-RPC client. May be a single-
+	// endpoint *bsvclient.RPCProvider or the W6-11 failover wrapper
+	// *bsvclient.MultiRPCProvider — both satisfy BSVProviderClient and
+	// every consumer downstream is interface-typed accordingly.
+	Provider BSVProviderClient
 }
 
 // wireBSVBroadcast builds the full covenant-advance broadcast stack —
@@ -83,13 +86,18 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 	}
 	provider := opts.Provider
 	if provider == nil {
-		p, provErr := bsvclient.NewRPCProvider(opts.NodeCfg.BSV.NodeURL, bsvNet)
+		p, provErr := BuildBSVProvider(opts.NodeCfg.BSV)
 		if provErr != nil {
 			return fmt.Errorf("BSV RPC provider: %w", provErr)
 		}
+		if p == nil {
+			return fmt.Errorf("BSV RPC provider: no node_url(s) configured")
+		}
 		provider = p
 	}
-	slog.Info("BSV RPC provider ready", "url", opts.NodeCfg.BSV.NodeURL, "network", bsvNet)
+	slog.Info("BSV RPC provider ready",
+		"endpoints", opts.NodeCfg.BSV.EffectiveNodeURLs(),
+		"network", bsvNet)
 
 	// 5. Rúnar signer from the fee-wallet key. Wrap LocalSigner in
 	// ExternalSigner so PrepareCall's GetUtxos(address) queries the
