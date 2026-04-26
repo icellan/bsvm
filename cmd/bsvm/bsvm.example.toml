@@ -38,6 +38,37 @@ network = "mainnet"
 fee_wallet_key = ""
 confirmations = 6
 
+# Chaintracks header oracle. Default ships ONE provider so quorum stays
+# opt-in. To enable W6-2 multi-upstream cross-checking, add additional
+# [[bsv.chaintracks.providers]] blocks and bump quorum_m to >=2.
+# See docs/decisions/header-oracle-quorum.md for the full design.
+[bsv.chaintracks]
+quorum_strategy = "hybrid"          # "hybrid" or "m_of_n"
+quorum_m = 1                         # mainnet shards should set >=2
+disagreement_action = "log"          # "log", "drop", or "halt"
+disagreement_cooldown = "10m"
+response_timeout = "5s"
+stream_skew_window = "750ms"
+stream_buffer_max = 32
+
+[[bsv.chaintracks.providers]]
+name = "bhs-primary"
+url  = "https://headers.example.com/api/v1/chain"
+api_key = ""
+weight = 1
+timeout = "5s"
+enabled = true
+
+# Example secondary provider (commented out by default — opt in to
+# enable quorum and bump quorum_m above to 2):
+# [[bsv.chaintracks.providers]]
+# name = "bhs-secondary"
+# url  = "https://headers.other.example/headers"
+# api_key = ""
+# weight = 1
+# timeout = "5s"
+# enabled = true
+
 [bridge]
 min_deposit_satoshis = 10000
 min_withdrawal_satoshis = 10000
