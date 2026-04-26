@@ -626,12 +626,14 @@ func cmdRun(ctx *cli.Context) error {
 	}
 
 	// 5.6: BEEF-driven bridge monitor is constructed below
-	// (BuildBridgeMonitor at the WireBEEFEndpoints call site). Block-
-	// scanning mode (BSVClient.SubscribeNewBlocks etc.) is still gated
-	// on the BSV-SDK block-notification path landing.
-	// TODO(W6-x): when SubscribeNewBlocks lands, supply a real
-	// bridge.BSVClient to BuildBridgeMonitor so the monitor can scan
-	// blocks in addition to receiving BEEF envelopes.
+	// (BuildBridgeMonitor at the WireBEEFEndpoints call site). The
+	// block-scanning fallback path (BSVClient.SubscribeNewBlocks /
+	// GetBlockTransactions for non-BEEF deposits) is wired further
+	// down via startBridgeBlockScanner once chaintracks + the
+	// optional BSV-node RPC provider are both in scope. See
+	// cmd/bsvm/bridge_bsv_client.go for the adapter shape and the
+	// open gates (no-RPC fallback via WoC, automatic re-subscribe on
+	// stream EOF).
 
 	// 5.7: Double-spend monitor (requires BSV block notifications).
 	slog.Info("double-spend monitor: initialized, waiting for BSV block notifications")
@@ -865,6 +867,39 @@ func cmdRun(ctx *cli.Context) error {
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 8.1 Bridge block-scan fallback. Rides on the chaintracks WS
+	// stream for new-tip + reorg notifications and uses the BSV-node
+	// RPC failover provider for verbose getblock fetches. The BEEF
+	// deposit path stays primary; this scanner picks up deposits sent
+	// directly on-chain. Returns (nil, nil) when the bridge isn't
+	// wired or chaintracks is missing — daemon stays bootable either
+	// way. Operators on a chaintracks-only deployment (no BSV-node
+	// RPC) get the chaintracks stream + reorg retraction but
+	// GetBlockTransactions returns ErrBlockFetchUnsupported (logged
+	// once at debug); the BEEF path remains the only deposit source.
+	bridgeWoCClient, wocErr := BuildWoCClient(nodeCfg.BSV)
+	if wocErr != nil {
+		slog.Warn("bridge block scanner: WoC client construction failed", "err", wocErr)
+	}
+	bridgeScannerClose, err := startBridgeBlockScanner(
+		bgCtx,
+		bridgeMonitor,
+		chaintracksClient,
+		bridgeWoCClient,
+		bridgeBSVProviderForScan(bsvProvider),
+		slog.Default(),
+	)
+	if err != nil {
+		return fmt.Errorf("start bridge block scanner: %w", err)
+	}
+	if bridgeScannerClose != nil {
+		defer func() {
+			if cerr := bridgeScannerClose(); cerr != nil {
+				slog.Warn("bridge block scanner: shutdown error", "err", cerr)
+			}
+		}()
+	}
 
 	if txIndexer != nil {
 		// The overlay's event feed is strongly typed over overlay.NewHeadEvent,
