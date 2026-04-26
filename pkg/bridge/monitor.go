@@ -430,6 +430,64 @@ func (m *BridgeMonitor) ValidateHorizon(horizon uint64, observedBSVTip uint64) e
 	return nil
 }
 
+// RetractDepositsAbove drops every pending and persisted deposit
+// whose BSV block height is strictly greater than minHeight. Used by
+// the block-scanning adapter (cmd/bsvm/bridge_bsv_client.go) to react
+// to a chaintracks reorg event: deposits that were observed in the
+// orphaned chain segment must be un-credited so the new chain can re-
+// scan them. The horizon is left untouched — the next ProcessBlock
+// call will re-credit any deposits that survive the reorg.
+//
+// Deposits that have already been MarkProcessed'd by the L2 inclusion
+// path are still rolled back here. The L2-side rollback (overlay
+// re-execute / Block.SafeHead retreat) is the responsibility of the
+// reorg subscriber that calls this — this method only reverses the
+// monitor's own bookkeeping.
+func (m *BridgeMonitor) RetractDepositsAbove(minHeight uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Drop in-memory pending entries above the height.
+	filtered := m.pendingDeposits[:0]
+	for _, dep := range m.pendingDeposits {
+		if dep.BSVBlockHeight > minHeight {
+			delete(m.processedDeposits, depositID{dep.BSVTxID, dep.Vout})
+			continue
+		}
+		filtered = append(filtered, dep)
+	}
+	m.pendingDeposits = filtered
+
+	// Drop persisted entries above the height.
+	if m.db == nil {
+		return
+	}
+	const dkLen = 1 + 32 + 4
+	iter := m.db.NewIterator(depositPrefix, nil)
+	var toDelete [][]byte
+	for iter.Next() {
+		key := iter.Key()
+		if len(key) != dkLen {
+			continue
+		}
+		dep, err := decodeDeposit(iter.Value())
+		if err != nil {
+			continue
+		}
+		if dep.BSVBlockHeight > minHeight {
+			// Copy the key — iter.Key()'s slice is reused.
+			k := make([]byte, len(key))
+			copy(k, key)
+			toDelete = append(toDelete, k)
+			delete(m.processedDeposits, depositID{dep.BSVTxID, dep.Vout})
+		}
+	}
+	iter.Release()
+	for _, k := range toDelete {
+		_ = m.db.Delete(k)
+	}
+}
+
 // EligibleDepositsAtHorizon returns all confirmed deposits up to the
 // given BSV block height, sorted deterministically by
 // (BSVBlockHeight ASC, BSVTxID ASC). This scans the database for
