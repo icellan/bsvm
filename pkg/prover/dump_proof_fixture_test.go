@@ -22,15 +22,16 @@ import (
 // changes; the assertion is the file's content equality across runs.
 //
 // Binary format (all integers little-endian):
-//   u32 root_len                 = 32
-//   [32]u8 root
-//   u32 case_count
-//   for each case:
-//     u32 key_len; key
-//     u8  has_value
-//     u32 value_len; value (only if has_value)
-//     u32 node_count
-//     for each node: u32 node_len; node bytes
+//
+//	u32 root_len                 = 32
+//	[32]u8 root
+//	u32 case_count
+//	for each case:
+//	  u32 key_len; key
+//	  u8  has_value
+//	  u32 value_len; value (only if has_value)
+//	  u32 node_count
+//	  for each node: u32 node_len; node bytes
 func TestDumpProofFixtureForRust(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping fixture dump in -short mode")
