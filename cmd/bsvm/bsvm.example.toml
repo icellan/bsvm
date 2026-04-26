@@ -33,10 +33,41 @@ max_peers = 50
 
 [bsv]
 node_url = ""
+# Legacy single-endpoint ARC URL. Prefer [[bsv.arc_endpoint]] for
+# multi-endpoint fan-out (W6-3). When both are set, arc_endpoint wins.
 arc_url = ""
+# Fan-out strategy: "first_success" (default) or "quorum".
+arc_strategy = "first_success"
+# Required when arc_strategy = "quorum".
+arc_quorum = 0
+arc_default_timeout = "30s"
+arc_callback_url = ""
+arc_callback_token = ""
 network = "mainnet"
 fee_wallet_key = ""
 confirmations = 6
+
+# Multi-endpoint ARC fan-out (W6-3). Add one block per ARC provider.
+# [[bsv.arc_endpoint]]
+# name = "taal"
+# url = "https://arc.taal.com"
+# auth_token = ""
+# timeout = "30s"
+# max_retries = 1
+# retry_backoff = "100ms"
+
+# BRC-104 mutual-auth for inbound ARC callbacks (W6-10).
+# When enabled with at least one identity, callbacks must carry
+# valid BRC-104 headers. Set allow_token = true during migration to
+# also accept the legacy X-CallbackToken header.
+[bsv.arc_brc104]
+enabled = false
+timestamp_window = "60s"
+nonce_cache_size = 8192
+allow_token = true
+# [[bsv.arc_brc104.identity]]
+# name = "arc-prod"
+# public_key_hex = "02..."  # 33-byte compressed or 65-byte uncompressed
 
 [bridge]
 min_deposit_satoshis = 10000
