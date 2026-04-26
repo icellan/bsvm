@@ -167,3 +167,85 @@ accept_unverified_bridge_deposits = false
 # Application-level RPC errors (tx not found, mempool conflict, etc.)
 # are surfaced immediately and never trigger failover — the next node
 # would return the same answer.
+
+# -----------------------------------------------------------------------------
+# Worked example: chaintracks header oracle quorum (W6-2)
+# -----------------------------------------------------------------------------
+# The default [bsv.chaintracks] block above ships ONE provider with
+# quorum_m = 1 so brand-new operators can boot without standing up multiple
+# Block Headers Service (BHS) endpoints. Mainnet shards SHOULD enable quorum
+# by configuring 2-3 independent providers and bumping quorum_m to >=2 — this
+# is what catches a single upstream silently serving stale or forged headers.
+#
+# A mainnet operator running with three BHS endpoints (one self-hosted, two
+# third-party) would replace the default [bsv.chaintracks] block with the
+# section below. Append-only example — the live config is the [bsv.chaintracks]
+# block higher up in this file; this section is documentation, kept in its
+# own marked region so sibling-agent merges stay trivial.
+#
+# [bsv.chaintracks]
+# # "hybrid" combines weighted voting (uses provider weights) with an
+# # explicit floor of `quorum_m` agreeing endpoints. "m_of_n" is strict
+# # M-of-N agreement with no weighting. Default: "hybrid".
+# quorum_strategy = "hybrid"
+# # Minimum number of providers that must agree before the chaintracks
+# # client accepts a header. 1 disables cross-checking; 2 requires any
+# # two providers to agree; 3 (with three configured providers) requires
+# # unanimity. Mainnet shards should set this to >= 2.
+# quorum_m = 2
+# # What to do when providers disagree:
+# #   "log"  — emit a structured WARN log and continue using the majority
+# #            answer (default; safest while operating)
+# #   "drop" — also suspend the deviant provider for `disagreement_cooldown`
+# #   "halt" — halt the node entirely (use only after extensive tuning)
+# disagreement_action = "drop"
+# # How long a provider stays suspended after disagreement_action="drop".
+# disagreement_cooldown = "10m"
+# # Per-fan-out call timeout. Slow providers exceeding this are treated
+# # as a non-vote for that round, not a hard failure.
+# response_timeout = "5s"
+# # How long to buffer streamed events per child before resolving quorum.
+# # Larger windows tolerate more clock skew between providers; smaller
+# # windows lower stream latency.
+# stream_skew_window = "750ms"
+# # Per-child reorg buffer cap. Prevents a misbehaving provider from
+# # consuming unbounded memory by streaming an arbitrarily long reorg.
+# stream_buffer_max = 32
+#
+# # Provider 1 — self-hosted BHS (highest weight: we trust ourselves most).
+# [[bsv.chaintracks.providers]]
+# name    = "bhs-self-hosted"                    # operator-chosen label, used in logs
+# url     = "https://chaintracks.example/api/v1" # BHS HTTP base URL
+# api_key = ""                                   # optional; set if upstream requires bearer auth
+# weight  = 3                                    # vote weight under "hybrid"; ignored under "m_of_n"
+# timeout = "5s"                                 # per-request timeout (overrides response_timeout for this provider)
+# enabled = true                                 # set false to keep the config but skip in fan-out
+#
+# # Provider 2 — third-party BHS (medium weight).
+# [[bsv.chaintracks.providers]]
+# name    = "bhs-vendor-a"
+# url     = "https://headers.vendor-a.example/api/v1"
+# api_key = "REPLACE_WITH_VENDOR_A_KEY"
+# weight  = 2
+# timeout = "5s"
+# enabled = true
+#
+# # Provider 3 — independent third-party BHS (lower weight, used as tiebreaker).
+# [[bsv.chaintracks.providers]]
+# name    = "bhs-vendor-b"
+# url     = "https://chaintracks.vendor-b.example/api/v1"
+# api_key = "REPLACE_WITH_VENDOR_B_KEY"
+# weight  = 1
+# timeout = "5s"
+# enabled = true
+#
+# Behaviour with this config under "hybrid" + quorum_m = 2:
+#   - Total weight = 3 + 2 + 1 = 6; majority weight threshold = 4.
+#   - Any header agreed by `bhs-self-hosted` + either vendor (3+2=5 or
+#     3+1=4) clears the weighted majority AND meets the floor of 2
+#     agreeing providers.
+#   - If `bhs-self-hosted` is offline, the two vendors must agree
+#     (weight 2+1=3 < 4 — falls back to floor: 2 agreeing providers).
+#   - If only one provider responds within `response_timeout`, the
+#     round fails the quorum and the chaintracks client retries with
+#     backoff. See docs/decisions/header-oracle-quorum.md.

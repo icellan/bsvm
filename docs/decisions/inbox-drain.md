@@ -30,12 +30,17 @@ batch, which would have prevented the covenant from ever resetting
 
 ### D1. Empty-queue marker
 
-**Question:** Spec 12 §"Public Values Layout" says `inboxRootAfter =
-bytes32(0)` for a full drain. But `pkg/covenant/inbox_state.go::EmptyInboxState`
-and `pkg/overlay/inbox_monitor.go::NewInboxMonitor` use
+**Question:** Spec 12 §"Public Values Layout" originally said
+`inboxRootAfter = bytes32(0)` for a full drain. But
+`pkg/covenant/inbox_state.go::EmptyInboxState` and
+`pkg/overlay/inbox_monitor.go::NewInboxMonitor` use
 `hash256(zero32)` as the genesis empty-chain marker.
 
-**Decision:** Use **`hash256(zero32)`** for the full-drain `inboxRootAfter`.
+**Decision:** Use **`hash256(zero32)`** as the canonical empty-inbox
+sentinel for both `inboxRootBefore` (empty / disabled inbox going
+in) and `inboxRootAfter` (queue fully drained coming out). Literal
+`bytes32(0)` is **forbidden** in either field — implementations that
+emit it MUST be considered buggy.
 
 Rationale:
 - The actual covenant code in `pkg/covenant/contracts/rollup_*.runar.go`
@@ -43,15 +48,28 @@ Rationale:
   uses `before != after` as the drain detector (see
   `rollup_inbox_test.go::TestFRIRollup_InboxDrainResetsCounter`,
   which uses arbitrary `rawSha256("post-drain")` values and still
-  passes the drain-detection branch).
+  passes the drain-detection branch). The drain-detection check is
+  value-agnostic, so the choice of empty marker is a wire-level
+  invariant rather than a covenant-script branch condition.
 - Using the genesis marker keeps the wire-level invariant that
-  `inboxRootAfter` is **always a valid chain root**. A literal zero
-  would be a special-case sentinel that no other code path produces.
+  `inboxRootAfter` is **always a valid hash-chain root**. A literal
+  zero would be a special-case sentinel that no other code path
+  produces, and would create an ambiguous state where two distinct
+  "empty" representations could collide with a degenerate hash-chain
+  input and silently break the covenant's reset logic.
 - Round-trips through `EmptyInboxState()` / `EmptyInboxRoot()`
-  trivially.
+  trivially: a freshly constructed `InboxMonitor` reports
+  `hash256(zero32)`, the guest's `empty_inbox_root` returns the same
+  value, and a fully drained chain rolls back to the same value —
+  so `before == after == hash256(zero32)` correctly registers as
+  "no drain happened" for an idle inbox.
 
-Spec 12 should be updated to clarify the marker is `hash256(zero32)`,
-not `bytes32(0)` — but that's a doc-only change.
+**Status:** Spec 10 and spec 12 were updated to make this choice
+normative — see spec 12, "Empty-Inbox Sentinel (Normative)". Spec 12
+also points at `prover/guest/src/inbox.rs::empty_inbox_root` and
+`pkg/prover/inbox_witness.go::EmptyInboxRoot` as the implementation
+source of truth. This decision record is no longer ambiguous: the
+sentinel is `hash256(zero32)`, full stop.
 
 ### D2. Ordering within a batch
 
@@ -248,10 +266,12 @@ behavioural binding that matters for production.
    txs as no-ops (which the EVM rejects with status=0 receipts —
    verifiable but not useful).
 
-2. **Spec doc clarification**: Spec 12 says `inboxRootAfter = bytes32(0)`
-   for full drain; the implementation uses `hash256(zero32)`. Same
-   semantics from the covenant's perspective (`before != after`) but
-   the spec text should be updated.
+2. **Spec doc clarification**: ~~Spec 12 says `inboxRootAfter = bytes32(0)`
+   for full drain; the implementation uses `hash256(zero32)`.~~
+   **CLOSED.** Spec 10 and spec 12 now spell out `hash256(zero32)` as
+   the canonical empty-inbox sentinel and forbid literal `bytes32(0)`
+   — see spec 12, "Empty-Inbox Sentinel (Normative)" and the tightened
+   D1 above.
 
 3. **Witness size cap**: ~~No upper bound on `inbox_queue.len()` is
    enforced today~~. **CLOSED in W4-3 mainnet hardening.** See D6 / D7

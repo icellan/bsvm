@@ -443,8 +443,10 @@ pub fn main() {
     let inbox_root_after = process_inbox_txs(
         &mut db, &mut mpt, &inbox_root_before, &inbox_txs, &mut receipts, &mut gas_used_total,
     );
-    // inbox_root_after is bytes32(0) if all inbox txs were included (queue drained),
-    // equals inbox_root_before if no inbox txs were included in this batch.
+    // inbox_root_after is hash256(zero32) (the empty-inbox sentinel — see
+    // "Empty-Inbox Sentinel (Normative)" below; NOT literal bytes32(0)) if all
+    // inbox txs were included (queue fully drained), equals inbox_root_before
+    // if no inbox txs were included in this batch.
 
     // 9. Migration script hash (bytes32(0) for normal advances, set by
     //    migrate path only — not implemented in the standard guest flow).
@@ -658,7 +660,7 @@ same order.
 | 2 | `Vec<u8>` | variable | State export (zstd-compressed RLP, see "State Export Serialization Format" below) |
 | 3 | `Vec<Vec<u8>>` | variable | Transaction batch (each element is one EIP-2718 typed tx envelope) |
 | 4 | `BlockContext` | ~100 bytes | Block context (timestamp, block number, coinbase, prevrandao, etc.) |
-| 5 | `[u8; 32]` | 32 bytes | Inbox root before (bytes32(0) if inbox disabled) |
+| 5 | `[u8; 32]` | 32 bytes | Inbox root before (`hash256(zero32)` if inbox empty / disabled — the empty-inbox sentinel; see "Empty-Inbox Sentinel (Normative)") |
 | 6 | `Vec<Vec<u8>>` | variable | Inbox transactions (empty vec if none) |
 
 All types are serialized via `bincode` (SP1's default). `Vec<u8>` is
@@ -843,21 +845,74 @@ The SP1 proof commits the following public values at fixed offsets:
 | 104 | 32 | batchDataHash | `hash256(batchData)` — double-SHA256 of the canonical batch encoding (see Spec 11, "Canonical Batch Data Encoding Format"). Uses hash256 (not keccak256) so the covenant can verify it with a single native `OP_HASH256`. |
 | 136 | 8 | chainID | L2 chain ID (uint64 BE) — cross-shard replay prevention |
 | 144 | 32 | withdrawalRoot | SHA256 Merkle root of withdrawal hashes in batch, or `bytes32(0)` if no withdrawals |
-| 176 | 32 | inboxRootBefore | Inbox hash chain root before this batch (from host input). `bytes32(0)` if inbox is empty or inbox is disabled. See Spec 10, "Inbox Integration via STARK Public Values". |
-| 208 | 32 | inboxRootAfter | Inbox hash chain root after this batch. `bytes32(0)` if all inbox txs were included (queue drained). Equals `inboxRootBefore` if no inbox txs were included in this batch. |
-
-<!-- TODO(spec): pin the per-batch inbox witness cap. Implementation
-     enforces `MAX_INBOX_DRAIN_PER_BATCH = 1024` in the SP1 guest
-     (`prover/guest/src/inbox.rs`) and the Go host
-     (`pkg/prover/inbox_witness.go::MaxInboxDrainPerBatch`). The cap
-     is a DoS guard against unbounded `inbox_queue` witnesses
-     exhausting SP1 cycles. Over-cap witnesses are rejected with
-     guest error code 0x13 (`InboxError::QueueExceedsCap`). See
-     `docs/decisions/inbox-drain.md` D6/D7 for rationale. Pin the
-     constant in the normative public-values / verifier text in the
-     next sweep. -->
+| 176 | 32 | inboxRootBefore | Inbox hash chain root before this batch (from host input). `hash256(zero32)` (the empty-inbox sentinel — see `prover/guest/src/inbox.rs::empty_inbox_root` and `pkg/overlay/inbox_monitor.go`) if the inbox is empty or disabled. See Spec 10, "Inbox Integration via STARK Public Values". |
+| 208 | 32 | inboxRootAfter | Inbox hash chain root after this batch. `hash256(zero32)` if all inbox txs were included (queue fully drained — same empty-inbox sentinel as `inboxRootBefore`). Equals `inboxRootBefore` if no inbox txs were included in this batch. Implementations MUST NOT use literal `bytes32(0)` here — see "Empty-Inbox Sentinel (Normative)" below. |
 
 | 240 | 32 | migrateScriptHash | `SHA256(newScript)` if migration, else `bytes32(0)` |
+
+#### Inbox Drain Cap (Normative)
+
+An inbox drain witness SHALL contain at most **1024 transactions**
+(`MAX_INBOX_DRAIN_PER_BATCH`). This is a soundness-relevant invariant
+of the verifier: a valid SP1 STARK proof for `inboxRootBefore` /
+`inboxRootAfter` MUST come from a guest execution that received at
+most 1024 entries in `inbox_queue`. The guest MUST reject witnesses
+exceeding this cap with error `0x13`
+(`InboxError::QueueExceedsCap`) BEFORE performing any Merkle / PoW
+work, so a malicious host pays no SP1 cycles for an oversized
+witness, and so the public-values commitment is never produced for
+an over-cap input.
+
+Producers (overlay nodes) MUST split larger queues across multiple
+consecutive covenant-advance batches. The spec-10 forced-inclusion
+threshold (10 advances) leaves ample headroom for paginated drains
+under any sane operator config. Truncation is forbidden — the only
+correct response to an over-cap queue is to fail and paginate.
+
+Cross-references:
+- Implementation (guest): `prover/guest/src/inbox.rs`
+  (`InboxError::QueueExceedsCap`, code `0x13`).
+- Implementation (Go host): `pkg/prover/inbox_witness.go`
+  (`MaxInboxDrainPerBatch`, `BuildInboxWitness`).
+- Implementation (overlay producer):
+  `pkg/overlay/process.go::processBatchInternal`.
+- Decision record: `docs/decisions/inbox-drain.md` (D6, D7).
+- Authoritative description: spec 10,
+  "Forced Inclusion Inbox", "Inbox Drain Cap (Normative)".
+
+#### Empty-Inbox Sentinel (Normative)
+
+When the inbox is empty or disabled (`inboxRootBefore`), or when a
+batch fully drains the queue (`inboxRootAfter`), the empty marker is
+**`hash256(zero32)`** — the double-SHA256 of 32 zero bytes — NOT
+literal `bytes32(0)`. This is the value produced by
+`prover/guest/src/inbox.rs::empty_inbox_root` and
+`pkg/overlay/inbox_monitor.go::NewInboxMonitor`, and the canonical
+"empty hash chain" sentinel for both the Go and Rust sides of the
+inbox witness.
+
+Implementations MUST NOT use literal `bytes32(0)` for this purpose.
+The covenant's drain-detection branch (`inboxRootBefore !=
+inboxRootAfter`) accepts any consistent value pair, but mixing the
+two sentinels would create an ambiguous state where two distinct
+"empty" representations could collide with a degenerate hash-chain
+input and silently break the covenant's reset logic.
+
+Earlier drafts of this spec said `bytes32(0)`. That wording is
+superseded — `hash256(zero32)` is the wire-level invariant. The
+covenant pseudocode in this section uses `runar.Bytes32Zero` as a
+placeholder constant; readers should treat that symbol as the
+canonical empty marker (`hash256(zero32)`) wherever it appears in
+inbox-root context, not as literal `0x00..00`.
+
+Cross-references:
+- Implementation (guest): `prover/guest/src/inbox.rs::empty_inbox_root`.
+- Implementation (Go host): `pkg/prover/inbox_witness.go::EmptyInboxRoot`.
+- Implementation (overlay monitor): `pkg/overlay/inbox_monitor.go`
+  (`NewInboxMonitor` seeds with the same sentinel).
+- Decision record: `docs/decisions/inbox-drain.md` D1.
+- Authoritative description: spec 10, "Inbox Integration via
+  STARK Public Values".
 
 Total: 272 bytes of public values.
 
@@ -1105,11 +1160,21 @@ func RollupContract(sp1VK []byte, chainID uint64, gov GovernanceConfig) *runar.C
         inboxIncluded := m.Not(m.Equal(inboxRootBefore, inboxRootAfter))
         newAdvanceCount := m.Add(c.GetState("advancesSinceInbox"), runar.Uint64Literal(1))
 
+        // Note: `runar.Bytes32Zero` here denotes the empty-inbox sentinel
+        // (`hash256(zero32)`), NOT literal `bytes32(0)` — see
+        // "Empty-Inbox Sentinel (Normative)" above. The actual covenant
+        // implementations (`pkg/covenant/contracts/rollup_*.runar.go`) do
+        // not depend on the value of these branches because the
+        // `before != after` check (computed by `inboxIncluded` on the
+        // preceding line) is sufficient for drain detection — these two
+        // equality branches exist only to make the constraint trivially
+        // satisfiable when the inbox was empty going in or fully drained
+        // coming out.
         m.Require(
             m.Or(
                 m.LessThan(newAdvanceCount, runar.Uint64Literal(10)), // Not overdue
-                m.Equal(inboxRootBefore, runar.Bytes32Zero),          // Inbox empty
-                m.Equal(inboxRootAfter, runar.Bytes32Zero),           // All inbox txs included
+                m.Equal(inboxRootBefore, runar.Bytes32Zero),          // Inbox empty (empty sentinel)
+                m.Equal(inboxRootAfter, runar.Bytes32Zero),           // All inbox txs included (empty sentinel)
             ),
             "forced inclusion: inbox txs must be fully included within 10 advances",
         )
