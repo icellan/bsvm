@@ -104,12 +104,12 @@ func inboxHash256(data []byte) types.Hash {
 //   - witness:   the InboxQueuedTx slice for ProveInput.InboxQueue.
 //   - rootBefore: the chain root over the FULL queue (claimed value).
 //   - rootAfter:  the chain root after draining the leading `drainCount`
-//                 entries — `EmptyInboxRoot()` if all drained, else the
-//                 chain over the trailing remainder.
+//     entries — `EmptyInboxRoot()` if all drained, else the
+//     chain over the trailing remainder.
 //   - err: when `drainCount` exceeds `len(rawQueue)`, OR when
-//          `len(rawQueue) > MaxInboxDrainPerBatch` (W4-3 mainnet
-//          hardening — see the constant doc for why the failure is
-//          hard rather than silent truncation).
+//     `len(rawQueue) > MaxInboxDrainPerBatch` (W4-3 mainnet
+//     hardening — see the constant doc for why the failure is
+//     hard rather than silent truncation).
 func BuildInboxWitness(rawQueue [][]byte, drainCount uint32) (
 	witness []InboxQueuedTx,
 	rootBefore types.Hash,

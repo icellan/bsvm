@@ -443,9 +443,9 @@ func (n *OverlayNode) processBatchInternal(
 	// snapshot as the witness even on no-drain batches — that way the
 	// guest's chain-root recomputation always succeeds.
 	var (
-		inboxQueueWitness    []prover.InboxQueuedTx
-		inboxDrainCount      uint32
-		inboxMustDrainAll    bool
+		inboxQueueWitness     []prover.InboxQueuedTx
+		inboxDrainCount       uint32
+		inboxMustDrainAll     bool
 		inboxRootAfterWitness types.Hash
 	)
 	if inboxWitness.preDrainRoot != (types.Hash{}) {

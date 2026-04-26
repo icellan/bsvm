@@ -24,14 +24,14 @@ import (
 //     the head of the batch.
 //  4. Assert:
 //     a. The published `inboxRootBefore` is the chain root over the 3
-//        inbox txs (i.e. the pre-drain monitor hash) — NOT the empty
-//        marker, which is what the buggy code was emitting.
+//     inbox txs (i.e. the pre-drain monitor hash) — NOT the empty
+//     marker, which is what the buggy code was emitting.
 //     b. The published `inboxRootAfter` is the empty marker (full drain).
 //     c. They differ — so the covenant treats this as "drain happened"
-//        and resets `advancesSinceInbox` to 0.
+//     and resets `advancesSinceInbox` to 0.
 //     d. The ProveInput carries a non-empty inbox witness with the
-//        correct queue contents and drain count, ready for the SP1 guest
-//        to verify (W4-3).
+//     correct queue contents and drain count, ready for the SP1 guest
+//     to verify (W4-3).
 func TestProcessBatch_ForcedInboxDrain_WitnessIsCorrect(t *testing.T) {
 	ts := newTestSetup(t)
 	defer ts.node.Stop()

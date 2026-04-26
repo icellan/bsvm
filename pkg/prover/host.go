@@ -371,16 +371,16 @@ func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
 // AccountExport / StorageSlotExport / TransactionExport / BlockContext
 // types one-to-one. Keep these in lock-step with the Rust bridge.
 type bridgeInput struct {
-	PreStateRoot      string                  `json:"pre_state_root"`
-	Accounts          []bridgeAccount         `json:"accounts"`
-	Transactions      []bridgeTransaction     `json:"transactions"`
-	BlockContext      bridgeBlockContext      `json:"block_context"`
-	InboxRootBefore   string                  `json:"inbox_root_before,omitempty"`
-	InboxRootAfter    string                  `json:"inbox_root_after,omitempty"`
-	InboxQueue        []bridgeInboxQueuedTx   `json:"inbox_queue,omitempty"`
-	InboxDrainCount   uint32                  `json:"inbox_drain_count,omitempty"`
-	InboxMustDrainAll bool                    `json:"inbox_must_drain_all,omitempty"`
-	Mode              string                  `json:"mode"`
+	PreStateRoot      string                `json:"pre_state_root"`
+	Accounts          []bridgeAccount       `json:"accounts"`
+	Transactions      []bridgeTransaction   `json:"transactions"`
+	BlockContext      bridgeBlockContext    `json:"block_context"`
+	InboxRootBefore   string                `json:"inbox_root_before,omitempty"`
+	InboxRootAfter    string                `json:"inbox_root_after,omitempty"`
+	InboxQueue        []bridgeInboxQueuedTx `json:"inbox_queue,omitempty"`
+	InboxDrainCount   uint32                `json:"inbox_drain_count,omitempty"`
+	InboxMustDrainAll bool                  `json:"inbox_must_drain_all,omitempty"`
+	Mode              string                `json:"mode"`
 }
 
 // bridgeInboxQueuedTx mirrors the Rust bridge's `InboxQueuedTxExport`
