@@ -604,28 +604,52 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Build a binary SHA-256 Merkle tree from withdrawal hashes.
 /// Returns the root hash, or zeros if empty.
+///
+/// Algorithm (must stay byte-identical to pkg/bridge/withdrawal.go and
+/// pkg/prover/withdrawal_root.go):
+///   - Empty list ⇒ bytes32(0)
+///   - Single leaf ⇒ that leaf is the root (no extra hashing)
+///   - Internal nodes:  SHA256(left || right)   (single-block, NOT hash256)
+///   - Odd-sized levels: pad with bytes32(0)    (NOT last-element duplication)
+///
+/// Bit-identical to:
+///   - pkg/bridge/withdrawal.go::BuildWithdrawalMerkleTree (on-chain reference)
+///   - pkg/prover/withdrawal_root.go::computeWithdrawalRoot (Go host mirror)
+///   - prover/guest-evm/src/main.rs::compute_withdrawal_root (Gate 0b stub)
+///
+/// Tested by pkg/prover/withdrawal_root_test.go::TestWithdrawalRoot_GoldenAgainstBridge.
 fn build_withdrawal_merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     if hashes.is_empty() {
         return [0u8; 32];
     }
-    let mut current_level = hashes.to_vec();
-    while current_level.len() > 1 {
-        let mut next_level = Vec::new();
-        for i in (0..current_level.len()).step_by(2) {
-            let left = &current_level[i];
-            let right = if i + 1 < current_level.len() {
-                &current_level[i + 1]
-            } else {
-                left // duplicate last element for odd count
-            };
-            let mut combined = Vec::with_capacity(64);
-            combined.extend_from_slice(left);
-            combined.extend_from_slice(right);
-            next_level.push(hash256(&combined));
-        }
-        current_level = next_level;
+
+    let mut level: Vec<[u8; 32]> = hashes.to_vec();
+
+    if level.len() == 1 {
+        return level[0];
     }
-    current_level[0]
+
+    while level.len() > 1 {
+        // Zero-pad odd levels (NOT last-leaf duplication).
+        if level.len() % 2 != 0 {
+            level.push([0u8; 32]);
+        }
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len() / 2);
+        let mut i = 0;
+        while i < level.len() {
+            // Internal node: single-block SHA256(left || right), NOT hash256.
+            let mut hasher = Sha256::new();
+            hasher.update(&level[i]);
+            hasher.update(&level[i + 1]);
+            let result = hasher.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&result);
+            next.push(out);
+            i += 2;
+        }
+        level = next;
+    }
+    level[0]
 }
 
 /// Compute the Ethereum logs bloom for a set of logs.

@@ -344,9 +344,21 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		ret   []byte
 		vmerr error // vm errors do not affect consensus and are therefore not assigned to err
 	)
-	if contractCreation {
+	switch {
+	case contractCreation:
 		ret, _, st.gasRemaining, vmerr = st.evm.Create(msg.From, msg.Data, st.gasRemaining, value)
-	} else {
+	case IsWithdrawDispatch(msg.To, msg.Data):
+		// Bridge withdrawal fast-path: replace the EVM call to the L2Bridge
+		// predeploy with a Go-side state mutation. Mirrors the deposit
+		// path in ApplyDepositTx — withdrawals are applied as direct
+		// state mutations rather than EVM execution so the burn,
+		// rate-limit check, and storage updates cannot fail mid-flight,
+		// be re-entered, or interact with arbitrary contracts. Intrinsic
+		// gas was already deducted in preCheck above; the remaining gas
+		// is returned to the sender exactly as for a successful EVM call.
+		st.state.SetNonce(msg.From, st.state.GetNonce(msg.From)+1, tracing.NonceChangeEoACall)
+		ret, vmerr = applyWithdrawDispatch(st, msg)
+	default:
 		// Increment the nonce for the next transaction.
 		st.state.SetNonce(msg.From, st.state.GetNonce(msg.From)+1, tracing.NonceChangeEoACall)
 
@@ -424,4 +436,31 @@ func (st *stateTransition) returnGas() {
 // gasUsed returns the amount of gas used up by the state transition.
 func (st *stateTransition) gasUsed() uint64 {
 	return st.initialGas - st.gasRemaining
+}
+
+// applyWithdrawDispatch routes a bridge withdrawal call through
+// ApplyWithdrawTx instead of the EVM. Returns ret/vmerr in the same
+// shape as evm.Call so the caller can splice the result into the
+// normal execute() return path. A failed withdrawal (insufficient
+// balance, rate-limit hit, malformed calldata) is reported as
+// vm.ErrExecutionReverted with the error message in ret, mirroring
+// how a Solidity require() failure surfaces.
+//
+// The vm.StateDB interface used by the EVM lacks the bridge package's
+// rate-limit and storage-slot helpers, but in practice the only
+// implementation in production is *state.StateDB (the genesis path
+// also drives StateDB through the same concrete type). The fast-path
+// type-asserts back to that concrete type; if the assertion fails the
+// withdrawal is reverted rather than corrupting the EVM-only path.
+func applyWithdrawDispatch(st *stateTransition, msg *Message) ([]byte, error) {
+	concrete, ok := stateDBFor(st.state)
+	if !ok {
+		return []byte("withdraw: state implementation does not support withdrawals"), vm.ErrExecutionReverted
+	}
+	hdr := &L2Header{Number: new(big.Int).Set(st.evm.Context.BlockNumber)}
+	_, err := ApplyWithdrawTx(concrete, hdr, msg.From, msg.Data)
+	if err != nil {
+		return []byte(err.Error()), vm.ErrExecutionReverted
+	}
+	return nil, nil
 }

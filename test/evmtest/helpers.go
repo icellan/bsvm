@@ -112,6 +112,13 @@ func setupMemoryPreState(pre map[string]PreAccountJSON) *state.MemoryStateDB {
 	return sdb
 }
 
+// SetupTriePreStateExported is the public form of setupTriePreState,
+// exposed so the cross-EVM differential harness can reuse the same
+// pre-state construction logic without duplicating it.
+func SetupTriePreStateExported(pre map[string]PreAccountJSON) (*state.StateDB, error) {
+	return setupTriePreState(pre)
+}
+
 // setupTriePreState creates a real StateDB backed by MPT and populates it
 // with the pre-state accounts. The resulting state root can be compared
 // against expected values.

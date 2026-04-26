@@ -141,9 +141,9 @@ func Build(cfg Config) (*Bundle, error) {
 	switch cfg.ProofMode {
 	case covenant.ProofModeFRI:
 		verificationMode = covenant.VerifyFRI
-	case covenant.ProofModeGroth16Generic:
+	case covenant.ProofModeGroth16:
 		verificationMode = covenant.VerifyGroth16
-	case covenant.ProofModeGroth16Witness:
+	case covenant.ProofModeGroth16WA:
 		verificationMode = covenant.VerifyGroth16WA
 	}
 
@@ -311,7 +311,7 @@ func (b *Bundle) PlanAdvance(txs []*types.Transaction) (*PlannedAdvance, error) 
 	}
 
 	var callOpts *runar.CallOptions
-	if waProof, ok := proof.(*covenant.Groth16WitnessProof); ok && waProof.Witness != nil {
+	if waProof, ok := proof.(*covenant.Groth16WAProof); ok && waProof.Witness != nil {
 		callOpts = &runar.CallOptions{
 			Groth16WAWitness: waProof.Witness,
 		}

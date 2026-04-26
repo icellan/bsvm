@@ -3,6 +3,7 @@ package overlay
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,11 +12,127 @@ import (
 
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/covenant"
+	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/prover"
 	"github.com/icellan/bsvm/pkg/rlp"
 	"github.com/icellan/bsvm/pkg/state"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// withdrawalInitiatedTopic mirrors pkg/block/system_tx.go's
+// withdrawalInitiatedTopic. It is recomputed here (rather than exported
+// from pkg/block) to keep overlay's dependency surface unchanged.
+var withdrawalInitiatedTopic = types.BytesToHash(crypto.Keccak256(
+	[]byte("WithdrawalInitiated(uint256,bytes20,uint256,bytes32)"),
+))
+
+// withdrawalNonceSlot mirrors pkg/bridge.WithdrawalNonceSlot (slot 2 in
+// the L2Bridge predeploy storage layout). Inlined here to avoid pulling
+// pkg/bridge into pkg/overlay's import graph.
+var withdrawalNonceSlot = types.HexToHash(
+	"0x0000000000000000000000000000000000000000000000000000000000000002",
+)
+
+// beUint64 reads an 8-byte big-endian uint64 from b. Returns 0 if b is
+// not exactly 8 bytes long.
+func beUint64(b []byte) uint64 {
+	if len(b) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
+}
+
+// extractWithdrawals scans the batch's receipts for the bridge predeploy's
+// WithdrawalInitiated logs and returns the withdrawals in emission order.
+//
+// Log layout (see pkg/block/system_tx.go::ApplyWithdrawTx):
+//
+//	topic[0] = keccak256("WithdrawalInitiated(uint256,bytes20,uint256,bytes32)")
+//	topic[1] = indexed sender (32-byte left-padded address)
+//	data     = bsvAddr (32-byte right-padded bytes20)
+//	         || weiAmount (uint256 BE)
+//	         || withdrawalHash (32 bytes)
+//
+// The bridge stores the satoshi-denominated leaf at withdrawalHashes[nonce]
+// in storage, computed as hash256(bsvAddr || satoshis_be || nonce_be). We
+// reconstruct (recipient, satoshis, nonce) from the emission order: nonce
+// is the index after RecordWithdrawal increments it (the i-th log in the
+// batch carries the nonce as it appeared at emission time, i.e. the nonce
+// recorded in topic ordering is monotonically increasing within the batch).
+//
+// Because the synthetic log doesn't include the nonce as a topic, we
+// recover it from the on-chain bridge contract's withdrawalNonce slot:
+// the slot is incremented once per withdrawal and the last N values
+// before the post-state correspond to this batch's withdrawals. To stay
+// pure-functional and avoid reading state here, we encode the nonce as
+// the order-of-emission relative to the bridge's pre-batch nonce, which
+// the caller supplies.
+func extractWithdrawals(receipts []*types.Receipt, baseNonce uint64) []prover.Withdrawal {
+	var out []prover.Withdrawal
+	idx := uint64(0)
+	for _, r := range receipts {
+		if r == nil {
+			continue
+		}
+		for _, log := range r.Logs {
+			if log == nil || log.Address != types.BridgeContractAddress {
+				continue
+			}
+			if len(log.Topics) == 0 || log.Topics[0] != withdrawalInitiatedTopic {
+				continue
+			}
+			// Need at minimum: 32 (bsvAddr padded) + 32 (weiAmount) bytes.
+			if len(log.Data) < 64 {
+				slog.Warn("withdrawal log data too short", "len", len(log.Data))
+				continue
+			}
+			var recipient types.Address
+			copy(recipient[:], log.Data[0:20])
+
+			// weiAmount is a uint256 BE; convert to satoshis the same way
+			// ApplyWithdrawTx did so the leaf hash matches.
+			weiBytes := log.Data[32:64]
+			satoshis := weiBytesToSatoshis(weiBytes)
+
+			out = append(out, prover.Withdrawal{
+				Recipient:      recipient,
+				AmountSatoshis: satoshis,
+				Nonce:          baseNonce + idx,
+			})
+			idx++
+		}
+	}
+	return out
+}
+
+// weiBytesToSatoshis interprets a 32-byte big-endian wei amount and
+// converts it to satoshis (floor division by 10^10). Mirrors
+// types.WeiToSatoshis but operates on raw bytes from a log, avoiding a
+// uint256 allocation per log.
+func weiBytesToSatoshis(b []byte) uint64 {
+	if len(b) != 32 {
+		return 0
+	}
+	// Anything in the top 24 bytes saturates uint64 sat space.
+	for i := 0; i < 24; i++ {
+		if b[i] != 0 {
+			// A wei amount that needs more than 8 bytes will produce a
+			// satoshi count larger than uint64. The bridge enforces a
+			// per-period rate limit so this is unreachable in practice;
+			// surface it via the satoshi truncation rules anyway.
+			weiHi := binary.BigEndian.Uint64(b[16:24])
+			weiLo := binary.BigEndian.Uint64(b[24:32])
+			// Try a 128-bit / 10^10 division: if the high word is
+			// non-zero, the satoshi count exceeds uint64.
+			if weiHi == 0 {
+				return weiLo / 10_000_000_000
+			}
+			return ^uint64(0) // saturate
+		}
+	}
+	wei := binary.BigEndian.Uint64(b[24:32])
+	return wei / 10_000_000_000
+}
 
 // mockProofMarker is the sentinel value written by the mock prover
 // (pkg/prover/host.go). Production deployments refuse to wrap a proof
@@ -263,11 +380,24 @@ func (n *OverlayNode) processBatchInternal(
 		inboxRootAfter = n.inboxMonitor.QueueHash()
 	}
 
+	// Read the bridge's pre-batch withdrawalNonce so we can assign each
+	// log emitted in this batch the correct nonce, then scrape the
+	// receipts for WithdrawalInitiated events. The SP1 guest folds these
+	// into the withdrawalRoot at PublicValues offset 144; the bridge
+	// covenant proves individual withdrawals against that root.
+	var preBatchWithdrawalNonce uint64
+	if preStateDB != nil {
+		nonceHash := preStateDB.GetState(types.BridgeContractAddress, withdrawalNonceSlot)
+		preBatchWithdrawalNonce = beUint64(nonceHash[24:32])
+	}
+	withdrawals := extractWithdrawals(receipts, preBatchWithdrawalNonce)
+
 	proveInput := &prover.ProveInput{
 		PreStateRoot:    preStateRoot,
 		Transactions:    rlpTxs,
 		InboxRootBefore: inboxRootBefore,
 		InboxRootAfter:  inboxRootAfter,
+		Withdrawals:     withdrawals,
 		BlockContext: prover.BlockContext{
 			Number:    l2Block.NumberU64(),
 			Timestamp: l2Block.Time(),
@@ -352,8 +482,11 @@ func (n *OverlayNode) processBatchInternal(
 				slog.Warn("covenant broadcast failed", "block", l2Block.NumberU64(), "error", bcErr)
 			} else {
 				broadcastResult = result
-				if n.confirmationWatcher != nil {
-					n.confirmationWatcher.Track(l2Block.NumberU64(), result.TxID)
+				// Read the watcher under the node mutex via the
+				// accessor; the field is mutated by
+				// StartConfirmationWatcher / Stop on a different goroutine.
+				if w := n.ConfirmationWatcherRef(); w != nil {
+					w.Track(l2Block.NumberU64(), result.TxID)
 				}
 			}
 		}

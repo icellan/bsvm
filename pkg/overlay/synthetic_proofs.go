@@ -79,7 +79,7 @@ func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob 
 	return buf
 }
 
-// syntheticGroth16GenericProof returns a Groth16GenericProof for Mode 2. The
+// syntheticGroth16Proof returns a Groth16Proof for Mode 2. The
 // BN254 proof points and adjusted public inputs come from the embedded Gate 0b
 // SP1 fixture (applied via covenant.ApplyZeroInputWorkaround), so the produced
 // proof actually satisfies the on-chain pairing check in the Mode 2 rollup
@@ -94,8 +94,8 @@ func buildAdvancePublicValues(preStateRoot, postStateRoot, batchData, proofBlob 
 // proof is valid for every advance. The per-block pre/post state roots and
 // batch hash live behind separate hash256 checks that do not feed into the
 // pairing.
-func syntheticGroth16GenericProof(proverValues, batch, blob []byte) (*covenant.Groth16GenericProof, error) {
-	fixture, err := loadSyntheticGroth16GenericFixture()
+func syntheticGroth16Proof(proverValues, batch, blob []byte) (*covenant.Groth16Proof, error) {
+	fixture, err := loadSyntheticGroth16Fixture()
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func syntheticGroth16GenericProof(proverValues, batch, blob []byte) (*covenant.G
 
 	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID, blockNumber)
 
-	return &covenant.Groth16GenericProof{
+	return &covenant.Groth16Proof{
 		Values:   pv,
 		Batch:    batch,
 		Blob:     blob,
@@ -242,25 +242,25 @@ func loadSyntheticGroth16WAWitness() (*bn254witness.Witness, error) {
 	return syntheticWAWitness, syntheticWAWitnessErr
 }
 
-// syntheticGroth16GenericFixture caches the Mode 2 inputs derived from the
+// syntheticGroth16Fixture caches the Mode 2 inputs derived from the
 // embedded Gate 0b SP1 fixture: the decomposed BN254 proof and the adjusted
 // public input vector produced by covenant.ApplyZeroInputWorkaround.
 //
 // The VK is not cached here because the deploy helper in test/integration
 // loads it independently (both sides must agree on the IC0 adjustment for
 // the on-chain MSM to recover the correct prepared_inputs).
-type syntheticGroth16GenericFixture struct {
+type syntheticGroth16Fixture struct {
 	proof          bn254witness.Proof
 	adjustedInputs covenant.Mode2AdjustedPublicInputs
 }
 
 var (
-	syntheticGenericFixtureOnce sync.Once
-	syntheticGenericFixture     *syntheticGroth16GenericFixture
-	syntheticGenericFixtureErr  error
+	syntheticGroth16FixtureOnce sync.Once
+	syntheticGroth16FixtureVal  *syntheticGroth16Fixture
+	syntheticGroth16FixtureErr  error
 )
 
-// loadSyntheticGroth16GenericFixture loads (once) the embedded Gate 0b SP1
+// loadSyntheticGroth16Fixture loads (once) the embedded Gate 0b SP1
 // fixture in the form the Mode 2 synthetic proof needs: the decomposed
 // BN254 proof (A, B, C as *big.Int coordinates) and the adjusted public
 // input vector (zeros replaced with 1 to sidestep the Rúnar codegen's
@@ -269,28 +269,28 @@ var (
 // The loader reuses the shared on-disk SP1 fixture paths from
 // materialiseSP1Fixtures so Mode 2 and Mode 3 share one temp directory
 // per process.
-func loadSyntheticGroth16GenericFixture() (*syntheticGroth16GenericFixture, error) {
-	syntheticGenericFixtureOnce.Do(func() {
+func loadSyntheticGroth16Fixture() (*syntheticGroth16Fixture, error) {
+	syntheticGroth16FixtureOnce.Do(func() {
 		paths, err := materialiseSP1Fixtures()
 		if err != nil {
-			syntheticGenericFixtureErr = fmt.Errorf("loadSyntheticGroth16GenericFixture: %w", err)
+			syntheticGroth16FixtureErr = fmt.Errorf("loadSyntheticGroth16Fixture: %w", err)
 			return
 		}
 
 		proof, err := bn254witness.ParseSP1RawProof(string(embeddedSP1Groth16RawProof))
 		if err != nil {
-			syntheticGenericFixtureErr = fmt.Errorf("loadSyntheticGroth16GenericFixture: proof: %w", err)
+			syntheticGroth16FixtureErr = fmt.Errorf("loadSyntheticGroth16Fixture: proof: %w", err)
 			return
 		}
 
 		rawInputs, err := bn254witness.LoadSP1PublicInputs(paths.pubPath)
 		if err != nil {
-			syntheticGenericFixtureErr = fmt.Errorf("loadSyntheticGroth16GenericFixture: public inputs: %w", err)
+			syntheticGroth16FixtureErr = fmt.Errorf("loadSyntheticGroth16Fixture: public inputs: %w", err)
 			return
 		}
 		if len(rawInputs) != covenant.Mode2PublicInputCount {
-			syntheticGenericFixtureErr = fmt.Errorf(
-				"loadSyntheticGroth16GenericFixture: expected %d SP1 public inputs, got %d",
+			syntheticGroth16FixtureErr = fmt.Errorf(
+				"loadSyntheticGroth16Fixture: expected %d SP1 public inputs, got %d",
 				covenant.Mode2PublicInputCount, len(rawInputs),
 			)
 			return
@@ -298,24 +298,24 @@ func loadSyntheticGroth16GenericFixture() (*syntheticGroth16GenericFixture, erro
 
 		rawVK, err := covenant.LoadSP1Groth16VK(paths.vkPath)
 		if err != nil {
-			syntheticGenericFixtureErr = fmt.Errorf("loadSyntheticGroth16GenericFixture: vk: %w", err)
+			syntheticGroth16FixtureErr = fmt.Errorf("loadSyntheticGroth16Fixture: vk: %w", err)
 			return
 		}
 		_, adjInputs, err := covenant.ApplyZeroInputWorkaround(rawVK, rawInputs)
 		if err != nil {
-			syntheticGenericFixtureErr = fmt.Errorf("loadSyntheticGroth16GenericFixture: workaround: %w", err)
+			syntheticGroth16FixtureErr = fmt.Errorf("loadSyntheticGroth16Fixture: workaround: %w", err)
 			return
 		}
 
-		syntheticGenericFixture = &syntheticGroth16GenericFixture{
+		syntheticGroth16FixtureVal = &syntheticGroth16Fixture{
 			proof:          proof,
 			adjustedInputs: adjInputs,
 		}
 	})
-	return syntheticGenericFixture, syntheticGenericFixtureErr
+	return syntheticGroth16FixtureVal, syntheticGroth16FixtureErr
 }
 
-// syntheticGroth16WAProof returns a Groth16WitnessProof for Mode 3. The
+// syntheticGroth16WAProof returns a Groth16WAProof for Mode 3. The
 // publicValues blob is rebuilt in the Mode 3 contract's expected layout
 // (same as Basefold), and the witness is the cached real Gate 0b witness
 // bundle. The caller MUST have already ensured the overlay is wired up
@@ -324,7 +324,7 @@ func loadSyntheticGroth16GenericFixture() (*syntheticGroth16GenericFixture, erro
 // In the mock prover path the preStateRoot / postStateRoot / chainID /
 // blockNumber are read from the prover's 280-byte PublicValues blob at
 // the SP1 layout offsets and re-serialized in the on-chain layout.
-func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth16WitnessProof, error) {
+func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth16WAProof, error) {
 	witness, err := loadSyntheticGroth16WAWitness()
 	if err != nil {
 		return nil, err
@@ -343,7 +343,7 @@ func syntheticGroth16WAProof(proverValues, batch, blob []byte) (*covenant.Groth1
 
 	pv := buildAdvancePublicValues(preRoot[:], postRoot[:], batch, blob, chainID, blockNumber)
 
-	return &covenant.Groth16WitnessProof{
+	return &covenant.Groth16WAProof{
 		Values:  pv,
 		Batch:   batch,
 		Blob:    blob,
@@ -361,9 +361,9 @@ func BuildAdvanceProofForOutput(
 	switch out.Mode {
 	case prover.ProofModeFRI:
 		return syntheticFRIProof(out.PublicValues, batch, out.Proof), nil
-	case prover.ProofModeGroth16Generic:
-		return syntheticGroth16GenericProof(out.PublicValues, batch, out.Proof)
-	case prover.ProofModeGroth16Witness:
+	case prover.ProofModeGroth16:
+		return syntheticGroth16Proof(out.PublicValues, batch, out.Proof)
+	case prover.ProofModeGroth16WA:
 		return syntheticGroth16WAProof(out.PublicValues, batch, out.Proof)
 	default:
 		return nil, unknownProofModeError(out.Mode)

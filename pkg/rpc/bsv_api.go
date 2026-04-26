@@ -55,6 +55,16 @@ type feeWalletAccessor interface {
 	Address() string
 }
 
+// feeWalletFloatReporter is an optional extension implemented by fee
+// wallets that track a minimum-float threshold. When the configured
+// fee wallet satisfies this interface, FeeWalletBalance enriches its
+// JSON response with floatOk / minFloat fields per spec 10. The base
+// feeWalletAccessor stays back-compat for the existing overlay
+// FeeWallet wiring; the new pkg/covenant.FeeWallet adds this seam.
+type feeWalletFloatReporter interface {
+	FloatHealth() (ok bool, balance, minFloat uint64)
+}
+
 // PeerSource exposes the list of currently connected network peers for
 // rendering via bsv_getPeers. The network layer's PeerManager satisfies
 // this via Snapshot(); keeping it as an interface lets BsvAPI stay free
@@ -179,6 +189,11 @@ func (api *BsvAPI) GetConfirmationStatus(blockNum uint64) map[string]interface{}
 
 // FeeWalletBalance returns the fee wallet balance in satoshis and the P2PKH
 // address. The response matches the spec 05 FeeWalletBalanceResult.
+// When the underlying fee wallet exposes a minimum-float threshold
+// (pkg/covenant.FeeWallet), the response also includes floatOk,
+// minFloat, utxoCount, and starved fields per spec 10 §"Fee Wallet
+// Bootstrap and Float Management".
+//
 // This implements bsv_feeWalletBalance.
 func (api *BsvAPI) FeeWalletBalance() map[string]interface{} {
 	if api.feeWallet == nil {
@@ -188,10 +203,19 @@ func (api *BsvAPI) FeeWalletBalance() map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
-		"balance": EncodeUint64(api.feeWallet.Balance()),
-		"address": api.feeWallet.Address(),
+	resp := map[string]interface{}{
+		"balance":   EncodeUint64(api.feeWallet.Balance()),
+		"address":   api.feeWallet.Address(),
+		"utxoCount": EncodeUint64(uint64(api.feeWallet.UTXOCount())),
+		"starved":   api.feeWallet.IsStarved(),
 	}
+	if reporter, ok := api.feeWallet.(feeWalletFloatReporter); ok {
+		floatOk, balance, minFloat := reporter.FloatHealth()
+		resp["floatOk"] = floatOk
+		resp["balance"] = EncodeUint64(balance)
+		resp["minFloat"] = EncodeUint64(minFloat)
+	}
+	return resp
 }
 
 // GetCovenantTip returns the current covenant UTXO information including

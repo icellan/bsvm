@@ -162,7 +162,7 @@ func (c *RunarBroadcastClient) Mode() ProofMode { return c.mode }
 // BroadcastAdvance dispatches the advanceState call by extracting the
 // mode-specific argument slice from req.Proof.ContractCallArgs. For Mode 3
 // (Groth16 witness-assisted) the BN254 witness bundle is pulled directly
-// from the concrete *Groth16WitnessProof and forwarded to the SDK via
+// from the concrete *Groth16WAProof and forwarded to the SDK via
 // runar.CallOptions.Groth16WAWitness; the witness is NOT marshaled into
 // the positional arg slice.
 func (c *RunarBroadcastClient) BroadcastAdvance(_ context.Context, req BroadcastRequest) (*BroadcastResult, error) {
@@ -184,10 +184,10 @@ func (c *RunarBroadcastClient) BroadcastAdvance(_ context.Context, req Broadcast
 	}
 
 	var callOpts *runar.CallOptions
-	if req.Proof.Mode() == ProofModeGroth16Witness {
-		waProof, ok := req.Proof.(*Groth16WitnessProof)
+	if req.Proof.Mode() == ProofModeGroth16WA {
+		waProof, ok := req.Proof.(*Groth16WAProof)
 		if !ok {
-			return nil, fmt.Errorf("mode %s requires *Groth16WitnessProof, got %T",
+			return nil, fmt.Errorf("mode %s requires *Groth16WAProof, got %T",
 				req.Proof.Mode(), req.Proof)
 		}
 		if waProof.Witness == nil {

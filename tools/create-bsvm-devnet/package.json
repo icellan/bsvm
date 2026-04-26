@@ -1,0 +1,41 @@
+{
+  "name": "create-bsvm-devnet",
+  "version": "0.1.0",
+  "description": "Scaffolds a local BSVM developer devnet — docker-compose, sample contract, and Hardhat config — in seconds. Run with `npx create-bsvm-devnet my-shard`.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "bin": {
+    "create-bsvm-devnet": "bin/create-bsvm-devnet.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "templates/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "bsvm",
+    "bsv",
+    "devnet",
+    "hardhat",
+    "ethereum",
+    "scaffold"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/prompts": "^2.4.9",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

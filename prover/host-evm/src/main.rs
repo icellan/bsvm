@@ -34,11 +34,20 @@ struct Transfer {
     gas_price: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct Withdrawal {
+    recipient: [u8; 20],
+    amount: u64,
+    nonce: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct BatchInput {
     accounts: Vec<Account>,
     transfer: Transfer,
     chain_id: u64,
+    #[serde(default)]
+    withdrawals: Vec<Withdrawal>,
 }
 
 #[tokio::main]
@@ -86,6 +95,7 @@ async fn main() {
         accounts: accounts.clone(),
         transfer: transfer.clone(),
         chain_id,
+        withdrawals: Vec::new(),
     };
 
     // -- 2. Compute expected values on the host side ---
@@ -144,7 +154,7 @@ async fn main() {
     println!("Public values size:  {} bytes", pv.len());
 
     // Verify public values layout
-    assert_eq!(pv.len(), 112, "public values must be exactly 112 bytes");
+    assert_eq!(pv.len(), 144, "public values must be exactly 144 bytes");
     verify_public_values(
         pv,
         &expected_pre_root,
@@ -153,7 +163,7 @@ async fn main() {
         &expected_batch_hash,
         chain_id,
     );
-    println!("Public values layout verified (112 bytes, spec 12 format)");
+    println!("Public values layout verified (144 bytes, Gate 0b stub format)");
 
     // -- 5. Set up keys ---
     let pk = client.setup(GUEST_ELF.clone()).await.expect("setup failed");
@@ -304,6 +314,10 @@ async fn main() {
         "    chainId:            {}",
         hex::encode(&pv_bytes[104..112])
     );
+    println!(
+        "    withdrawalRoot:     {}",
+        hex::encode(&pv_bytes[112..144])
+    );
     println!("================================================================");
 
     // -- 10. Gate 0b threshold evaluation ---
@@ -360,7 +374,7 @@ Generated: (run timestamp in program output)
 | Verification time | {:?} |
 | Proof size | {} bytes ({:.1} KB) |
 
-## Public Values (112 bytes)
+## Public Values (144 bytes, Gate 0b stub layout)
 
 | Offset | Size | Field | Value |
 |--------|------|-------|-------|
@@ -369,6 +383,7 @@ Generated: (run timestamp in program output)
 | 64 | 8 | gasUsed | `{}` (= {}) |
 | 72 | 32 | batchDataHash | `{}` |
 | 104 | 8 | chainId | `{}` (= {}) |
+| 112 | 32 | withdrawalRoot | `{}` |
 
 ## Artifacts
 
@@ -423,6 +438,7 @@ Generated: (run timestamp in program output)
         hex::encode(&pv_bytes[72..104]),
         hex::encode(&pv_bytes[104..112]),
         u64::from_be_bytes(pv_bytes[104..112].try_into().unwrap()),
+        hex::encode(&pv_bytes[112..144]),
         // Artifacts
         core_bytes.len(),
         core_bytes.len() as f64 / 1024.0,
@@ -512,4 +528,7 @@ fn verify_public_values(
     // [104..112] chainId (big-endian u64)
     let chain_id = u64::from_be_bytes(pv[104..112].try_into().unwrap());
     assert_eq!(chain_id, expected_chain_id, "chainId mismatch");
+    // [112..144] withdrawalRoot — empty list ⇒ all-zeros
+    let zero_root = [0u8; 32];
+    assert_eq!(&pv[112..144], &zero_root, "withdrawalRoot mismatch (expected all-zeros for empty withdrawal list)");
 }

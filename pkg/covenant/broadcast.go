@@ -22,9 +22,9 @@ type ProofMode = proofmode.ProofMode
 
 // Re-exported ProofMode constants.
 const (
-	ProofModeFRI            = proofmode.FRI
-	ProofModeGroth16Generic = proofmode.Groth16Generic
-	ProofModeGroth16Witness = proofmode.Groth16Witness
+	ProofModeFRI       = proofmode.FRI
+	ProofModeGroth16   = proofmode.Groth16
+	ProofModeGroth16WA = proofmode.Groth16WA
 )
 
 // BroadcastClient broadcasts covenant advance transactions to the BSV
@@ -124,10 +124,10 @@ func (p *FRIProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error)
 	}, nil
 }
 
-// Groth16GenericProof carries the proof data for ProofModeGroth16Generic.
+// Groth16Proof carries the proof data for ProofModeGroth16.
 // Its ContractCallArgs method produces the 16-arg slice expected by
 // contracts.Groth16RollupContract.AdvanceState.
-type Groth16GenericProof struct {
+type Groth16Proof struct {
 	// SP1 envelope.
 	Values []byte
 	Batch  []byte
@@ -154,17 +154,17 @@ type Groth16GenericProof struct {
 	PublicInputs [5]*big.Int
 }
 
-// Mode returns ProofModeGroth16Generic.
-func (p *Groth16GenericProof) Mode() ProofMode { return ProofModeGroth16Generic }
+// Mode returns ProofModeGroth16.
+func (p *Groth16Proof) Mode() ProofMode { return ProofModeGroth16 }
 
 // BatchData returns the canonical batch encoding.
-func (p *Groth16GenericProof) BatchData() []byte { return p.Batch }
+func (p *Groth16Proof) BatchData() []byte { return p.Batch }
 
 // PublicValues returns the raw SP1 public values blob.
-func (p *Groth16GenericProof) PublicValues() []byte { return p.Values }
+func (p *Groth16Proof) PublicValues() []byte { return p.Values }
 
 // ProofBlob returns the raw SP1 proof bytes.
-func (p *Groth16GenericProof) ProofBlob() []byte { return p.Blob }
+func (p *Groth16Proof) ProofBlob() []byte { return p.Blob }
 
 // ContractCallArgs returns the argument slice for
 // Groth16RollupContract.AdvanceState in the order:
@@ -184,9 +184,9 @@ func (p *Groth16GenericProof) ProofBlob() []byte { return p.Blob }
 //
 // Nil scalar / coordinate pointers are rejected as errors; zero values
 // are permitted and encoded as OP_0.
-func (p *Groth16GenericProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
+func (p *Groth16Proof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
 	if p == nil {
-		return nil, errors.New("nil groth16 generic proof")
+		return nil, errors.New("nil groth16 proof")
 	}
 
 	newStateRootHex := hex.EncodeToString(req.NewState.StateRoot[:])
@@ -261,7 +261,7 @@ func (p *Groth16GenericProof) ContractCallArgs(req BroadcastRequest) ([]interfac
 	}, nil
 }
 
-// Groth16WitnessProof carries the proof data for ProofModeGroth16Witness
+// Groth16WAProof carries the proof data for ProofModeGroth16WA
 // (Mode 3, witness-assisted Groth16). Its ContractCallArgs method produces
 // the 5-arg slice expected by contracts.Groth16WARollupContract.AdvanceState.
 //
@@ -269,8 +269,8 @@ func (p *Groth16GenericProof) ContractCallArgs(req BroadcastRequest) ([]interfac
 // onto the stack ON TOP of the regular ABI argument pushes (via
 // runar.CallOptions.Groth16WAWitness). It is NOT included in
 // ContractCallArgs — the RunarBroadcastClient reads it directly from the
-// concrete *Groth16WitnessProof pointer and forwards it to the SDK.
-type Groth16WitnessProof struct {
+// concrete *Groth16WAProof pointer and forwards it to the SDK.
+type Groth16WAProof struct {
 	// SP1 envelope.
 	Values []byte
 	Batch  []byte
@@ -284,17 +284,17 @@ type Groth16WitnessProof struct {
 	Witness *bn254witness.Witness
 }
 
-// Mode returns ProofModeGroth16Witness.
-func (p *Groth16WitnessProof) Mode() ProofMode { return ProofModeGroth16Witness }
+// Mode returns ProofModeGroth16WA.
+func (p *Groth16WAProof) Mode() ProofMode { return ProofModeGroth16WA }
 
 // BatchData returns the canonical batch encoding.
-func (p *Groth16WitnessProof) BatchData() []byte { return p.Batch }
+func (p *Groth16WAProof) BatchData() []byte { return p.Batch }
 
 // PublicValues returns the raw SP1 public values blob.
-func (p *Groth16WitnessProof) PublicValues() []byte { return p.Values }
+func (p *Groth16WAProof) PublicValues() []byte { return p.Values }
 
 // ProofBlob returns the raw SP1 proof bytes.
-func (p *Groth16WitnessProof) ProofBlob() []byte { return p.Blob }
+func (p *Groth16WAProof) ProofBlob() []byte { return p.Blob }
 
 // ContractCallArgs returns the argument slice for
 // Groth16WARollupContract.AdvanceState in the order:
@@ -302,11 +302,11 @@ func (p *Groth16WitnessProof) ProofBlob() []byte { return p.Blob }
 //	newStateRoot, newBlockNumber, publicValues, batchData, proofBlob.
 //
 // The witness bundle is NOT marshaled here — the RunarBroadcastClient
-// reads it from the concrete *Groth16WitnessProof and passes it via
+// reads it from the concrete *Groth16WAProof and passes it via
 // runar.CallOptions.Groth16WAWitness when invoking the contract.
-func (p *Groth16WitnessProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
+func (p *Groth16WAProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
 	if p == nil {
-		return nil, errors.New("nil groth16 witness proof")
+		return nil, errors.New("nil groth16-wa proof")
 	}
 	newStateRootHex := hex.EncodeToString(req.NewState.StateRoot[:])
 	publicValuesHex := hex.EncodeToString(p.Values)

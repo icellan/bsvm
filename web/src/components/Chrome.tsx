@@ -1,9 +1,10 @@
-import { FormEvent, ReactElement, useState } from "react";
-import { Link, NavLink, useNavigate } from "react-router-dom";
+import { ReactElement } from "react";
+import { Link, NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
 import { bsv, hexToNumber } from "@/rpc/client";
 import Pill from "@/components/ui/Pill";
+import SearchBar from "@/components/SearchBar";
 import { useTheme } from "@/state/theme";
 
 // Chrome is the mission-control top bar: brand + nav + search + right
@@ -21,17 +22,6 @@ export default function Chrome(): ReactElement {
     queryFn: bsv.networkHealth,
     refetchInterval: 2_000,
   });
-
-  const navigate = useNavigate();
-  const [query, setQuery] = useState("");
-
-  function onSearch(e: FormEvent) {
-    e.preventDefault();
-    const t = query.trim();
-    if (!t) return;
-    setQuery("");
-    navigate(`/search?q=${encodeURIComponent(t)}`);
-  }
 
   const { theme, toggle } = useTheme();
 
@@ -99,50 +89,9 @@ export default function Chrome(): ReactElement {
           <ChromeLink to="/admin" label="Admin" matchPrefix="/admin" />
         </nav>
 
-        <form
-          onSubmit={onSearch}
-          className="ml-auto chrome-search flex items-center gap-2"
-          style={{ minWidth: 0 }}
-        >
-          <div
-            className="flex items-center gap-2"
-            style={{
-              background: "var(--ts-bg-2)",
-              border: "1px solid var(--ts-line-2)",
-              borderRadius: 4,
-              padding: "4px 8px",
-              minWidth: 280,
-            }}
-          >
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="block · tx · address"
-              className="mono"
-              style={{
-                background: "transparent",
-                border: "none",
-                outline: "none",
-                color: "var(--ts-text)",
-                fontSize: 11,
-                flex: 1,
-                minWidth: 0,
-              }}
-            />
-            <kbd
-              className="mono"
-              style={{
-                fontSize: 10,
-                padding: "1px 5px",
-                color: "var(--ts-text-3)",
-                border: "1px solid var(--ts-line-2)",
-                borderRadius: 3,
-              }}
-            >
-              /
-            </kbd>
-          </div>
-        </form>
+        <div className="ml-auto chrome-search" style={{ minWidth: 0 }}>
+          <SearchBar variant="compact" />
+        </div>
 
         <div className="chrome-pills flex items-center gap-2">
           <Pill tone="neutral">

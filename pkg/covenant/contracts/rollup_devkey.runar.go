@@ -99,6 +99,7 @@ func (c *DevKeyRollupContract) AdvanceState(
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
+	pvWithdrawalRoot := runar.Substr(publicValues, 144, 32)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
 	runar.Assert(pvPreStateRoot == c.StateRoot)
@@ -107,10 +108,12 @@ func (c *DevKeyRollupContract) AdvanceState(
 
 	// Spec-12 OP_RETURN data-availability output. Identical to the FRI and
 	// Groth16 contracts so external observers can parse the batchData
-	// without needing to branch on proof mode.
+	// without needing to branch on proof mode. The 32-byte withdrawalRoot
+	// prefix (pv[144..176)) lets the bridge covenant read it via cross-
+	// covenant output reference (spec 13 §C).
 	opReturnHdr := runar.ByteString("\x00\x6a\x4e")
 	bsvmMagic := runar.ByteString("BSVM\x02")
-	payload := runar.Cat(bsvmMagic, batchData)
+	payload := runar.Cat(runar.Cat(bsvmMagic, pvWithdrawalRoot), batchData)
 	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
 	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
 	c.AddDataOutput(0, opReturnScript)

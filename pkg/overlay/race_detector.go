@@ -132,7 +132,10 @@ func (rd *RaceDetector) BackoffDuration() time.Duration {
 // rd.mu held.
 func (rd *RaceDetector) backoffDuration() time.Duration {
 	if rd.consecutiveLosses == 0 {
-		return 0
+		// Spec 11: jitter from the start. Even the first advance attempt
+		// must sleep a random 50-200ms so simultaneously-tipped nodes
+		// don't all fire at the same instant.
+		return 50*time.Millisecond + time.Duration(rand.Int64N(int64(150*time.Millisecond)))
 	}
 
 	// Exponential backoff: baseBackoff * 2^consecutiveLosses

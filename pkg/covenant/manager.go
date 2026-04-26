@@ -34,6 +34,8 @@ type CovenantManager struct {
 	governance      GovernanceConfig
 	persister       CovenantPersister
 	broadcastClient BroadcastClient
+	feeWallet       *FeeWallet
+	stateChangeCB   func(prev, curr CovenantState)
 }
 
 // NewCovenantManager creates a new covenant manager with the given compiled
@@ -103,6 +105,34 @@ func (cm *CovenantManager) SetPersister(p CovenantPersister) {
 	cm.persister = p
 }
 
+// FeeWallet returns the fee wallet attached to this manager, or nil if
+// none has been configured. The covenant manager does not use the fee
+// wallet directly — it is held here so the overlay node and RPC layer
+// can reach it through a single, stable handle without each layer
+// owning its own pointer.
+func (cm *CovenantManager) FeeWallet() *FeeWallet {
+	return cm.feeWallet
+}
+
+// SetFeeWallet attaches (or replaces) the fee wallet. The wallet has no
+// authority over the covenant — it only funds the BSV miner fee on
+// covenant-advance transactions. Passing nil clears the wallet.
+func (cm *CovenantManager) SetFeeWallet(fw *FeeWallet) {
+	cm.feeWallet = fw
+}
+
+// SetStateChangeCallback registers a callback invoked after each
+// successful ApplyAdvance with the previous and current covenant
+// state. The overlay node uses this to detect Frozen-flag transitions
+// and pause/unpause the batcher. Passing nil clears the callback.
+//
+// The callback runs synchronously inside ApplyAdvance and must not
+// block the broadcast path. Callers that need to do non-trivial work
+// should hand off to a goroutine.
+func (cm *CovenantManager) SetStateChangeCallback(cb func(prev, curr CovenantState)) {
+	cm.stateChangeCB = cb
+}
+
 // LoadPersistedState loads covenant state from the persister. Returns true if
 // persisted state was found and loaded, false if no persisted state exists.
 // This should be called on startup to restore state from a previous session.
@@ -161,7 +191,12 @@ func (cm *CovenantManager) ValidateAdvanceData(
 // This should be called after the BSV transaction has been broadcast and confirmed.
 // The newTxID is the transaction ID of the advance transaction.
 // If a persister is set, the state and txid are persisted to disk.
+//
+// After persistence, any registered state-change callback is invoked
+// with the previous and new state so observers (e.g. the overlay's
+// governance monitor) can react to Frozen-flag transitions.
 func (cm *CovenantManager) ApplyAdvance(newTxID types.Hash, newState CovenantState) error {
+	prevState := cm.currentState
 	cm.currentTxID = newTxID
 	cm.currentVout = 0 // Covenant output is always at index 0
 	cm.currentState = newState
@@ -173,6 +208,9 @@ func (cm *CovenantManager) ApplyAdvance(newTxID types.Hash, newState CovenantSta
 		if err := cm.persister.WriteCovenantTxID(newTxID); err != nil {
 			return fmt.Errorf("persisting covenant txid: %w", err)
 		}
+	}
+	if cm.stateChangeCB != nil {
+		cm.stateChangeCB(prevState, newState)
 	}
 	return nil
 }

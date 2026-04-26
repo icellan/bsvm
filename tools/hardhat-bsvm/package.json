@@ -1,0 +1,36 @@
+{
+  "name": "hardhat-bsvm",
+  "version": "0.1.0",
+  "description": "Hardhat plugin for BSVM — Ethereum-compatible L2 on BSV. Adds a `bsvm` network type, helpers for the bsv_* JSON-RPC namespace, and tasks for proving status, bridge deposits/withdrawals, and prover fee wallet.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "commonjs",
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "hardhat",
+    "hardhat-plugin",
+    "bsvm",
+    "bsv",
+    "ethereum",
+    "l2"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "hardhat": "^2.22.0",
+    "ethers": "^6.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ethers": "^6.13.0",
+    "hardhat": "^2.22.0",
+    "typescript": "^5.4.0"
+  }
+}

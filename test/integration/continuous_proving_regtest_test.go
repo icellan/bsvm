@@ -227,7 +227,7 @@ func deployFRIRollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.Run
 // produce → prove → broadcast loop against a deployed Groth16WA rollup
 // covenant whose witness-assisted preamble was baked at compile time with
 // the Gate 0b SP1 fixture vk.json. The mock prover's synthetic Mode 3
-// proof path (pkg/overlay/synthetic_proofs.go) produces a Groth16WitnessProof
+// proof path (pkg/overlay/synthetic_proofs.go) produces a Groth16WAProof
 // carrying the cached Gate 0b BN254 witness, which the RunarBroadcastClient
 // threads through runar.CallOptions.Groth16WAWitness on every advance.
 func TestContinuousProvingLoop_Groth16WA_Regtest(t *testing.T) {
@@ -235,7 +235,7 @@ func TestContinuousProvingLoop_Groth16WA_Regtest(t *testing.T) {
 		ChainID:      chainID,
 		TxKeySeed:    11,
 		CoinbaseSeed: 12,
-		ProofMode:    covenant.ProofModeGroth16Witness,
+		ProofMode:    covenant.ProofModeGroth16WA,
 	}
 	genesisStateRoot, err := regtestharness.ComputeGenesisStateRoot(harnessCfg)
 	if err != nil {
@@ -395,13 +395,13 @@ func deployGroth16WARollupWithStateRoot(t *testing.T, stateRootHex string) (*run
 	return contract, provider, signer, wallet
 }
 
-// TestContinuousProvingLoop_Groth16Generic_Regtest is the Mode 2 variant of
+// TestContinuousProvingLoop_Groth16_Regtest is the Mode 2 variant of
 // TestContinuousProvingLoop_Basefold_Regtest. It drives the overlay's full
 // produce → prove → broadcast loop against a deployed Mode 2 Groth16 rollup
 // covenant (generic BN254 pairing, no witness-assisted preamble) whose VK is
 // baked at compile time with the Gate 0b SP1 fixture. The mock prover's
 // synthetic Mode 2 proof path (pkg/overlay/synthetic_proofs.go) produces a
-// Groth16GenericProof carrying the Gate 0b fixture's BN254 proof points and
+// Groth16Proof carrying the Gate 0b fixture's BN254 proof points and
 // adjusted public inputs, so the on-chain Bn254MultiPairing4 check passes on
 // every advance.
 //
@@ -411,12 +411,12 @@ func deployGroth16WARollupWithStateRoot(t *testing.T, stateRootHex string) (*run
 // Per-advance TX size is ~18.5 MB and per-advance time is ~5 seconds, so
 // this test uses only 2 batches (vs 3 for Modes 1 / 3) to keep total
 // wall-clock under ~25 seconds.
-func TestContinuousProvingLoop_Groth16Generic_Regtest(t *testing.T) {
+func TestContinuousProvingLoop_Groth16_Regtest(t *testing.T) {
 	harnessCfg := regtestharness.Config{
 		ChainID:      chainID,
 		TxKeySeed:    13,
 		CoinbaseSeed: 14,
-		ProofMode:    covenant.ProofModeGroth16Generic,
+		ProofMode:    covenant.ProofModeGroth16,
 	}
 	genesisStateRoot, err := regtestharness.ComputeGenesisStateRoot(harnessCfg)
 	if err != nil {
@@ -536,12 +536,12 @@ func TestContinuousProvingLoop_Groth16Generic_Regtest(t *testing.T) {
 // The VK conversion from SP1's fixture format (β/γ/δ pre-negated) to Mode
 // 2's on-chain convention (β pre-negated, γ/δ positive) and the zero-input
 // workaround adjustment (IC0 replaced to compensate for zero public inputs)
-// are both applied by loadGate0Groth16Generic, which is defined in
+// are both applied by loadGate0Groth16, which is defined in
 // rollup_groth16_test.go in the same package.
 func deployGroth16RollupWithStateRoot(t *testing.T, stateRootHex string) (*runar.RunarContract, runar.Provider, runar.Signer, *helpers.Wallet) {
 	t.Helper()
 
-	vk, _, _ := loadGate0Groth16Generic(t)
+	vk, _, _ := loadGate0Groth16(t)
 
 	artifact, err := compileContract(groth16RollupContractPath)
 	if err != nil {

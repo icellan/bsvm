@@ -3,6 +3,14 @@
 // talking directly to a bitcoind-compatible JSON-RPC endpoint (SV Node,
 // Teranode, or any node exposing the classic JSON-RPC 1.0 surface).
 //
+// DEPRECATED: per spec 17, RPCProvider's role as the primary BSV
+// transport is superseded by the spec-17 networking stack
+// (pkg/arc + pkg/chaintracks + pkg/whatsonchain composed into
+// pkg/bsvclient.NetworkClient). RPCProvider remains supported as the
+// optional BSV-node backup path for operators who run their own BSV
+// full node, and as the regtest harness fast-path. New broadcast and
+// chain-observation call sites should use NetworkClient instead.
+//
 // This is NOT the same as runar/integration/go/helpers. That helpers
 // package is a test-only mirror that lives in a separate Go module, uses
 // process-global mutable state (env-driven URL, user, password) and

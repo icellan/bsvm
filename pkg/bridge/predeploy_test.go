@@ -389,3 +389,29 @@ func TestSortDeposits_Single(t *testing.T) {
 		t.Errorf("single deposit amount changed: got %d", deposits[0].SatoshiAmount)
 	}
 }
+
+// --- Feature 4: L2 Withdraw Predeploy Selector ---
+
+// TestL2WithdrawPredeployBytecode keeps the bytecode predicates the dispatch
+// fast-path relies on. The actual selector matching lives in
+// pkg/block.IsWithdrawDispatch (tested there); this test only guarantees
+// the predeploy still ships with the success-stub code so the EVM does not
+// revert before the fast-path can intercept the call.
+func TestL2WithdrawPredeployBytecode(t *testing.T) {
+	statedb := newTestStateDB(t)
+	DeployBridgePredeploy(statedb)
+
+	code := statedb.GetCode(types.BridgeContractAddress)
+	if len(code) == 0 {
+		t.Fatal("predeploy must ship with non-empty bytecode so EVM call succeeds before the fast-path dispatch")
+	}
+	// The stub bytecode is a deliberate constant — `0x60 01 60 00 52 60 20
+	// 60 00 f3` (returns 32 bytes of 0x01). Pin the prefix so accidental
+	// edits force a deliberate update of the dispatch fast-path tests.
+	wantPrefix := []byte{0x60, 0x01, 0x60, 0x00, 0x52}
+	for i, b := range wantPrefix {
+		if code[i] != b {
+			t.Fatalf("predeploy bytecode prefix mismatch at byte %d: got 0x%02x, want 0x%02x", i, code[i], b)
+		}
+	}
+}

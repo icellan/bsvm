@@ -222,7 +222,7 @@ func buildGroth16UpgradeArgs(c *Groth16RollupContract, newScript runar.ByteStrin
 func callGroth16UpgradeSingleKey(c *Groth16RollupContract, sig runar.Sig, newScript runar.ByteString) {
 	args := buildGroth16UpgradeArgs(c, newScript)
 	c.UpgradeSingleKey(
-		sig, newScript,
+		sig, newScript, fakeAnfHash(newScript),
 		args.publicValues, args.batchData, args.proofBlob,
 		args.proofA, args.proofBX0, args.proofBX1, args.proofBY0, args.proofBY1, args.proofC,
 		args.g16Input0, args.g16Input1, args.g16Input2, args.g16Input3, args.g16Input4,
@@ -235,7 +235,7 @@ func callGroth16UpgradeSingleKey(c *Groth16RollupContract, sig runar.Sig, newScr
 func callGroth16UpgradeMultiSig2(c *Groth16RollupContract, sig1, sig2 runar.Sig, newScript runar.ByteString) {
 	args := buildGroth16UpgradeArgs(c, newScript)
 	c.UpgradeMultiSig2(
-		sig1, sig2, newScript,
+		sig1, sig2, newScript, fakeAnfHash(newScript),
 		args.publicValues, args.batchData, args.proofBlob,
 		args.proofA, args.proofBX0, args.proofBX1, args.proofBY0, args.proofBY1, args.proofC,
 		args.g16Input0, args.g16Input1, args.g16Input2, args.g16Input3, args.g16Input4,

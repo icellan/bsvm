@@ -70,6 +70,24 @@ func TestCovenantStateSerialization(t *testing.T) {
 				Frozen:      0,
 			},
 		},
+		{
+			name: "advances since inbox at threshold",
+			state: CovenantState{
+				StateRoot:          testStateRoot(7),
+				BlockNumber:        7,
+				Frozen:             0,
+				AdvancesSinceInbox: 9,
+			},
+		},
+		{
+			name: "advances since inbox max",
+			state: CovenantState{
+				StateRoot:          testStateRoot(8),
+				BlockNumber:        8,
+				Frozen:             0,
+				AdvancesSinceInbox: 255,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -92,6 +110,10 @@ func TestCovenantStateSerialization(t *testing.T) {
 			}
 			if decoded.Frozen != tt.state.Frozen {
 				t.Errorf("frozen mismatch: got %d, want %d", decoded.Frozen, tt.state.Frozen)
+			}
+			if decoded.AdvancesSinceInbox != tt.state.AdvancesSinceInbox {
+				t.Errorf("advances since inbox mismatch: got %d, want %d",
+					decoded.AdvancesSinceInbox, tt.state.AdvancesSinceInbox)
 			}
 		})
 	}
@@ -122,6 +144,10 @@ func TestCovenantStateDecodeErrors(t *testing.T) {
 				b[40] = 2 // invalid frozen value
 				return b
 			}(),
+		},
+		{
+			name: "old v1 size (41 bytes)",
+			data: make([]byte, 41), // pre-AdvancesSinceInbox layout — must be rejected
 		},
 	}
 

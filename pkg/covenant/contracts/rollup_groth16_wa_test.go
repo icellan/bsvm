@@ -301,7 +301,7 @@ func TestGroth16WARollup_Upgrade(t *testing.T) {
 	sig := runar.SignTestMessage(runar.Alice.PrivKey)
 	newScript := runar.ByteString("new_script")
 	migHash := runar.ByteString(rawHash256(string(newScript)))
-	c.UpgradeSingleKey(sig, newScript, migHash, 1)
+	c.UpgradeSingleKey(sig, newScript, migHash, fakeAnfHash(newScript), 1)
 	if c.Frozen != 0 {
 		t.Errorf("expected frozen=0 after upgrade, got %d", c.Frozen)
 	}
@@ -320,7 +320,7 @@ func TestGroth16WARollup_UpgradeRejectsNotFrozen(t *testing.T) {
 	sig := runar.SignTestMessage(runar.Alice.PrivKey)
 	newScript := runar.ByteString("new_script")
 	migHash := runar.ByteString(rawHash256(string(newScript)))
-	c.UpgradeSingleKey(sig, newScript, migHash, 1)
+	c.UpgradeSingleKey(sig, newScript, migHash, fakeAnfHash(newScript), 1)
 }
 
 // ---------------------------------------------------------------------------

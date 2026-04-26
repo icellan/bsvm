@@ -194,12 +194,19 @@ func buildFRIUpgradeArgs(c *FRIRollupContract, newScript runar.ByteString) friAd
 	return args
 }
 
+// fakeAnfHash returns a deterministic 32-byte fake ANF hash for tests.
+// Production code derives this as hash256 of the published ANF JSON; tests
+// only need a stable 32-byte blob bound to the new script identity.
+func fakeAnfHash(newScript runar.ByteString) runar.ByteString {
+	return runar.ByteString(rawSha256("anf:" + string(newScript)))
+}
+
 // callFRIUpgradeSingleKey invokes UpgradeSingleKey with a freshly built
 // args bundle.
 func callFRIUpgradeSingleKey(c *FRIRollupContract, sig runar.Sig, newScript runar.ByteString) {
 	args := buildFRIUpgradeArgs(c, newScript)
 	c.UpgradeSingleKey(
-		sig, newScript,
+		sig, newScript, fakeAnfHash(newScript),
 		args.publicValues, args.batchData, args.proofBlob,
 		args.newBlockNum,
 	)
@@ -209,7 +216,7 @@ func callFRIUpgradeSingleKey(c *FRIRollupContract, sig runar.Sig, newScript runa
 func callFRIUpgradeMultiSig2(c *FRIRollupContract, sig1, sig2 runar.Sig, newScript runar.ByteString) {
 	args := buildFRIUpgradeArgs(c, newScript)
 	c.UpgradeMultiSig2(
-		sig1, sig2, newScript,
+		sig1, sig2, newScript, fakeAnfHash(newScript),
 		args.publicValues, args.batchData, args.proofBlob,
 		args.newBlockNum,
 	)

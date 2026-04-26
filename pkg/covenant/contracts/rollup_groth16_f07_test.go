@@ -18,11 +18,15 @@ import (
 //
 // Format:
 //
-//	OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4> "BSVM\x02" <batchData>
+//	OP_FALSE OP_RETURN OP_PUSHDATA4 <payload_len_le4>
+//	  "BSVM\x02" || withdrawalRoot(32) || batchData
 //
 // The "BSVM\x02" magic mirrors the "BSVM\x01" genesis prefix in
 // pkg/covenant/genesis.go. Indexers can filter covenant-advance
 // OP_RETURNs from unrelated OP_RETURN traffic by matching the magic.
+// withdrawalRoot is the SP1-committed pv[144..176) — included so the
+// bridge covenant can read it via cross-covenant output reference
+// (spec 13 §C).
 
 const (
 	// Script-level header bytes.
@@ -34,11 +38,35 @@ const (
 // advanceMagic is the BSVM advance OP_RETURN magic ("BSVM\x02").
 var advanceMagic = []byte{'B', 'S', 'V', 'M', 0x02}
 
+// withdrawalRootOpReturnOffset is the byte offset in the emitted
+// OP_RETURN script at which withdrawalRoot starts. Breakdown:
+//
+//	[0..3)  OP_FALSE OP_RETURN OP_PUSHDATA4
+//	[3..7)  4-byte LE payload length
+//	[7..12) "BSVM\x02"
+//	[12..44) withdrawalRoot (32 bytes)
+const withdrawalRootOpReturnOffset = 3 + 4 + 5
+
+// withdrawalRootFromPV returns the 32-byte slot at pv[144..176) — the
+// canonical home of the SP1-committed withdrawalRoot in the spec-12
+// public-values blob.
+func withdrawalRootFromPV(pv string) []byte {
+	if len(pv) < 176 {
+		return make([]byte, 32)
+	}
+	out := make([]byte, 32)
+	copy(out, pv[144:176])
+	return out
+}
+
 // expectedOpReturnScript builds the reference script the contract should
-// emit for a given batchData. Used to compare against the mock-captured
-// DataOutputs entry.
-func expectedOpReturnScript(batchData []byte) []byte {
+// emit for a given (publicValues, batchData) pair. Used to compare
+// against the mock-captured DataOutputs entry.
+func expectedOpReturnScript(publicValues, batchData []byte) []byte {
+	withdrawalRoot := withdrawalRootFromPV(string(publicValues))
+
 	payload := append([]byte{}, advanceMagic...)
+	payload = append(payload, withdrawalRoot...)
 	payload = append(payload, batchData...)
 	lenBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBytes, uint32(len(payload)))
@@ -85,7 +113,7 @@ func TestGroth16Rollup_F07_EmitsSpec12OpReturn(t *testing.T) {
 	callGroth16Advance(c, args)
 
 	got := extractDataOutputScript(t, c.DataOutputs())
-	want := expectedOpReturnScript([]byte(args.batchData))
+	want := expectedOpReturnScript([]byte(args.publicValues), []byte(args.batchData))
 	if string(got) != string(want) {
 		t.Errorf("OP_RETURN script mismatch:\n  got  %x\n  want %x", got, want)
 	}
@@ -114,7 +142,7 @@ func TestGroth16Rollup_F07_MagicPrefix(t *testing.T) {
 }
 
 // TestGroth16Rollup_F07_LengthEncoding pins the OP_PUSHDATA4 length
-// field matches payload size (BSVM\x02 + batchData).
+// field matches payload size (BSVM\x02 + withdrawalRoot + batchData).
 func TestGroth16Rollup_F07_LengthEncoding(t *testing.T) {
 	c := newGroth16Rollup(zeros32(), 0, 0)
 	args := buildGroth16Args(zeros32(), 1)
@@ -122,7 +150,7 @@ func TestGroth16Rollup_F07_LengthEncoding(t *testing.T) {
 
 	script := extractDataOutputScript(t, c.DataOutputs())
 	declaredLen := binary.LittleEndian.Uint32(script[3:7])
-	wantLen := uint32(len(advanceMagic) + len(args.batchData))
+	wantLen := uint32(len(advanceMagic) + 32 + len(args.batchData))
 	if declaredLen != wantLen {
 		t.Errorf("OP_PUSHDATA4 length: got %d, want %d", declaredLen, wantLen)
 	}
@@ -137,7 +165,7 @@ func TestGroth16Rollup_F07_BatchDataRoundTrip(t *testing.T) {
 	callGroth16Advance(c, args)
 
 	script := extractDataOutputScript(t, c.DataOutputs())
-	recovered := script[3+4+len(advanceMagic):]
+	recovered := script[3+4+len(advanceMagic)+32:]
 	if string(recovered) != string(args.batchData) {
 		t.Errorf("batchData not recoverable from OP_RETURN:\n  got  %x\n  want %x",
 			recovered, []byte(args.batchData))
@@ -188,7 +216,7 @@ func TestGroth16WARollup_F07_EmitsSpec12OpReturn(t *testing.T) {
 	callGroth16WAAdvance(c, args)
 
 	got := extractDataOutputScript(t, c.DataOutputs())
-	want := expectedOpReturnScript([]byte(args.batchData))
+	want := expectedOpReturnScript([]byte(args.publicValues), []byte(args.batchData))
 	if string(got) != string(want) {
 		t.Errorf("OP_RETURN script mismatch:\n  got  %x\n  want %x", got, want)
 	}
@@ -216,7 +244,7 @@ func TestGroth16WARollup_F07_MagicPrefix(t *testing.T) {
 }
 
 // TestGroth16WARollup_F07_LengthEncoding pins the OP_PUSHDATA4 length
-// field matches payload size (BSVM\x02 + batchData).
+// field matches payload size (BSVM\x02 + withdrawalRoot + batchData).
 func TestGroth16WARollup_F07_LengthEncoding(t *testing.T) {
 	c := newGroth16WARollup(zeros32(), 0, 0)
 	args := buildGroth16WAArgs(zeros32(), 1)
@@ -224,7 +252,7 @@ func TestGroth16WARollup_F07_LengthEncoding(t *testing.T) {
 
 	script := extractDataOutputScript(t, c.DataOutputs())
 	declaredLen := binary.LittleEndian.Uint32(script[3:7])
-	wantLen := uint32(len(advanceMagic) + len(args.batchData))
+	wantLen := uint32(len(advanceMagic) + 32 + len(args.batchData))
 	if declaredLen != wantLen {
 		t.Errorf("OP_PUSHDATA4 length: got %d, want %d", declaredLen, wantLen)
 	}
@@ -238,7 +266,7 @@ func TestGroth16WARollup_F07_BatchDataRoundTrip(t *testing.T) {
 	callGroth16WAAdvance(c, args)
 
 	script := extractDataOutputScript(t, c.DataOutputs())
-	recovered := script[3+4+len(advanceMagic):]
+	recovered := script[3+4+len(advanceMagic)+32:]
 	if string(recovered) != string(args.batchData) {
 		t.Errorf("batchData not recoverable from OP_RETURN:\n  got  %x\n  want %x",
 			recovered, []byte(args.batchData))

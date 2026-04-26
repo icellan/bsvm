@@ -171,6 +171,21 @@ func (s *SyncManager) OnCovenantAdvance(peerID peer.ID, msg *CovenantAdvanceMsg)
 		"localTip", localTip,
 	)
 
+	// Forward to the race detector so the win/loss accounting and
+	// follower-mode logic see peer-gossiped advances. Peer gossip is
+	// always someone else's advance from this node's perspective; the
+	// BatchData field is empty because the gossip message does not
+	// carry it (the advance can be reconstructed from the BSV tx if
+	// needed for replay).
+	if rd := s.overlay.RaceDetector(); rd != nil {
+		_ = rd.HandleCovenantAdvance(&overlay.CovenantAdvanceEvent{
+			BSVTxID:       msg.BSVTxID,
+			L2BlockNum:    msg.L2BlockNum,
+			PostStateRoot: msg.StateRoot,
+			IsOurs:        false,
+		})
+	}
+
 	if msg.L2BlockNum <= localTip {
 		// Check if the state root matches our local state for this block.
 		header := s.overlay.ChainDB().ReadHeaderByNumber(msg.L2BlockNum)

@@ -3,7 +3,10 @@ package bridge
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/icellan/bsvm/pkg/types"
 )
@@ -438,4 +441,289 @@ func TestBuildWithdrawalClaimTx_FullBalance(t *testing.T) {
 	if result.NewBalance != 0 {
 		t.Errorf("new balance = %d, want 0", result.NewBalance)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Signing-path tests
+// ---------------------------------------------------------------------------
+
+// stubSigner returns a fixed unlock script and records every call so
+// tests can assert what was signed.
+type stubSigner struct {
+	unlockHex string
+	calls     int
+	wantErr   error
+	lastIdx   int
+	lastSats  uint64
+	lastScrpt string
+}
+
+func (s *stubSigner) SignInput(_ string, idx int, prevScript string, prevSats uint64) (string, error) {
+	s.calls++
+	s.lastIdx = idx
+	s.lastSats = prevSats
+	s.lastScrpt = prevScript
+	if s.wantErr != nil {
+		return "", s.wantErr
+	}
+	return s.unlockHex, nil
+}
+
+func TestBuildWithdrawalClaimTx_Signed(t *testing.T) {
+	addr := make([]byte, 20)
+	addr[0] = 0xab
+	signer := &stubSigner{unlockHex: "abcdef"}
+
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000_000,
+		BridgeScript:  []byte{0x76, 0xa9, 0x14},
+		BSVAddress:    addr,
+		SatoshiAmount: 1000,
+		Nonce:         1,
+		CSVDelay:      6,
+		Signer:        signer,
+	}
+	got, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	if signer.calls != 1 {
+		t.Errorf("signer call count = %d, want 1", signer.calls)
+	}
+	if signer.lastIdx != 0 {
+		t.Errorf("signer received input index %d, want 0", signer.lastIdx)
+	}
+	if signer.lastSats != claim.BridgeSats {
+		t.Errorf("signer received satoshis %d, want %d", signer.lastSats, claim.BridgeSats)
+	}
+	if signer.lastScrpt != hex.EncodeToString(claim.BridgeScript) {
+		t.Errorf("signer received script %s, want %s", signer.lastScrpt, hex.EncodeToString(claim.BridgeScript))
+	}
+	wantUnlock, _ := hex.DecodeString(signer.unlockHex)
+	if !bytes.Contains(got.RawTx, wantUnlock) {
+		t.Error("signed raw tx does not contain the unlock script returned by signer")
+	}
+}
+
+func TestBuildWithdrawalClaimTx_SignerError(t *testing.T) {
+	addr := make([]byte, 20)
+	signer := &stubSigner{wantErr: errors.New("boom")}
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000_000,
+		BridgeScript:  []byte{0x76},
+		BSVAddress:    addr,
+		SatoshiAmount: 1000,
+		Signer:        signer,
+	}
+	_, err := BuildWithdrawalClaimTx(claim)
+	if err == nil {
+		t.Fatal("expected signer error to surface, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawer integration tests
+// ---------------------------------------------------------------------------
+
+// flakyBroadcaster fails the first `failures` calls then succeeds.
+type flakyBroadcaster struct {
+	failures int
+	calls    int
+	txid     types.Hash
+}
+
+func (f *flakyBroadcaster) Broadcast(_ []byte) (types.Hash, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return types.Hash{}, errors.New("transient broadcast error")
+	}
+	return f.txid, nil
+}
+
+func TestWithdrawer_BuildsCompleteClaim(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	for i := range bsvAddr {
+		bsvAddr[i] = byte(i + 1)
+	}
+
+	leaf := WithdrawalHash(bsvAddr, 100_000_000, 1)
+	pending := []*PendingWithdrawal{{
+		Nonce:          1,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 100_000_000,
+		L2BlockNum:     10,
+		LeafIndex:      0,
+		BatchHashes:    []types.Hash{leaf},
+		WithdrawalHash: leaf,
+	}}
+	scanner := &mockWithdrawalScanner{withdrawals: pending}
+
+	stateScript := []byte{0x76, 0xa9, 0x14, 0x00, 0x00}
+	opReturn := buildOpReturnWithRoot(leaf)
+	advanceTx := &BSVTransaction{
+		TxID: types.HexToHash("0xbeef"),
+		Outputs: []BSVOutput{
+			{Script: stateScript, Value: 1000},
+			{Script: opReturn, Value: 0},
+		},
+	}
+	finder := &mockAdvanceFinder{tx: advanceTx}
+
+	bridgeUTXO := &BridgeUTXO{
+		TxID:             types.HexToHash("0xaaaa"),
+		Vout:             0,
+		Balance:          1_000_000_000,
+		LastClaimedNonce: 0,
+		Script:           []byte{0x76, 0xa9, 0x14},
+	}
+
+	bcaster := &flakyBroadcaster{txid: types.HexToHash("0xfeed")}
+	signer := &stubSigner{unlockHex: "11"}
+
+	w := NewWithdrawer(bcaster, bridgeUTXO, scanner, finder, DefaultWithdrawalConfig()).
+		WithSigner(signer)
+
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("ProcessFinalizedWithdrawals: %v", err)
+	}
+	if signer.calls != 1 {
+		t.Errorf("signer called %d times, want 1", signer.calls)
+	}
+	if bcaster.calls != 1 {
+		t.Errorf("broadcaster called %d times, want 1", bcaster.calls)
+	}
+	if bridgeUTXO.LastClaimedNonce != 1 {
+		t.Errorf("LastClaimedNonce = %d, want 1", bridgeUTXO.LastClaimedNonce)
+	}
+}
+
+func TestWithdrawer_RetriesBroadcastFailure(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	pending := []*PendingWithdrawal{{
+		Nonce:          1,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 50_000_000,
+		L2BlockNum:     10,
+		BatchHashes:    []types.Hash{leaf},
+		LeafIndex:      0,
+	}}
+	scanner := &mockWithdrawalScanner{withdrawals: pending}
+	advanceTx := &BSVTransaction{Outputs: []BSVOutput{
+		{Script: []byte{0x76}, Value: 1000},
+		{Script: buildOpReturnWithRoot(leaf), Value: 0},
+	}}
+
+	bridgeUTXO := &BridgeUTXO{
+		TxID:    types.HexToHash("0xaaaa"),
+		Balance: 100_000_000_000,
+		Script:  []byte{0x76, 0xa9},
+	}
+	bcaster := &flakyBroadcaster{failures: 2, txid: types.HexToHash("0xfeed")}
+
+	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
+		&mockAdvanceFinder{tx: advanceTx}, DefaultWithdrawalConfig())
+	w.SetBroadcastRetryPolicy(3, []time.Duration{0, 0, 0})
+
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("ProcessFinalizedWithdrawals: %v", err)
+	}
+	if bcaster.calls != 3 {
+		t.Errorf("broadcaster calls = %d, want 3", bcaster.calls)
+	}
+	if bridgeUTXO.LastClaimedNonce != 1 {
+		t.Errorf("LastClaimedNonce = %d, want 1", bridgeUTXO.LastClaimedNonce)
+	}
+}
+
+func TestWithdrawer_BroadcastExhausted(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	pending := []*PendingWithdrawal{{
+		Nonce:          1,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 50_000_000,
+		L2BlockNum:     10,
+		BatchHashes:    []types.Hash{leaf},
+		LeafIndex:      0,
+	}}
+	scanner := &mockWithdrawalScanner{withdrawals: pending}
+	advanceTx := &BSVTransaction{Outputs: []BSVOutput{
+		{Script: []byte{0x76}, Value: 1000},
+		{Script: buildOpReturnWithRoot(leaf), Value: 0},
+	}}
+
+	bridgeUTXO := &BridgeUTXO{
+		TxID:    types.HexToHash("0xaaaa"),
+		Balance: 100_000_000_000,
+		Script:  []byte{0x76, 0xa9},
+	}
+	bcaster := &flakyBroadcaster{failures: 5}
+
+	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
+		&mockAdvanceFinder{tx: advanceTx}, DefaultWithdrawalConfig())
+	w.SetBroadcastRetryPolicy(2, []time.Duration{0, 0})
+
+	err := w.ProcessFinalizedWithdrawals()
+	if err == nil {
+		t.Fatal("expected broadcast exhaustion error")
+	}
+	if bridgeUTXO.LastClaimedNonce != 0 {
+		t.Errorf("LastClaimedNonce = %d, want 0 (claim must not advance on broadcast failure)",
+			bridgeUTXO.LastClaimedNonce)
+	}
+}
+
+func TestWithdrawer_RootMismatchSkips(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	pending := []*PendingWithdrawal{{
+		Nonce:          1,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 50_000_000,
+		L2BlockNum:     10,
+		BatchHashes:    []types.Hash{leaf},
+		LeafIndex:      0,
+	}}
+	scanner := &mockWithdrawalScanner{withdrawals: pending}
+
+	wrongRoot := types.HexToHash("0xdeadbeef")
+	advanceTx := &BSVTransaction{Outputs: []BSVOutput{
+		{Script: []byte{0x76}, Value: 1000},
+		{Script: buildOpReturnWithRoot(wrongRoot), Value: 0},
+	}}
+
+	bridgeUTXO := &BridgeUTXO{TxID: types.HexToHash("0xaa"), Balance: 1e9, Script: []byte{0x76}}
+	bcaster := &flakyBroadcaster{}
+
+	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
+		&mockAdvanceFinder{tx: advanceTx}, DefaultWithdrawalConfig())
+
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("ProcessFinalizedWithdrawals: %v", err)
+	}
+	if bcaster.calls != 0 {
+		t.Errorf("broadcaster called %d times, want 0 (root mismatch should skip)", bcaster.calls)
+	}
+	if bridgeUTXO.LastClaimedNonce != 0 {
+		t.Error("LastClaimedNonce advanced despite root mismatch")
+	}
+}
+
+// buildOpReturnWithRoot builds the advance OP_RETURN script the rollup
+// contracts emit: "BSVM\x02" || withdrawalRoot(32) || zero-padded
+// batch-data tail. Length stays >75 so the push uses OP_PUSHDATA2.
+func buildOpReturnWithRoot(root types.Hash) []byte {
+	payload := make([]byte, 5+32+128)
+	copy(payload[:5], []byte("BSVM\x02"))
+	copy(payload[5:5+32], root[:])
+
+	script := []byte{0x6a, 0x4d}
+	lenBuf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(lenBuf, uint16(len(payload)))
+	script = append(script, lenBuf...)
+	script = append(script, payload...)
+	return script
 }

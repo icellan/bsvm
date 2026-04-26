@@ -41,9 +41,11 @@ import runar "github.com/icellan/runar/packages/runar-go"
 //     [0, r) to match SP1 / Solidity reference verifiers.
 //
 // State fields (persisted across UTXO spends via OP_PUSH_TX):
-//   - StateRoot:   32-byte hash of current L2 state
-//   - BlockNumber: monotonically increasing block counter
-//   - Frozen:      0 = active, 1 = frozen by governance
+//   - StateRoot:          32-byte hash of current L2 state
+//   - BlockNumber:        monotonically increasing block counter
+//   - Frozen:             0 = active, 1 = frozen by governance
+//   - AdvancesSinceInbox: forced-inclusion counter (spec 10). See
+//     AdvanceState comment below for the reset / increment rules.
 //
 // Readonly properties baked into the locking script at compile time:
 //   - SP1VerifyingKeyHash: sha256(SP1 verifying key) — cross-system binding
@@ -64,9 +66,10 @@ type Groth16WARollupContract struct {
 	runar.StatefulSmartContract
 
 	// ---- Mutable state ----
-	StateRoot   runar.ByteString // 32-byte hash of current state
-	BlockNumber runar.Bigint     // monotonically increasing block counter
-	Frozen      runar.Bigint     // 0=active, 1=frozen by governance
+	StateRoot          runar.ByteString // 32-byte hash of current state
+	BlockNumber        runar.Bigint     // monotonically increasing block counter
+	Frozen             runar.Bigint     // 0=active, 1=frozen by governance
+	AdvancesSinceInbox runar.Bigint     // forced-inclusion counter (spec 10)
 
 	// ---- Readonly: shared with the Basefold and Mode 2 variants ----
 	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey) — bsv-evm binding
@@ -169,6 +172,9 @@ func (c *Groth16WARollupContract) AdvanceState(
 	pvPostStateRoot := runar.Substr(publicValues, 32, 32)
 	pvBatchDataHash := runar.Substr(publicValues, 104, 32)
 	pvChainIdBytes := runar.Substr(publicValues, 136, 8)
+	pvWithdrawalRoot := runar.Substr(publicValues, 144, 32)
+	pvInboxRootBefore := runar.Substr(publicValues, 176, 32)
+	pvInboxRootAfter := runar.Substr(publicValues, 208, 32)
 	pvBlockNumber := runar.Substr(publicValues, 272, 8)
 
 	runar.Assert(pvChainIdBytes == runar.Num2Bin(c.ChainId, 8))
@@ -177,11 +183,18 @@ func (c *Groth16WARollupContract) AdvanceState(
 	runar.Assert(pvBatchDataHash == runar.Hash256(batchData))
 	runar.Assert(pvBlockNumber == runar.Num2Bin(newBlockNumber, 8))
 
+	// Spec 10 forced-inclusion gate. See FRI / Mode 2 contracts for the
+	// full rationale; same logic, same offsets.
+	runar.Assert(c.AdvancesSinceInbox < 10 || pvInboxRootBefore != pvInboxRootAfter)
+
 	// F07 (post-R7/R9): emit the spec-12 advance OP_RETURN output —
-	// see the Mode 2 AdvanceState for the format rationale.
+	// see the Mode 2 AdvanceState for the format rationale. Includes
+	// the SP1-committed withdrawalRoot at pv[144..176) as a fixed-
+	// offset prefix so the bridge covenant can read it via the cross-
+	// covenant output reference pattern (spec 13 §C).
 	opReturnHdr := runar.ByteString("\x00\x6a\x4e") // OP_FALSE + OP_RETURN + OP_PUSHDATA4
 	bsvmMagic := runar.ByteString("BSVM\x02")
-	payload := runar.Cat(bsvmMagic, batchData)
+	payload := runar.Cat(runar.Cat(bsvmMagic, pvWithdrawalRoot), batchData)
 	lenBytes := runar.Num2Bin(runar.Len(payload), 4)
 	opReturnScript := runar.Cat(runar.Cat(opReturnHdr, lenBytes), payload)
 	c.AddDataOutput(0, opReturnScript)
@@ -189,6 +202,13 @@ func (c *Groth16WARollupContract) AdvanceState(
 	c.StateRoot = newStateRoot
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
+
+	// Reset on inbox drain, otherwise increment by one.
+	if pvInboxRootBefore != pvInboxRootAfter {
+		c.AdvancesSinceInbox = 0
+	} else {
+		c.AdvancesSinceInbox = c.AdvancesSinceInbox + 1
+	}
 
 	_ = proofBlob
 }
@@ -305,6 +325,7 @@ func (c *Groth16WARollupContract) UpgradeSingleKey(
 	sig runar.Sig,
 	newCovenantScript runar.ByteString,
 	migrationHash runar.ByteString,
+	newCovenantAnfHash runar.ByteString, // 32-byte hash256 of the published new ANF
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -313,6 +334,17 @@ func (c *Groth16WARollupContract) UpgradeSingleKey(
 
 	runar.Assert(migrationHash == runar.Hash256(newCovenantScript))
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
+
+	// Spec 10 covenant migration OP_RETURN — see rollup_fri.runar.go for
+	// the format rationale. Mode 3 already carries `migrationHash` as a
+	// param (== hash256(newCovenantScript)); we add `newCovenantAnfHash`
+	// so the migration tx publishes both commitments for observers.
+	migOpReturnHdr := runar.ByteString("\x00\x6a\x4e")
+	migMagic := runar.ByteString("BSVM\x03")
+	migPayload := runar.Cat(runar.Cat(migMagic, migrationHash), newCovenantAnfHash)
+	migLenBytes := runar.Num2Bin(runar.Len(migPayload), 4)
+	migOpReturnScript := runar.Cat(runar.Cat(migOpReturnHdr, migLenBytes), migPayload)
+	c.AddDataOutput(0, migOpReturnScript)
 
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
@@ -326,6 +358,7 @@ func (c *Groth16WARollupContract) UpgradeMultiSig2(
 	sig2 runar.Sig,
 	newCovenantScript runar.ByteString,
 	migrationHash runar.ByteString,
+	newCovenantAnfHash runar.ByteString, // 32-byte hash256 of the published new ANF
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -338,6 +371,17 @@ func (c *Groth16WARollupContract) UpgradeMultiSig2(
 
 	runar.Assert(migrationHash == runar.Hash256(newCovenantScript))
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
+
+	// Spec 10 covenant migration OP_RETURN — see rollup_fri.runar.go for
+	// the format rationale. Mode 3 already carries `migrationHash` as a
+	// param (== hash256(newCovenantScript)); we add `newCovenantAnfHash`
+	// so the migration tx publishes both commitments for observers.
+	migOpReturnHdr := runar.ByteString("\x00\x6a\x4e")
+	migMagic := runar.ByteString("BSVM\x03")
+	migPayload := runar.Cat(runar.Cat(migMagic, migrationHash), newCovenantAnfHash)
+	migLenBytes := runar.Num2Bin(runar.Len(migPayload), 4)
+	migOpReturnScript := runar.Cat(runar.Cat(migOpReturnHdr, migLenBytes), migPayload)
+	c.AddDataOutput(0, migOpReturnScript)
 
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0
@@ -352,6 +396,7 @@ func (c *Groth16WARollupContract) UpgradeMultiSig3(
 	sig3 runar.Sig,
 	newCovenantScript runar.ByteString,
 	migrationHash runar.ByteString,
+	newCovenantAnfHash runar.ByteString, // 32-byte hash256 of the published new ANF
 	newBlockNumber runar.Bigint,
 ) {
 	runar.Assert(c.Frozen == 1)
@@ -364,6 +409,17 @@ func (c *Groth16WARollupContract) UpgradeMultiSig3(
 
 	runar.Assert(migrationHash == runar.Hash256(newCovenantScript))
 	runar.Assert(newBlockNumber == c.BlockNumber+1)
+
+	// Spec 10 covenant migration OP_RETURN — see rollup_fri.runar.go for
+	// the format rationale. Mode 3 already carries `migrationHash` as a
+	// param (== hash256(newCovenantScript)); we add `newCovenantAnfHash`
+	// so the migration tx publishes both commitments for observers.
+	migOpReturnHdr := runar.ByteString("\x00\x6a\x4e")
+	migMagic := runar.ByteString("BSVM\x03")
+	migPayload := runar.Cat(runar.Cat(migMagic, migrationHash), newCovenantAnfHash)
+	migLenBytes := runar.Num2Bin(runar.Len(migPayload), 4)
+	migOpReturnScript := runar.Cat(runar.Cat(migOpReturnHdr, migLenBytes), migPayload)
+	c.AddDataOutput(0, migOpReturnScript)
 
 	c.BlockNumber = newBlockNumber
 	c.Frozen = 0

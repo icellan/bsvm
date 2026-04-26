@@ -1,0 +1,8 @@
+src/
+tsconfig.json
+*.tsbuildinfo
+node_modules/
+.DS_Store
+.editorconfig
+.eslintrc*
+.prettierrc*

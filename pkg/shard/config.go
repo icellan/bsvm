@@ -61,9 +61,84 @@ type ShardConfig struct {
 	// shard's peer network.
 	BootstrapPeers []string `json:"bootstrapPeers,omitempty"`
 
+	// BSVNetwork holds spec-17 networking configuration: ARC,
+	// chaintracks, WhatsOnChain. Optional — when absent the node
+	// runs without spec-17 networking and falls back to the legacy
+	// pkg/bsvclient.RPCProvider direct-RPC path. Devnet defaults are
+	// permissive (everything optional); mainnet shard configs MUST
+	// populate at least ARC and Chaintracks.
+	BSVNetwork *BSVNetworkConfig `json:"bsvNetwork,omitempty"`
+
 	// DataDir is the local filesystem path for shard data. It is not
 	// serialized because it is machine-specific.
 	DataDir string `json:"-"`
+}
+
+// BSVNetworkConfig captures the spec-17 networking stack config.
+// Each sub-config is optional; absent means "disabled". Default
+// values are sized for devnet — mainnet operators populate every
+// section.
+type BSVNetworkConfig struct {
+	ARC          *ARCConfig          `json:"arc,omitempty"`
+	Chaintracks  *ChaintracksConfig  `json:"chaintracks,omitempty"`
+	WhatsOnChain *WhatsOnChainConfig `json:"whatsOnChain,omitempty"`
+}
+
+// ARCConfig configures one or more ARC endpoints plus the shared
+// callback URL / token.
+type ARCConfig struct {
+	// CallbackMode is "direct" or "poll". Default "direct".
+	CallbackMode string `json:"callbackMode,omitempty"`
+	// CallbackURL is the public URL ARC POSTs status updates to.
+	CallbackURL string `json:"callbackUrl,omitempty"`
+	// CallbackToken is the shared secret ARC sends in
+	// X-CallbackToken. Multiple entries support atomic rotation.
+	CallbackTokens []string `json:"callbackTokens,omitempty"`
+	// Endpoints lists each ARC HTTP endpoint to try in parallel.
+	Endpoints []ARCEndpoint `json:"endpoints,omitempty"`
+}
+
+// ARCEndpoint is one ARC base URL plus optional auth token.
+type ARCEndpoint struct {
+	Name      string `json:"name,omitempty"`
+	URL       string `json:"url"`
+	AuthToken string `json:"authToken,omitempty"`
+}
+
+// ChaintracksConfig configures the BRC-64 Block Headers Service
+// upstreams.
+type ChaintracksConfig struct {
+	// Quorum is the minimum number of upstreams that must agree on a
+	// header before it is committed. Default 1 for devnet, 2 for
+	// mainnet.
+	Quorum int `json:"quorum,omitempty"`
+	// CheckpointHeight + CheckpointHash seed the local view at
+	// shard genesis time.
+	CheckpointHeight uint64 `json:"checkpointHeight,omitempty"`
+	CheckpointHash   string `json:"checkpointHash,omitempty"`
+	// Upstreams lists each header source.
+	Upstreams []ChaintracksUpstream `json:"upstreams,omitempty"`
+}
+
+// ChaintracksUpstream is a single header-source endpoint.
+type ChaintracksUpstream struct {
+	Name string `json:"name,omitempty"`
+	// Kind is "brc-64", "whatsonchain", or "bsv-rpc".
+	Kind   string `json:"kind"`
+	URL    string `json:"url"`
+	APIKey string `json:"apiKey,omitempty"`
+	// Enabled defaults to true when omitted; bsv-rpc upstreams default
+	// to false unless explicitly enabled.
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// WhatsOnChainConfig configures the optional WoC supplementary
+// lookup service.
+type WhatsOnChainConfig struct {
+	Enabled  bool   `json:"enabled,omitempty"`
+	URL      string `json:"url,omitempty"`
+	APIKey   string `json:"apiKey,omitempty"`
+	CacheTTL string `json:"cacheTtl,omitempty"`
 }
 
 // LoadConfig reads a shard configuration from a JSON file at the given

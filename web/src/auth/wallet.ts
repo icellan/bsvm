@@ -13,8 +13,24 @@
 declare global {
   interface Window {
     bsv?: BrowserBsvProvider;
+    ethereum?: EvmProvider;
   }
 }
+
+// EvmProvider is the EIP-1193 surface exposed by MetaMask, Rabby,
+// and any wallet that speaks the standard. The contract-interaction
+// page uses it for write methods (eth_sendTransaction). The wallet
+// is expected to handle nonce, gas, and chain selection — we only
+// hand it the call arguments. BRC-100 wallets like Metanet Desktop
+// don't currently expose this surface, so the UI degrades to a
+// "no EVM wallet available" hint when window.ethereum is absent.
+export type EvmProvider = {
+  isMetaMask?: boolean;
+  request: <T = unknown>(args: {
+    method: string;
+    params?: unknown[];
+  }) => Promise<T>;
+};
 
 // The `window.bsv` interface as defined by BRC-100 wallet toolbox.
 // We only use a tiny slice of it — requestIdentity + signMessage.
@@ -110,4 +126,62 @@ export function randomNonce(): Uint8Array {
   const out = new Uint8Array(32);
   crypto.getRandomValues(out);
   return out;
+}
+
+// ---- EVM wallet bridge (contract write methods) ----------------------
+//
+// The contract-interaction page on the explorer needs an Ethereum-
+// compatible signer for state-changing calls. We use the EIP-1193
+// `window.ethereum` provider when present (MetaMask, Rabby, etc.).
+// The BRC-100 wallet (window.bsv) is reserved for admin / governance
+// signatures and cannot sign EVM transactions on its own.
+
+export class EvmWalletUnavailableError extends Error {
+  constructor() {
+    super(
+      "No EVM wallet detected. Install MetaMask (or any EIP-1193 wallet) to send transactions.",
+    );
+  }
+}
+
+export function getEvmProvider(): EvmProvider {
+  const provider = typeof window !== "undefined" ? window.ethereum : undefined;
+  if (!provider) throw new EvmWalletUnavailableError();
+  return provider;
+}
+
+export function hasEvmProvider(): boolean {
+  return typeof window !== "undefined" && !!window.ethereum;
+}
+
+// requestEvmAccounts asks the wallet to expose at least one account.
+// Returns the user-selected from-address (lowercased hex). The wallet
+// may show a connect prompt the first time this is invoked.
+export async function requestEvmAccounts(): Promise<string> {
+  const provider = getEvmProvider();
+  const accounts = await provider.request<string[]>({
+    method: "eth_requestAccounts",
+  });
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    throw new Error("wallet returned no accounts");
+  }
+  return accounts[0].toLowerCase();
+}
+
+// sendEvmTransaction hands an unsigned tx skeleton to the EVM wallet
+// for signing + broadcast. The wallet returns the resulting tx hash.
+// We deliberately let the wallet pick nonce / gas / fees; callers may
+// override gas / value via the args.
+export async function sendEvmTransaction(args: {
+  from: string;
+  to?: string;
+  data?: string;
+  value?: string;
+  gas?: string;
+}): Promise<string> {
+  const provider = getEvmProvider();
+  return provider.request<string>({
+    method: "eth_sendTransaction",
+    params: [args],
+  });
 }

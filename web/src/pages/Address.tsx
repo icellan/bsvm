@@ -83,6 +83,24 @@ export default function Address() {
         <div className="mt-2 flex gap-3 items-center">
           <Copy value={address ?? ""} label="copy address" />
           {isContract ? <Chip tone="info" dot>contract</Chip> : <Chip tone="neutral" dot>eoa</Chip>}
+          {isContract && address ? (
+            <Link
+              to={`/address/${address}/interact`}
+              className="mono"
+              style={{
+                fontSize: 11,
+                color: "var(--ts-accent)",
+                padding: "3px 8px",
+                border:
+                  "1px solid color-mix(in srgb, var(--ts-accent) 40%, transparent)",
+                borderRadius: 4,
+                textDecoration: "none",
+              }}
+              title="Open the read/write/event interaction panel"
+            >
+              interact →
+            </Link>
+          ) : null}
         </div>
       </div>
 

@@ -142,7 +142,7 @@ func TestGroth16Rollup_F01_UpgradeEnforcesBindings(t *testing.T) {
 	args := buildGroth16UpgradeArgs(c, newScript)
 	args.g16Input0 = new(big.Int).Add(testSP1ProgramVkHashScalar, big.NewInt(1))
 	c.UpgradeSingleKey(
-		sig, newScript,
+		sig, newScript, fakeAnfHash(newScript),
 		args.publicValues, args.batchData, args.proofBlob,
 		args.proofA, args.proofBX0, args.proofBX1, args.proofBY0, args.proofBY1, args.proofC,
 		args.g16Input0, args.g16Input1, args.g16Input2, args.g16Input3, args.g16Input4,
@@ -252,7 +252,7 @@ func TestGroth16WARollup_F05_UpgradeAcceptsMatchingHash(t *testing.T) {
 	newScript := runar.ByteString("legit-new-script")
 	migHash := runar.ByteString(rawHash256(string(newScript)))
 
-	c.UpgradeSingleKey(sig, newScript, migHash, 1)
+	c.UpgradeSingleKey(sig, newScript, migHash, fakeAnfHash(newScript), 1)
 
 	if c.Frozen != 0 {
 		t.Errorf("expected frozen=0 after upgrade, got %d", c.Frozen)
@@ -278,7 +278,7 @@ func TestGroth16WARollup_F05_UpgradeRejectsMismatchedHash(t *testing.T) {
 	otherScript := runar.ByteString("a-different-script")
 	migHash := runar.ByteString(rawHash256(string(otherScript)))
 
-	c.UpgradeSingleKey(sig, newScript, migHash, 1)
+	c.UpgradeSingleKey(sig, newScript, migHash, fakeAnfHash(newScript), 1)
 }
 
 // TestGroth16WARollup_F05_UpgradeRejectsAllZeroHash blocks the trivial
@@ -294,7 +294,7 @@ func TestGroth16WARollup_F05_UpgradeRejectsAllZeroHash(t *testing.T) {
 	newScript := runar.ByteString("any-new-script")
 	zeroHash := runar.ByteString(string(make([]byte, 32)))
 
-	c.UpgradeSingleKey(sig, newScript, zeroHash, 1)
+	c.UpgradeSingleKey(sig, newScript, zeroHash, fakeAnfHash(newScript), 1)
 }
 
 // TestGroth16WARollup_F05_UpgradeMultiSig2EnforcesHash — same check on
@@ -312,7 +312,7 @@ func TestGroth16WARollup_F05_UpgradeMultiSig2EnforcesHash(t *testing.T) {
 	newScript := runar.ByteString("multisig-new-script")
 	wrongHash := runar.ByteString(rawHash256("NOT-the-new-script"))
 
-	c.UpgradeMultiSig2(sig1, sig2, newScript, wrongHash, 1)
+	c.UpgradeMultiSig2(sig1, sig2, newScript, wrongHash, fakeAnfHash(newScript), 1)
 }
 
 // TestGroth16WARollup_F05_UpgradeMultiSig3EnforcesHash — same on 3-of-3.
@@ -330,5 +330,5 @@ func TestGroth16WARollup_F05_UpgradeMultiSig3EnforcesHash(t *testing.T) {
 	newScript := runar.ByteString("3of3-new-script")
 	wrongHash := runar.ByteString(rawHash256("still-not-the-new-script"))
 
-	c.UpgradeMultiSig3(sig1, sig2, sig3, newScript, wrongHash, 1)
+	c.UpgradeMultiSig3(sig1, sig2, sig3, newScript, wrongHash, fakeAnfHash(newScript), 1)
 }

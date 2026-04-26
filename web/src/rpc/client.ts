@@ -113,6 +113,34 @@ export const eth = {
   getCode: (address: string, tag = "latest") =>
     call<string>("eth_getCode", [address, tag]),
   gasPrice: () => call<string>("eth_gasPrice"),
+  // eth_call — read-only contract execution. Returns the hex-encoded
+  // ABI-packed return value, or "0x" for a void/reverting call.
+  call: (
+    args: { to: string; from?: string; data?: string; value?: string },
+    tag = "latest",
+  ) => call<string>("eth_call", [args, tag]),
+  // eth_estimateGas — best-effort gas estimate for a tx that hasn't
+  // been signed yet. Used by the contract-write flow to seed a
+  // sensible default before the wallet picks the final value.
+  estimateGas: (args: {
+    to?: string;
+    from?: string;
+    data?: string;
+    value?: string;
+  }) => call<string>("eth_estimateGas", [args]),
+  // eth_sendRawTransaction — submit a wallet-signed transaction to
+  // the mempool. Returns the tx hash.
+  sendRawTransaction: (rawHex: string) =>
+    call<string>("eth_sendRawTransaction", [rawHex]),
+  // eth_getLogs — fetch logs matching the given filter. Used by the
+  // contract event decoder; we constrain to a recent window to keep
+  // payloads small.
+  getLogs: (filter: {
+    address?: string | string[];
+    fromBlock?: string;
+    toBlock?: string;
+    topics?: (string | string[] | null)[];
+  }) => call<LogEntry[]>("eth_getLogs", [filter]),
 };
 
 export const bsv = {

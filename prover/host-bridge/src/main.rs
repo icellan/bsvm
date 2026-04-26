@@ -54,6 +54,10 @@ struct StorageExport {
 /// Transaction from the Go host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TransactionExport {
+    /// Transaction type byte (0x00 = legacy, 0x02 = EIP-1559, 0x7E = deposit).
+    /// Optional for backward compatibility — defaults to 0x02 (EIP-1559).
+    #[serde(default)]
+    tx_type: u8,
     from: String,
     to: Option<String>,
     value: String,
@@ -73,6 +77,12 @@ struct HostInput {
     accounts: Vec<AccountExport>,
     transactions: Vec<TransactionExport>,
     block_context: BlockContext,
+    /// Inbox queue hash before draining (hex, optional — defaults to zeros).
+    #[serde(default)]
+    inbox_root_before: String,
+    /// Inbox queue hash after draining (hex, optional — defaults to zeros).
+    #[serde(default)]
+    inbox_root_after: String,
     /// Proving mode: "execute" (no proof), "core", "compressed", or "groth16".
     mode: String,
 }
@@ -98,8 +108,13 @@ struct GuestStorageSlot {
 }
 
 /// Transaction as expected by the guest program.
+///
+/// Field shape MUST match prover/guest/src/main.rs::EvmTransaction exactly,
+/// including field order — bincode is positional under serde derives, so any
+/// drift here silently corrupts guest input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuestTransaction {
+    tx_type: u8,
     from: [u8; 20],
     to: Option<[u8; 20]>,
     value: [u8; 32],
@@ -123,12 +138,16 @@ struct GuestBlockContext {
 }
 
 /// Complete batch input as expected by the guest program.
+///
+/// Field order MUST match prover/guest/src/main.rs::BatchInput exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuestBatchInput {
     pre_state_root: [u8; 32],
     accounts: Vec<GuestAccountState>,
     transactions: Vec<GuestTransaction>,
     block_context: GuestBlockContext,
+    inbox_root_before: [u8; 32],
+    inbox_root_after: [u8; 32],
 }
 
 // ─── Output types (JSON to Go host) ──────────────────────────────────────────
@@ -138,7 +157,8 @@ struct GuestBatchInput {
 struct HostOutput {
     /// Hex-encoded proof bytes.
     proof: String,
-    /// Hex-encoded public values (272 bytes).
+    /// Hex-encoded public values (280 bytes for the production guest;
+    /// see prover/guest/src/main.rs and pkg/prover/proof.go::PublicValuesSize).
     public_values: String,
     /// Hex-encoded verifying key hash.
     vk_hash: String,
@@ -211,6 +231,9 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         .transactions
         .iter()
         .map(|t| GuestTransaction {
+            // Default tx_type to 0x02 (EIP-1559) when host omits it; older
+            // wire formats predate the deposit-tx-type-aware production guest.
+            tx_type: if t.tx_type == 0 { 0x02 } else { t.tx_type },
             from: hex_to_address(&t.from),
             to: t.to.as_ref().map(|s| hex_to_address(s)),
             value: hex_to_bytes32(&t.value),
@@ -232,11 +255,25 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         prev_randao: hex_to_bytes32(&input.block_context.prev_randao),
     };
 
+    // Inbox roots: optional in wire format, default to zeros (no inbox).
+    let inbox_root_before = if input.inbox_root_before.is_empty() {
+        [0u8; 32]
+    } else {
+        hex_to_bytes32(&input.inbox_root_before)
+    };
+    let inbox_root_after = if input.inbox_root_after.is_empty() {
+        [0u8; 32]
+    } else {
+        hex_to_bytes32(&input.inbox_root_after)
+    };
+
     GuestBatchInput {
         pre_state_root,
         accounts,
         transactions,
         block_context,
+        inbox_root_before,
+        inbox_root_after,
     }
 }
 

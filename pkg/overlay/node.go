@@ -190,6 +190,36 @@ func NewOverlayNodeWithObservability(
 	})
 	node.raceDetector = rd
 
+	// Auto-start the confirmation watcher when the covenant manager
+	// already has a broadcast client attached at construction time.
+	// This guarantees confirmedTip / finalizedTip (and therefore the
+	// safe / finalized block tags exposed via eth_getBlockByNumber)
+	// advance under BSV confirmations without requiring callers to
+	// remember to call StartConfirmationWatcher separately. The
+	// cmd/bsvm wiring path attaches the broadcast client AFTER
+	// construction and therefore still calls StartConfirmationWatcher
+	// explicitly; that call is idempotent (it stops & replaces the
+	// existing watcher).
+	if covenantMgr != nil {
+		if bc := covenantMgr.BroadcastClient(); bc != nil {
+			node.StartConfirmationWatcher(bc, config.ConfirmationPollInterval)
+		}
+		covenantMgr.SetStateChangeCallback(func(prev, curr covenant.CovenantState) {
+			if prev.Frozen == curr.Frozen {
+				return
+			}
+			gm := node.GovernanceMonitor()
+			if gm == nil {
+				return
+			}
+			if curr.Frozen != 0 {
+				gm.HandleGovernanceFreeze()
+			} else {
+				gm.HandleGovernanceUnfreeze()
+			}
+		})
+	}
+
 	return node, nil
 }
 
@@ -524,7 +554,13 @@ func (n *OverlayNode) ReplayBatchData(batchData []byte) error {
 // Subsequent successful broadcasts in ProcessBatch will be tracked by this
 // watcher. Calling StartConfirmationWatcher more than once replaces the
 // previous watcher after stopping it.
+//
+// A non-positive interval is replaced with config.ConfirmationPollInterval
+// (or, if that is also non-positive, the watcher's own internal default).
 func (n *OverlayNode) StartConfirmationWatcher(client covenant.BroadcastClient, interval time.Duration) {
+	if interval <= 0 {
+		interval = n.config.ConfirmationPollInterval
+	}
 	n.mu.Lock()
 	old := n.confirmationWatcher
 	n.mu.Unlock()

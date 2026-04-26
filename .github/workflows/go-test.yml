@@ -190,13 +190,45 @@ jobs:
         working-directory: bsv-evm
         run: go test -count=1 -p 2 -timeout 12m ./test/evmtest/...
 
+  cross-evm-diff-smoke:
+    name: cross-EVM diff (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+          submodules: recursive
+
+      - name: Checkout runar
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test ./test/cross_evm_diff/ (smoke only)
+        working-directory: bsv-evm
+        # Smoke subset: 5 fixtures covering transfer, sstore, sload,
+        # balance, sha3. Full suite (~2.6k fixtures) runs on the daily
+        # cron in cross-evm-diff.yml.
+        run: go test -count=1 -timeout 2m -run 'TestCrossEVMDiff_Smoke|TestSmokeFixturesExist|TestExecuteStateTestRoot' ./test/cross_evm_diff/
+
   devnet-smoke:
     name: devnet smoke (mock)
     runs-on: ubuntu-latest
     # Sequential: only run after every Go check passes, so a red
     # PR doesn't burn ~5 min of runner time on the docker image
     # build + compose cluster spin-up.
-    needs: [lint, build, test, covenant, evmtest]
+    needs: [lint, build, test, covenant, evmtest, cross-evm-diff-smoke]
     timeout-minutes: 20
 
     env:

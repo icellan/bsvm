@@ -30,7 +30,7 @@ func TestFRIRollup_F07_EmitsSpec12OpReturn(t *testing.T) {
 	callFRIAdvance(c, args)
 
 	got := extractDataOutputScript(t, c.DataOutputs())
-	want := expectedOpReturnScript([]byte(args.batchData))
+	want := expectedOpReturnScript([]byte(args.publicValues), []byte(args.batchData))
 	if string(got) != string(want) {
 		t.Errorf("OP_RETURN script mismatch:\n  got  %x\n  want %x", got, want)
 	}
@@ -58,7 +58,7 @@ func TestFRIRollup_F07_MagicPrefix(t *testing.T) {
 }
 
 // TestFRIRollup_F07_LengthEncoding pins the OP_PUSHDATA4 length field
-// matches payload size (BSVM\x02 + batchData).
+// matches payload size (BSVM\x02 + withdrawalRoot + batchData).
 func TestFRIRollup_F07_LengthEncoding(t *testing.T) {
 	c := newFRIRollup(zeros32(), 0, 0)
 	args := buildFRIArgs(zeros32(), 1)
@@ -66,7 +66,7 @@ func TestFRIRollup_F07_LengthEncoding(t *testing.T) {
 
 	script := extractDataOutputScript(t, c.DataOutputs())
 	declaredLen := binary.LittleEndian.Uint32(script[3:7])
-	wantLen := uint32(len(advanceMagic) + len(args.batchData))
+	wantLen := uint32(len(advanceMagic) + 32 + len(args.batchData))
 	if declaredLen != wantLen {
 		t.Errorf("OP_PUSHDATA4 length: got %d, want %d", declaredLen, wantLen)
 	}
@@ -80,7 +80,7 @@ func TestFRIRollup_F07_BatchDataRoundTrip(t *testing.T) {
 	callFRIAdvance(c, args)
 
 	script := extractDataOutputScript(t, c.DataOutputs())
-	recovered := script[3+4+len(advanceMagic):]
+	recovered := script[3+4+len(advanceMagic)+32:]
 	if string(recovered) != string(args.batchData) {
 		t.Errorf("batchData not recoverable from OP_RETURN:\n  got  %x\n  want %x",
 			recovered, []byte(args.batchData))

@@ -313,12 +313,12 @@ func TestContinuousProvingLoop_Basefold(t *testing.T) {
 	}
 }
 
-// TestContinuousProvingLoop_Groth16Generic drives the overlay with the
+// TestContinuousProvingLoop_Groth16 drives the overlay with the
 // Groth16 generic proof mode and asserts that every broadcast carries a
-// Groth16GenericProof whose ContractCallArgs produces the 16-arg slice
+// Groth16Proof whose ContractCallArgs produces the 16-arg slice
 // expected by Groth16RollupContract.AdvanceState.
-func TestContinuousProvingLoop_Groth16Generic(t *testing.T) {
-	cs := newContinuousSetup(t, 7, prover.ProofModeGroth16Generic)
+func TestContinuousProvingLoop_Groth16(t *testing.T) {
+	cs := newContinuousSetup(t, 7, prover.ProofModeGroth16)
 	defer cs.node.Stop()
 
 	recipient := types.HexToAddress("0x00000000000000000000000000000000000000dd")
@@ -341,11 +341,11 @@ func TestContinuousProvingLoop_Groth16Generic(t *testing.T) {
 		if req.Proof == nil {
 			t.Fatalf("batch %d: advance proof must not be nil", i+1)
 		}
-		if got := req.Proof.Mode(); got != covenant.ProofModeGroth16Generic {
-			t.Errorf("batch %d: mode = %s, want groth16-generic", i+1, got)
+		if got := req.Proof.Mode(); got != covenant.ProofModeGroth16 {
+			t.Errorf("batch %d: mode = %s, want groth16", i+1, got)
 		}
-		if _, ok := req.Proof.(*covenant.Groth16GenericProof); !ok {
-			t.Errorf("batch %d: proof concrete type = %T, want *covenant.Groth16GenericProof", i+1, req.Proof)
+		if _, ok := req.Proof.(*covenant.Groth16Proof); !ok {
+			t.Errorf("batch %d: proof concrete type = %T, want *covenant.Groth16Proof", i+1, req.Proof)
 		}
 		args, err := req.Proof.ContractCallArgs(req)
 		if err != nil {
@@ -357,15 +357,15 @@ func TestContinuousProvingLoop_Groth16Generic(t *testing.T) {
 	}
 }
 
-// TestContinuousProvingLoop_Groth16Witness drives the overlay with the
+// TestContinuousProvingLoop_Groth16WA drives the overlay with the
 // witness-assisted Groth16 proof mode (Mode 3). The mock prover builds a
-// Groth16WitnessProof with a real BN254 witness loaded from the embedded
+// Groth16WAProof with a real BN254 witness loaded from the embedded
 // Gate 0b SP1 fixture, the fake BroadcastClient records it, and the test
 // asserts that ContractCallArgs produces the 5-arg slice expected by
 // Groth16WARollupContract.AdvanceState (witness is side-channelled via
 // CallOptions in the real client and is NOT in the positional args).
-func TestContinuousProvingLoop_Groth16Witness(t *testing.T) {
-	cs := newContinuousSetup(t, 9, prover.ProofModeGroth16Witness)
+func TestContinuousProvingLoop_Groth16WA(t *testing.T) {
+	cs := newContinuousSetup(t, 9, prover.ProofModeGroth16WA)
 	defer cs.node.Stop()
 
 	recipient := types.HexToAddress("0x00000000000000000000000000000000000000ee")
@@ -382,15 +382,15 @@ func TestContinuousProvingLoop_Groth16Witness(t *testing.T) {
 	if req.Proof == nil {
 		t.Fatal("advance proof must not be nil")
 	}
-	if got := req.Proof.Mode(); got != covenant.ProofModeGroth16Witness {
-		t.Errorf("mode = %s, want groth16-witness", got)
+	if got := req.Proof.Mode(); got != covenant.ProofModeGroth16WA {
+		t.Errorf("mode = %s, want groth16-wa", got)
 	}
-	waProof, ok := req.Proof.(*covenant.Groth16WitnessProof)
+	waProof, ok := req.Proof.(*covenant.Groth16WAProof)
 	if !ok {
-		t.Fatalf("proof concrete type = %T, want *covenant.Groth16WitnessProof", req.Proof)
+		t.Fatalf("proof concrete type = %T, want *covenant.Groth16WAProof", req.Proof)
 	}
 	if waProof.Witness == nil {
-		t.Error("Groth16WitnessProof.Witness must be non-nil after synthetic proof build")
+		t.Error("Groth16WAProof.Witness must be non-nil after synthetic proof build")
 	}
 
 	args, err := req.Proof.ContractCallArgs(req)

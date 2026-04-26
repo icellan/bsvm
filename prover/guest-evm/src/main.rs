@@ -5,12 +5,23 @@
 //! Milestone 3; this version validates the proof pipeline end-to-end with
 //! minimal complexity.
 //!
-//! Public values layout (spec 12, simplified to 112 bytes for Gate 0b):
+//! Public values layout (Gate 0b stub, 144 bytes):
 //!   [0..32]    preStateRoot   (SHA-256 of pre-state)
 //!   [32..64]   postStateRoot  (SHA-256 of post-state)
 //!   [64..72]   gasUsed        (uint64 big-endian)
 //!   [72..104]  batchDataHash  (SHA-256 of batch data)
 //!   [104..112] chainId        (uint64 big-endian)
+//!   [112..144] withdrawalRoot (binary SHA-256 Merkle root over hash256
+//!                              leaves; bytes32(0) when no withdrawals)
+//!
+//! NOTE on layout: the full revm guest at prover/guest/src/main.rs
+//! commits the canonical 280-byte spec-12 layout (with withdrawalRoot at
+//! [144..176)). This stub uses an abbreviated 144-byte layout because it
+//! omits the unused fields (receiptsHash, inbox roots, migrateScriptHash,
+//! blockNumber). The withdrawalRoot computation itself is bit-identical
+//! to pkg/bridge/withdrawal.go and the full guest's
+//! `build_withdrawal_merkle_root` will be replaced with the same binary
+//! SHA-256 + zero-pad scheme to converge on the Go reference.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
@@ -38,12 +49,28 @@ pub struct Transfer {
     pub gas_price: u64,
 }
 
-/// Everything the guest needs to execute and prove a single transfer.
+/// A withdrawal record matching the Go reference (pkg/bridge/withdrawal.go).
+/// `recipient` is the 20-byte BSV address (RIPEMD160(SHA256(pubkey))).
+/// `amount` is satoshis (uint64 BE), `nonce` is the L2-side withdrawal nonce.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Withdrawal {
+    pub recipient: [u8; 20],
+    pub amount: u64,
+    pub nonce: u64,
+}
+
+/// Everything the guest needs to execute and prove a single transfer plus
+/// optionally commit a withdrawalRoot.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BatchInput {
     pub accounts: Vec<Account>,
     pub transfer: Transfer,
     pub chain_id: u64,
+    /// Withdrawals included in this batch. May be empty.
+    /// `#[serde(default)]` keeps backward compatibility with hosts that do
+    /// not yet send the field.
+    #[serde(default)]
+    pub withdrawals: Vec<Withdrawal>,
 }
 
 pub fn main() {
@@ -95,12 +122,16 @@ pub fn main() {
     let batch_data = encode_transfer(tx);
     let batch_data_hash = sha256(&batch_data);
 
-    // ── 6. Commit public values (112 bytes, spec 12 layout) ───────────
+    // ── 6. Compute withdrawal Merkle root (matches pkg/bridge/withdrawal.go).
+    let withdrawal_root = compute_withdrawal_root(&input.withdrawals);
+
+    // ── 7. Commit public values (144 bytes, stub layout) ──────────────
     sp1_zkvm::io::commit_slice(&pre_state_root); // [0..32]
     sp1_zkvm::io::commit_slice(&post_state_root); // [32..64]
     sp1_zkvm::io::commit_slice(&gas_used.to_be_bytes()); // [64..72]
     sp1_zkvm::io::commit_slice(&batch_data_hash); // [72..104]
     sp1_zkvm::io::commit_slice(&input.chain_id.to_be_bytes()); // [104..112]
+    sp1_zkvm::io::commit_slice(&withdrawal_root); // [112..144]
 }
 
 /// Compute a deterministic state root by sorting accounts by address,
@@ -139,4 +170,62 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
     out
+}
+
+/// hash256(x) = SHA256(SHA256(x)) — matches BSV's OP_HASH256.
+fn hash256(data: &[u8]) -> [u8; 32] {
+    sha256(&sha256(data))
+}
+
+/// Compute the leaf hash for a withdrawal:
+///   hash256(recipient || amount_u64_be || nonce_u64_be)
+/// Mirrors pkg/bridge/withdrawal.go::WithdrawalHash exactly.
+fn withdrawal_leaf(w: &Withdrawal) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(20 + 8 + 8);
+    buf.extend_from_slice(&w.recipient);
+    buf.extend_from_slice(&w.amount.to_be_bytes());
+    buf.extend_from_slice(&w.nonce.to_be_bytes());
+    hash256(&buf)
+}
+
+/// SHA256(left || right) — single-block internal node.
+/// Matches pkg/bridge/withdrawal.go::sha256Pair.
+fn sha256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(left);
+    hasher.update(right);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Build a binary SHA-256 Merkle tree over withdrawal hashes and return
+/// the root. Internal nodes are SHA256(left || right) (NOT hash256). Odd
+/// levels are padded with the all-zero hash. Empty list returns [0u8; 32].
+/// Bit-identical to pkg/bridge/withdrawal.go::BuildWithdrawalMerkleTree.
+fn compute_withdrawal_root(withdrawals: &[Withdrawal]) -> [u8; 32] {
+    if withdrawals.is_empty() {
+        return [0u8; 32];
+    }
+
+    let mut level: Vec<[u8; 32]> = withdrawals.iter().map(withdrawal_leaf).collect();
+
+    if level.len() == 1 {
+        return level[0];
+    }
+
+    while level.len() > 1 {
+        if level.len() % 2 != 0 {
+            level.push([0u8; 32]);
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        let mut i = 0;
+        while i < level.len() {
+            next.push(sha256_pair(&level[i], &level[i + 1]));
+            i += 2;
+        }
+        level = next;
+    }
+    level[0]
 }

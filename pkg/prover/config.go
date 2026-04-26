@@ -42,9 +42,9 @@ type ProofMode = proofmode.ProofMode
 
 // Re-exported ProofMode constants.
 const (
-	ProofModeFRI            = proofmode.FRI
-	ProofModeGroth16Generic = proofmode.Groth16Generic
-	ProofModeGroth16Witness = proofmode.Groth16Witness
+	ProofModeFRI       = proofmode.FRI
+	ProofModeGroth16   = proofmode.Groth16
+	ProofModeGroth16WA = proofmode.Groth16WA
 )
 
 // Config holds the SP1 prover configuration.

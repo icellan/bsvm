@@ -150,3 +150,15 @@ func DeriveRandom(bsvBlockHash types.Hash, l2BlockNum uint64) types.Hash {
 	binary.BigEndian.PutUint64(data[32:], l2BlockNum)
 	return types.Hash(crypto.Keccak256Hash(data))
 }
+
+// stateDBFor type-asserts a vm.StateDB to the concrete *state.StateDB
+// used by production code paths. The bridge withdrawal fast-path needs
+// the concrete type because its rate-limit / storage-slot helpers
+// (CheckWithdrawalRateLimit, RecordWithdrawal) operate on it directly
+// rather than through the vm.StateDB interface. Returns (nil, false)
+// for any other implementation (e.g. tracing wrappers used by external
+// tooling) so the dispatch can revert cleanly instead of panicking.
+func stateDBFor(s vm.StateDB) (*state.StateDB, bool) {
+	concrete, ok := s.(*state.StateDB)
+	return concrete, ok
+}

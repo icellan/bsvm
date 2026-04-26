@@ -1,0 +1,68 @@
+name: Cross-EVM differential (full suite)
+
+# Runs the full ethereum/tests cross-EVM differential harness
+# (~2.6k GeneralStateTest fixtures) against both the Go EVM and the
+# SP1 prover. Per spec 12 ("Cross-EVM Differential Testing"), state-
+# root agreement between the two EVMs is the single most critical
+# correctness property — any divergence is a P0 blocker.
+#
+# The smoke subset runs in go-test.yml on every push. This workflow
+# runs the full suite on a daily cron and on manual dispatch. It also
+# uploads diffs.json as an artifact when mismatches occur so triage
+# can happen without re-running the full suite locally.
+#
+# All `run:` blocks operate on local repo files — no untrusted GitHub
+# event payloads are interpolated.
+
+on:
+  schedule:
+    # 03:17 UTC daily — off-peak so it doesn't fight PR-gate runners.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: cross-evm-diff-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-suite:
+    name: cross-EVM diff (full ~2.6k fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout bsv-evm
+        uses: actions/checkout@v4
+        with:
+          path: bsv-evm
+          submodules: recursive
+
+      - name: Checkout runar (sibling — go.mod replace targets ../runar)
+        uses: actions/checkout@v4
+        with:
+          repository: icellan/runar
+          path: runar
+          token: ${{ secrets.RUNAR_CHECKOUT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: bsv-evm/go.sum
+
+      - name: go test ./test/cross_evm_diff/ (full)
+        working-directory: bsv-evm
+        # 30-minute timeout per spec — on free-runner hardware the full
+        # suite is mock-prover bound and completes well under 10 minutes,
+        # but reserve headroom for the production revm guest swap.
+        run: go test -count=1 -v -timeout 30m -run TestCrossEVMDiff ./test/cross_evm_diff/
+
+      - name: Upload diff report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-evm-diffs
+          path: bsv-evm/test/cross_evm_diff/diffs.json
+          if-no-files-found: ignore
+          retention-days: 14

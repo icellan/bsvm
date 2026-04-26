@@ -126,9 +126,9 @@ func TestRaceDetector_HandleAdvance_Loss(t *testing.T) {
 func TestRaceDetector_BackoffDuration(t *testing.T) {
 	rd := NewRaceDetector(nil)
 
-	// Zero losses => zero backoff.
-	if d := rd.BackoffDuration(); d != 0 {
-		t.Errorf("expected 0 backoff at 0 losses, got %v", d)
+	// Zero losses => 50-200ms first-attempt jitter (spec 11).
+	if d := rd.BackoffDuration(); d < 50*time.Millisecond || d >= 200*time.Millisecond {
+		t.Errorf("expected 50-200ms first-attempt jitter at 0 losses, got %v", d)
 	}
 
 	// 1 loss => ~250ms (base=125ms * 2^1 = 250ms, ±jitter)

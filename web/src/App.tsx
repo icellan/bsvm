@@ -5,6 +5,7 @@ import Dashboard from "@/pages/Dashboard";
 import Block from "@/pages/Block";
 import Transaction from "@/pages/Transaction";
 import Address from "@/pages/Address";
+import ContractInteract from "@/pages/ContractInteract";
 import Bridge from "@/pages/Bridge";
 import Network from "@/pages/Network";
 import Search from "@/pages/Search";
@@ -26,6 +27,7 @@ export default function App() {
         <Route path="/block/:id" element={<Block />} />
         <Route path="/tx/:hash" element={<Transaction />} />
         <Route path="/address/:address" element={<Address />} />
+        <Route path="/address/:address/interact" element={<ContractInteract />} />
         <Route path="/bridge" element={<Bridge />} />
         <Route path="/network" element={<Network />} />
         <Route path="/search" element={<Search />} />

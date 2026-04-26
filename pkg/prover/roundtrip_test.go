@@ -659,3 +659,213 @@ func TestRoundTripMockBatchMultipleTransfers(t *testing.T) {
 		t.Errorf("recipient3 balance: got %d, want 300", r3Bal.Uint64())
 	}
 }
+
+// TestRoundTripMockTransferWithWithdrawals exercises the production-guest
+// happy path the way the overlay node will: a single EOA→EOA transfer plus
+// two L2→BSV withdrawals carried alongside in ProveInput. The mock prover
+// stands in for SP1 so this runs in milliseconds, but the public-values
+// blob is byte-identical to what the real guest would emit at every offset
+// the covenant inspects:
+//   - [0..32)    PreStateRoot  ← genesis StateRoot
+//   - [32..64)   PostStateRoot ← Go EVM IntermediateRoot after the batch
+//   - [64..96)   ReceiptsHash  ← MPT receipts trie root
+//   - [96..104)  GasUsed       ← 21000 for one transfer
+//   - [104..136) BatchDataHash ← hash256(tx-encoded-bytes)
+//   - [136..144) ChainID       ← 1337
+//   - [144..176) WithdrawalRoot ← bridge-side Merkle root over the two
+//                                  fixture withdrawals (NOT zero)
+//   - [272..280) BlockNumber   ← l2Block.NumberU64()
+//
+// This is the canonical 280-byte spec-12 layout (PublicValuesSize). The
+// covenant binds postStateRoot at [32..64) and BlockNumber at [272..280)
+// to advance the chain, so this test is the contract between the
+// production guest and the rest of the system.
+func TestRoundTripMockTransferWithWithdrawals(t *testing.T) {
+	database := db.NewMemoryDB()
+	chainConfig := vm.DefaultL2Config(roundtripChainID)
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	senderAddr := types.Address(crypto.PubkeyToAddress(key.PublicKey))
+	recipientAddr := types.HexToAddress("0xfeedfacefeedfacefeedfacefeedfacefeedface")
+	coinbaseAddr := types.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc")
+
+	// Genesis: fund the sender with 1000 ETH.
+	genesis := block.DefaultGenesis(roundtripChainID)
+	balance, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1000), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
+	genesis.Alloc = map[types.Address]block.GenesisAccount{
+		senderAddr: {Balance: balance},
+	}
+
+	genesisHeader, err := block.InitGenesis(database, genesis)
+	if err != nil {
+		t.Fatalf("InitGenesis failed: %v", err)
+	}
+	preStateRoot := genesisHeader.StateRoot
+
+	preStateDB, err := state.New(preStateRoot, database)
+	if err != nil {
+		t.Fatalf("failed to open pre-state: %v", err)
+	}
+
+	// Build a 1-ETH transfer.
+	signer := types.NewLondonSigner(big.NewInt(roundtripChainID))
+	tx, err := types.SignNewTx(key, signer, &types.DynamicFeeTx{
+		ChainID:   big.NewInt(roundtripChainID),
+		Nonce:     0,
+		GasTipCap: big.NewInt(1),
+		GasFeeCap: big.NewInt(1),
+		Gas:       21000,
+		To:        &recipientAddr,
+		Value:     uint256.NewInt(1_000_000_000_000_000_000),
+	})
+	if err != nil {
+		t.Fatalf("failed to sign tx: %v", err)
+	}
+
+	// Run the Go EVM with access recording so we can build a state export.
+	execStateDB, err := state.New(preStateRoot, database)
+	if err != nil {
+		t.Fatalf("failed to open exec state: %v", err)
+	}
+	execStateDB.StartAccessRecording()
+
+	executor := block.NewBlockExecutor(chainConfig, vm.Config{})
+	chainCtx := &testChainContext{}
+
+	l2Block, receipts, err := executor.ProcessBatch(
+		genesisHeader, coinbaseAddr, 1000,
+		[]*types.Transaction{tx}, execStateDB, chainCtx,
+	)
+	if err != nil {
+		t.Fatalf("ProcessBatch failed: %v", err)
+	}
+	if len(receipts) != 1 || receipts[0].Status != types.ReceiptStatusSuccessful {
+		t.Fatalf("unexpected receipt: %+v", receipts)
+	}
+	if receipts[0].GasUsed != 21000 {
+		t.Fatalf("expected 21000 gas, got %d", receipts[0].GasUsed)
+	}
+
+	postStateRoot := l2Block.StateRoot()
+	gasUsed := l2Block.GasUsed()
+	receiptsHash := mpt.DeriveSha(types.Receipts(receipts))
+	recording := execStateDB.StopAccessRecording()
+
+	// Sanity: post-state must differ from pre-state for a non-trivial transfer.
+	if postStateRoot == preStateRoot {
+		t.Fatalf("postStateRoot == preStateRoot — Go EVM did not move state")
+	}
+
+	// Two L2 → BSV withdrawals. The bridge covenant verifies inclusion via
+	// pkg/bridge.BuildWithdrawalMerkleTree, so the prover-side root MUST
+	// match that algorithm bit-for-bit (see pkg/prover/withdrawal_root.go
+	// and prover/guest/src/main.rs::build_withdrawal_merkle_root).
+	withdrawals := []Withdrawal{
+		{Recipient: types.HexToAddress("0x1111222233334444555566667777888899990000"), AmountSatoshis: 50_000, Nonce: 1},
+		{Recipient: types.HexToAddress("0xffffeeeeddddccccbbbbaaaa999988887777aaaa"), AmountSatoshis: 175_000, Nonce: 2},
+	}
+
+	export, err := ExportStateForProving(preStateDB, recording.Accounts, recording.Slots)
+	if err != nil {
+		t.Fatalf("ExportStateForProving failed: %v", err)
+	}
+	stateExportJSON, err := SerializeExport(export)
+	if err != nil {
+		t.Fatalf("SerializeExport failed: %v", err)
+	}
+
+	proveInput := &ProveInput{
+		PreStateRoot: preStateRoot,
+		StateExport:  stateExportJSON,
+		Transactions: [][]byte{encodeTx(t, tx)},
+		BlockContext: BlockContext{
+			Number:    l2Block.NumberU64(),
+			Timestamp: l2Block.Time(),
+			Coinbase:  coinbaseAddr,
+			GasLimit:  l2Block.GasLimit(),
+			BaseFee:   0,
+		},
+		Withdrawals: withdrawals,
+		ExpectedResults: &ExpectedResults{
+			PostStateRoot: postStateRoot,
+			ReceiptsHash:  receiptsHash,
+			GasUsed:       gasUsed,
+			ChainID:       roundtripChainID,
+		},
+	}
+
+	prover := NewSP1Prover(Config{Mode: ProverMock})
+	output, err := prover.Prove(context.Background(), proveInput)
+	if err != nil {
+		t.Fatalf("Prove (mock) failed: %v", err)
+	}
+	if got, want := len(output.PublicValues), PublicValuesSize; got != want {
+		t.Fatalf("public values length: got %d, want %d", got, want)
+	}
+
+	pv, err := ParsePublicValues(output.PublicValues)
+	if err != nil {
+		t.Fatalf("ParsePublicValues failed: %v", err)
+	}
+
+	// --- Canonical 280-byte layout assertions -------------------------------
+
+	if pv.PreStateRoot != preStateRoot {
+		t.Errorf("[0..32)  PreStateRoot:  got %s, want %s", pv.PreStateRoot.Hex(), preStateRoot.Hex())
+	}
+	if pv.PostStateRoot != postStateRoot {
+		t.Errorf("[32..64) PostStateRoot: got %s, want %s", pv.PostStateRoot.Hex(), postStateRoot.Hex())
+	}
+	if pv.ReceiptsHash != receiptsHash {
+		t.Errorf("[64..96) ReceiptsHash:  got %s, want %s", pv.ReceiptsHash.Hex(), receiptsHash.Hex())
+	}
+	if pv.GasUsed != 21000 {
+		t.Errorf("[96..104) GasUsed: got %d, want 21000", pv.GasUsed)
+	}
+	if pv.BatchDataHash == (types.Hash{}) {
+		t.Errorf("[104..136) BatchDataHash should not be zero for non-empty batch")
+	}
+	if pv.ChainID != roundtripChainID {
+		t.Errorf("[136..144) ChainID: got %d, want %d", pv.ChainID, roundtripChainID)
+	}
+	expectedWithdrawalRoot := computeWithdrawalRoot(withdrawals)
+	if pv.WithdrawalRoot != expectedWithdrawalRoot {
+		t.Errorf("[144..176) WithdrawalRoot: got %s, want %s",
+			pv.WithdrawalRoot.Hex(), expectedWithdrawalRoot.Hex())
+	}
+	if pv.WithdrawalRoot == (types.Hash{}) {
+		t.Errorf("[144..176) WithdrawalRoot should be non-zero with %d withdrawals", len(withdrawals))
+	}
+	if pv.InboxRootBefore != (types.Hash{}) {
+		t.Errorf("[176..208) InboxRootBefore should be zero (no inbox), got %s", pv.InboxRootBefore.Hex())
+	}
+	if pv.InboxRootAfter != (types.Hash{}) {
+		t.Errorf("[208..240) InboxRootAfter should be zero (no inbox), got %s", pv.InboxRootAfter.Hex())
+	}
+	if pv.MigrateScriptHash != (types.Hash{}) {
+		t.Errorf("[240..272) MigrateScriptHash should be zero (no migration), got %s", pv.MigrateScriptHash.Hex())
+	}
+	if pv.BlockNumber != l2Block.NumberU64() {
+		t.Errorf("[272..280) BlockNumber: got %d, want %d", pv.BlockNumber, l2Block.NumberU64())
+	}
+
+	// Belt-and-braces: explicit byte-window comparison so a future encoder
+	// drift can't sneak past the parsed-struct check above.
+	if got := types.BytesToHash(output.PublicValues[32:64]); got != postStateRoot {
+		t.Errorf("raw PV[32..64) PostStateRoot: got %s, want %s", got.Hex(), postStateRoot.Hex())
+	}
+	if got := types.BytesToHash(output.PublicValues[144:176]); got != expectedWithdrawalRoot {
+		t.Errorf("raw PV[144..176) WithdrawalRoot: got %s, want %s", got.Hex(), expectedWithdrawalRoot.Hex())
+	}
+
+	// Surface the canonical hashes in -v output so the round-trip evidence
+	// shows up in CI logs.
+	t.Logf("preStateRoot:          %s", preStateRoot.Hex())
+	t.Logf("postStateRoot (Go EVM): %s", postStateRoot.Hex())
+	t.Logf("postStateRoot (PV):     %s", pv.PostStateRoot.Hex())
+	t.Logf("withdrawalRoot:        %s", pv.WithdrawalRoot.Hex())
+	t.Logf("batchDataHash:         %s", pv.BatchDataHash.Hex())
+}

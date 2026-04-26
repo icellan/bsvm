@@ -2,6 +2,7 @@ package overlay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,11 @@ import (
 	"github.com/icellan/bsvm/pkg/tracing"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// ErrBatcherPaused is the sentinel error returned by Add when the batcher
+// is paused (governance freeze). RPC layers test for this via errors.Is
+// so they can map the failure to a "shard frozen" JSON-RPC error code.
+var ErrBatcherPaused = errors.New("shard frozen")
 
 // maxRecentHashes is the maximum number of recent transaction hashes
 // to track for deduplication.
@@ -45,9 +51,10 @@ type Batcher struct {
 
 	// flushTimer fires after flushDelay to flush a non-empty pending
 	// list. It is nil when there are no pending transactions.
-	flushTimer *time.Timer
-	stopped    bool
-	paused     bool // governance freeze pauses batch processing
+	flushTimer  *time.Timer
+	stopped     bool
+	paused      bool   // governance freeze pauses batch processing
+	pauseReason string // populated by Pause(reason) for diagnostics
 
 	// ---- Atomic counters (drive both Prometheus and Stats()) ----
 	acceptedTotal   atomic.Uint64
@@ -172,8 +179,12 @@ func (b *Batcher) Add(tx *types.Transaction) error {
 		if b.promPausedRejected != nil {
 			b.promPausedRejected.Inc()
 		}
+		reason := b.pauseReason
 		b.mu.Unlock()
-		return fmt.Errorf("batcher is paused (governance freeze)")
+		if reason == "" {
+			return ErrBatcherPaused
+		}
+		return fmt.Errorf("%w: %s", ErrBatcherPaused, reason)
 	}
 
 	txHash := tx.Hash()
@@ -331,22 +342,39 @@ func (b *Batcher) Stats() BatcherStats {
 
 // Pause pauses the batcher for governance freeze. New transactions are
 // rejected while paused, but existing pending transactions are retained.
-func (b *Batcher) Pause() {
+//
+// An optional reason string may be supplied; when present it is recorded
+// for diagnostics and surfaced through the error returned by Add (so RPC
+// callers can show why the shard refused the submission). Only the
+// first reason is used; passing zero arguments preserves the old API.
+func (b *Batcher) Pause(reason ...string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.paused = true
+	if len(reason) > 0 {
+		b.pauseReason = reason[0]
+	}
 	b.stopFlushTimer()
 }
 
-// Resume unpauses the batcher after a governance unfreeze. If there are
-// pending transactions, the flush timer is restarted.
-func (b *Batcher) Resume() {
+// Unpause is the canonical name for unpausing the batcher after a
+// governance unfreeze. If there are pending transactions, the flush
+// timer is restarted. Resume is preserved as an alias for backwards
+// compatibility.
+func (b *Batcher) Unpause() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.paused = false
+	b.pauseReason = ""
 	if len(b.pending) > 0 {
 		b.startFlushTimer()
 	}
+}
+
+// Resume unpauses the batcher after a governance unfreeze. Alias for
+// Unpause kept for backwards compatibility with admin RPC callers.
+func (b *Batcher) Resume() {
+	b.Unpause()
 }
 
 // IsPaused returns whether the batcher is currently paused.
@@ -354,6 +382,15 @@ func (b *Batcher) IsPaused() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.paused
+}
+
+// PauseReason returns the human-readable reason supplied to the most
+// recent Pause call. Empty when the batcher is not paused or was paused
+// without a reason.
+func (b *Batcher) PauseReason() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pauseReason
 }
 
 // Stop stops the batcher and cancels any pending flush timer.

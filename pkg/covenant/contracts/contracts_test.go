@@ -230,14 +230,13 @@ func TestFRIRollupContract_UnfreezeMethods(t *testing.T) {
 }
 
 func TestFRIRollupContract_UpgradeMethods(t *testing.T) {
-	// Mode 1 Upgrade does NOT carry an on-chain proof check (same trust
-	// model as AdvanceState). Common upgrade payload (excluding sigs) is
-	// 5 args: newCovenantScript, publicValues, batchData, proofBlob,
-	// newBlockNumber.
+	// Common upgrade payload (excluding sigs) is now 6 args:
+	// newCovenantScript, newCovenantAnfHash (spec 10 migration ANF
+	// publication), publicValues, batchData, proofBlob, newBlockNumber.
 	rt := reflect.TypeOf(&FRIRollupContract{})
-	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+5) // receiver + sig + 5 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+5) // receiver + 2 sigs + 5 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+5) // receiver + 3 sigs + 5 payload
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+6) // receiver + sig + 6 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+6) // receiver + 2 sigs + 6 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+6) // receiver + 3 sigs + 6 payload
 }
 
 func TestGroth16RollupContract_FreezeMethods(t *testing.T) {
@@ -255,13 +254,14 @@ func TestGroth16RollupContract_UnfreezeMethods(t *testing.T) {
 }
 
 func TestGroth16RollupContract_UpgradeMethods(t *testing.T) {
-	// Common upgrade payload (excluding sigs) for Groth16 is 16 args:
-	// newCovenantScript, publicValues, batchData, proofBlob,
-	// proofA, proofBX0/X1/Y0/Y1, proofC, g16Input0..4, newBlockNumber.
+	// Common upgrade payload (excluding sigs) for Groth16 is now 17 args:
+	// newCovenantScript, newCovenantAnfHash (spec 10), publicValues,
+	// batchData, proofBlob, proofA, proofBX0/X1/Y0/Y1, proofC,
+	// g16Input0..4, newBlockNumber.
 	rt := reflect.TypeOf(&Groth16RollupContract{})
-	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+16) // receiver + sig + 16 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+16)
-	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+16)
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+17) // receiver + sig + 17 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+17)
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+17)
 }
 
 func TestGroth16WARollupContract_FreezeMethods(t *testing.T) {
@@ -282,14 +282,13 @@ func TestGroth16WARollupContract_UpgradeMethods(t *testing.T) {
 	// Mode 3 Upgrade does NOT re-verify a proof (the witness preamble can
 	// only be used by a single method, and that method is AdvanceState),
 	// so the governance signatures are the sole authorization. Common
-	// upgrade payload is 2 args: newCovenantScript, newBlockNumber.
+	// upgrade payload is now 4 args: newCovenantScript, migrationHash,
+	// newCovenantAnfHash (spec 10 migration ANF publication),
+	// newBlockNumber.
 	rt := reflect.TypeOf(&Groth16WARollupContract{})
-	// F05: Mode 3 Upgrade* payload is 3 args — newCovenantScript,
-	// migrationHash, newBlockNumber — with migrationHash asserted equal
-	// to Hash256(newCovenantScript) on chain.
-	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+3) // receiver + sig + 3 payload
-	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+3)
-	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+3)
+	requireMethodArity(t, rt, "UpgradeSingleKey", 1+1+4) // receiver + sig + 4 payload
+	requireMethodArity(t, rt, "UpgradeMultiSig2", 1+2+4)
+	requireMethodArity(t, rt, "UpgradeMultiSig3", 1+3+4)
 }
 
 // ---------------------------------------------------------------------------

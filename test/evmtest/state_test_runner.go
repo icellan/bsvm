@@ -103,6 +103,238 @@ func RunStateTest(test *StateTest, fork string) []error {
 	return errs
 }
 
+// PostStateResult captures the actual outputs of executing a single
+// (test, fork, post-index) tuple. The cross-EVM differential harness
+// uses this to compare Go-EVM execution against the SP1 prover output.
+//
+// PostStateRoot is the computed post-execution state root (matching
+// what the production block executor commits). ExpectedRoot is the
+// fixture's declared post-state hash for this fork/index. ExecErr is
+// non-nil when the EVM rejected the transaction (intrinsic gas too
+// low, sender balance insufficient, etc.) — these failure cases still
+// produce a post-state root via the snapshot-revert path.
+type PostStateResult struct {
+	Fork          string
+	Index         int
+	PostStateRoot types.Hash
+	ExpectedRoot  types.Hash
+	GasUsed       uint64
+	ExecErr       error
+}
+
+// ExecuteStateTest runs a general state test for the specified fork
+// and returns the post-execution state root and gas used for each post
+// index, without asserting against the expected root. The cross-EVM
+// differential harness uses this so it can drive the prover with the
+// same inputs and compare both EVMs' computed roots.
+func ExecuteStateTest(test *StateTest, fork string) ([]PostStateResult, error) {
+	posts, ok := test.Post[fork]
+	if !ok {
+		return nil, nil
+	}
+
+	var results []PostStateResult
+	for i, post := range posts {
+		root, gasUsed, execErr, err := executeSinglePost(test, fork, post, i)
+		if err != nil {
+			return nil, fmt.Errorf("post[%d]: %w", i, err)
+		}
+		results = append(results, PostStateResult{
+			Fork:          fork,
+			Index:         i,
+			PostStateRoot: root,
+			ExpectedRoot:  hexToHash(post.Hash),
+			GasUsed:       gasUsed,
+			ExecErr:       execErr,
+		})
+	}
+	return results, nil
+}
+
+// executeSinglePost mirrors runSingleStateTest but returns the computed
+// post-state root and gas used instead of asserting against the
+// expected root. ExecErr captures EVM-level rejection (intrinsic gas,
+// nonce, etc.) — these failures still produce a valid post-state root
+// via the snapshot-revert path and matter for differential comparison.
+func executeSinglePost(test *StateTest, fork string, post PostState, index int) (types.Hash, uint64, error, error) {
+	chainConfig := getChainConfigForFork(fork)
+
+	memDB := db.NewMemoryDB()
+	sdb, err := state.New(types.EmptyRootHash, memDB)
+	if err != nil {
+		return types.Hash{}, 0, nil, fmt.Errorf("create statedb: %w", err)
+	}
+
+	for addrHex, acct := range test.Pre {
+		addr := hexToAddress(addrHex)
+		sdb.CreateAccount(addr)
+
+		balance := hexToUint256(acct.Balance)
+		sdb.AddBalance(addr, balance, tracing.BalanceChangeUnspecified)
+
+		nonce := hexToUint64(acct.Nonce)
+		if nonce > 0 {
+			sdb.SetNonce(addr, nonce, tracing.NonceChangeUnspecified)
+		}
+
+		code := hexToBytes(acct.Code)
+		if len(code) > 0 {
+			sdb.SetCode(addr, code, tracing.CodeChangeCreation)
+		}
+
+		for keyHex, valHex := range acct.Storage {
+			key := hexToHash(keyHex)
+			val := hexToHash(valHex)
+			sdb.SetState(addr, key, val)
+		}
+	}
+
+	preRoot, err := sdb.Commit(false)
+	if err != nil {
+		return types.Hash{}, 0, nil, fmt.Errorf("commit pre-state: %w", err)
+	}
+
+	sdb, err = state.New(preRoot, memDB)
+	if err != nil {
+		return types.Hash{}, 0, nil, fmt.Errorf("reopen statedb: %w", err)
+	}
+
+	dataIdx := post.Indexes.Data
+	gasIdx := post.Indexes.Gas
+	valueIdx := post.Indexes.Value
+
+	txData := getIndexed(test.Transaction.Data, dataIdx)
+	txGasLimit := getIndexed(test.Transaction.GasLimit, gasIdx)
+	txValue := getIndexed(test.Transaction.Value, valueIdx)
+
+	data := hexToBytes(txData)
+	gasLimit := hexToUint64(txGasLimit)
+	value := hexToBigInt(txValue)
+	valueU256, _ := uint256.FromBig(value)
+	if valueU256 == nil {
+		valueU256 = new(uint256.Int)
+	}
+
+	gasPrice := hexToBigInt(test.Transaction.GasPrice)
+	var gasFeeCap, gasTipCap *big.Int
+	if test.Transaction.MaxFeePerGas != "" {
+		gasFeeCap = hexToBigInt(test.Transaction.MaxFeePerGas)
+		gasTipCap = hexToBigInt(test.Transaction.MaxPriorityFeePerGas)
+	}
+	if gasFeeCap == nil {
+		gasFeeCap = new(big.Int).Set(gasPrice)
+	}
+	if gasTipCap == nil {
+		gasTipCap = new(big.Int).Set(gasPrice)
+	}
+
+	baseFee := hexToBigInt(test.Env.CurrentBaseFee)
+	if baseFee.Sign() > 0 {
+		gasPrice = new(big.Int).Add(gasTipCap, baseFee)
+		if gasPrice.Cmp(gasFeeCap) > 0 {
+			gasPrice = new(big.Int).Set(gasFeeCap)
+		}
+	}
+	if gasPrice == nil || gasPrice.Sign() == 0 {
+		if gasFeeCap != nil && gasFeeCap.Sign() > 0 {
+			gasPrice = new(big.Int).Set(gasFeeCap)
+		}
+	}
+
+	var sender types.Address
+	secretKey := hexToBytes(test.Transaction.SecretKey)
+	if len(secretKey) > 0 {
+		privKey, err := crypto.ToECDSA(secretKey)
+		if err != nil {
+			return types.Hash{}, 0, nil, fmt.Errorf("invalid secret key: %w", err)
+		}
+		sender = types.Address(crypto.PubkeyToAddress(privKey.PublicKey))
+	} else if test.Transaction.Sender != "" {
+		sender = hexToAddress(test.Transaction.Sender)
+	}
+
+	var to *types.Address
+	if test.Transaction.To != "" {
+		toAddr := hexToAddress(test.Transaction.To)
+		to = &toAddr
+	}
+
+	nonce := hexToUint64(test.Transaction.Nonce)
+
+	var accessList types.AccessList
+	if len(test.Transaction.AccessLists) > 0 {
+		alIdx := dataIdx
+		if alIdx >= len(test.Transaction.AccessLists) {
+			alIdx = len(test.Transaction.AccessLists) - 1
+		}
+		if alIdx >= 0 && alIdx < len(test.Transaction.AccessLists) {
+			raw := test.Transaction.AccessLists[alIdx]
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := json.Unmarshal(raw, &accessList); err != nil {
+					accessList = nil
+				}
+			}
+		}
+	}
+
+	var txBlobHashes []types.Hash
+	for _, h := range test.Transaction.BlobVersionedHashes {
+		txBlobHashes = append(txBlobHashes, hexToHash(h))
+	}
+	var txBlobFeeCap *big.Int
+	if test.Transaction.MaxFeePerBlobGas != "" {
+		txBlobFeeCap = hexToBigInt(test.Transaction.MaxFeePerBlobGas)
+	}
+
+	blockCtx := makeBlockContext(test.Env)
+	rules := chainConfig.Rules(blockCtx.BlockNumber, true, blockCtx.Time)
+
+	msg := &block.Message{
+		From:             sender,
+		To:               to,
+		Nonce:            nonce,
+		Value:            valueU256,
+		GasLimit:         gasLimit,
+		GasPrice:         gasPrice,
+		GasFeeCap:        gasFeeCap,
+		GasTipCap:        gasTipCap,
+		Data:             data,
+		AccessList:       accessList,
+		SkipNonceChecks:  false,
+		SkipFromEOACheck: false,
+	}
+
+	evmInstance := vm.NewEVM(blockCtx, sdb, chainConfig, vm.Config{})
+
+	gp := new(block.GasPool)
+	gp.AddGas(blockCtx.GasLimit)
+
+	evmInstance.TxContext = vm.TxContext{
+		Origin:     sender,
+		GasPrice:   gasPrice,
+		BlobHashes: txBlobHashes,
+		BlobFeeCap: txBlobFeeCap,
+	}
+
+	snapshot := sdb.Snapshot()
+
+	res, applyErr := block.ApplyMessage(evmInstance, msg, gp)
+	if applyErr != nil {
+		sdb.RevertToSnapshot(snapshot)
+		stateRoot := sdb.IntermediateRoot(rules.IsEIP158)
+		return stateRoot, 0, applyErr, nil
+	}
+
+	sdb.AddBalance(blockCtx.Coinbase, new(uint256.Int), tracing.BalanceChangeUnspecified)
+	stateRoot := sdb.IntermediateRoot(rules.IsEIP158)
+
+	var gasUsed uint64
+	if res != nil {
+		gasUsed = res.UsedGas
+	}
+	return stateRoot, gasUsed, nil, nil
+}
+
 func runSingleStateTest(test *StateTest, fork string, post PostState, index int) error {
 	chainConfig := getChainConfigForFork(fork)
 

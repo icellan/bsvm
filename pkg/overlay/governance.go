@@ -72,7 +72,7 @@ func (gm *GovernanceMonitor) HandleGovernanceFreeze() {
 
 	// Pause the batcher to stop accepting new transactions.
 	if gm.node != nil && gm.node.batcher != nil {
-		gm.node.batcher.Pause()
+		gm.node.batcher.Pause("covenant frozen by governance")
 	}
 
 	slog.Info("governance freeze applied: batcher paused, no new batches will be produced")

@@ -51,15 +51,15 @@ const groth16RollupContractPath = "pkg/covenant/contracts/rollup_groth16.runar.g
 // ---------------------------------------------------------------------------
 
 var (
-	gate0Groth16GenericOnce      sync.Once
-	gate0Groth16GenericVK        *covenant.Groth16VK
-	gate0Groth16GenericProof     bn254witness.Proof
-	gate0Groth16GenericInputs    covenant.Mode2AdjustedPublicInputs
-	gate0Groth16GenericRawInputs []*big.Int
-	gate0Groth16GenericLoadErr   error
+	gate0Groth16Once      sync.Once
+	gate0Groth16VK        *covenant.Groth16VK
+	gate0Groth16Proof     bn254witness.Proof
+	gate0Groth16Inputs    covenant.Mode2AdjustedPublicInputs
+	gate0Groth16RawInputs []*big.Int
+	gate0Groth16LoadErr   error
 )
 
-// loadGate0Groth16Generic loads the canonical Gate 0b SP1 Groth16 fixture
+// loadGate0Groth16 loads the canonical Gate 0b SP1 Groth16 fixture
 // in the form Mode 2 needs:
 //
 //   - A *covenant.Groth16VK with VK constants ready for
@@ -78,51 +78,51 @@ var (
 // runtime. See covenant.ApplyZeroInputWorkaround for the derivation.
 //
 // Results are cached across tests so fixture parsing only runs once.
-func loadGate0Groth16Generic(t *testing.T) (*covenant.Groth16VK, bn254witness.Proof, covenant.Mode2AdjustedPublicInputs) {
+func loadGate0Groth16(t *testing.T) (*covenant.Groth16VK, bn254witness.Proof, covenant.Mode2AdjustedPublicInputs) {
 	t.Helper()
-	gate0Groth16GenericOnce.Do(func() {
+	gate0Groth16Once.Do(func() {
 		vkPath := gate0SP1FixturePath("sp1_groth16_vk.json")
 		rawVK, err := covenant.LoadSP1Groth16VK(vkPath)
 		if err != nil {
-			gate0Groth16GenericLoadErr = err
+			gate0Groth16LoadErr = err
 			return
 		}
 
 		rawProofHex, err := os.ReadFile(gate0SP1FixturePath("groth16_raw_proof.hex"))
 		if err != nil {
-			gate0Groth16GenericLoadErr = err
+			gate0Groth16LoadErr = err
 			return
 		}
 		proof, err := bn254witness.ParseSP1RawProof(strings.TrimSpace(string(rawProofHex)))
 		if err != nil {
-			gate0Groth16GenericLoadErr = err
+			gate0Groth16LoadErr = err
 			return
 		}
-		gate0Groth16GenericProof = proof
+		gate0Groth16Proof = proof
 
 		rawInputs, err := bn254witness.LoadSP1PublicInputs(gate0SP1FixturePath("groth16_public_inputs.txt"))
 		if err != nil {
-			gate0Groth16GenericLoadErr = err
+			gate0Groth16LoadErr = err
 			return
 		}
 		if len(rawInputs) != covenant.Mode2PublicInputCount {
-			gate0Groth16GenericLoadErr = errSP1PublicInputCount(len(rawInputs))
+			gate0Groth16LoadErr = errSP1PublicInputCount(len(rawInputs))
 			return
 		}
-		gate0Groth16GenericRawInputs = rawInputs
+		gate0Groth16RawInputs = rawInputs
 
 		adjVK, adjInputs, err := covenant.ApplyZeroInputWorkaround(rawVK, rawInputs)
 		if err != nil {
-			gate0Groth16GenericLoadErr = err
+			gate0Groth16LoadErr = err
 			return
 		}
-		gate0Groth16GenericVK = adjVK
-		gate0Groth16GenericInputs = adjInputs
+		gate0Groth16VK = adjVK
+		gate0Groth16Inputs = adjInputs
 	})
-	if gate0Groth16GenericLoadErr != nil {
-		t.Fatalf("loadGate0Groth16Generic: %v", gate0Groth16GenericLoadErr)
+	if gate0Groth16LoadErr != nil {
+		t.Fatalf("loadGate0Groth16: %v", gate0Groth16LoadErr)
 	}
-	return gate0Groth16GenericVK, gate0Groth16GenericProof, gate0Groth16GenericInputs
+	return gate0Groth16VK, gate0Groth16Proof, gate0Groth16Inputs
 }
 
 type errSP1PublicInputCount int
@@ -238,7 +238,7 @@ func paddedFp(v *big.Int) []byte {
 func deployGroth16Rollup(t *testing.T) (*runar.RunarContract, runar.Provider, runar.Signer, *helpers.Wallet, error) {
 	t.Helper()
 
-	vk, _, _ := loadGate0Groth16Generic(t)
+	vk, _, _ := loadGate0Groth16(t)
 
 	artifact, err := compileContract(groth16RollupContractPath)
 	if err != nil {
@@ -347,7 +347,7 @@ func TestRollupGroth16_FullLifecycle(t *testing.T) {
 		t.Fatalf("deploy Groth16 covenant: %v", deployErr)
 	}
 
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 
 	deployTxid := contract.GetCurrentUtxo().Txid
 	deploySize := fullGetTxSize(t, deployTxid)
@@ -417,7 +417,7 @@ func TestRollupGroth16_RejectWrongPreStateRoot(t *testing.T) {
 	if deployErr != nil {
 		t.Fatalf("deploy: %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 
 	z32 := hexZeros32()
 	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
@@ -439,7 +439,7 @@ func TestRollupGroth16_RejectSkippedBlockNumber(t *testing.T) {
 	if deployErr != nil {
 		t.Fatalf("deploy: %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 
 	z32 := hexZeros32()
 	args := buildGroth16AdvanceArgs(z32, 2, proof, pubInputs) // skip block 1, jump to 2
@@ -457,7 +457,7 @@ func TestRollupGroth16_RejectBadProofBlob(t *testing.T) {
 	if deployErr != nil {
 		t.Fatalf("deploy: %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 
 	z32 := hexZeros32()
 	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
@@ -476,7 +476,7 @@ func TestRollupGroth16_RejectWrongChainID(t *testing.T) {
 	if deployErr != nil {
 		t.Fatalf("deploy: %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 
 	z32 := hexZeros32()
 	newStateRoot := hexStateRoot(1)
@@ -500,7 +500,7 @@ func TestRollupGroth16_RejectWrongPostStateRoot(t *testing.T) {
 	if deployErr != nil {
 		t.Skipf("deploy failed (expected on constrained regtest): %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 	z32 := hexZeros32()
 	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
 	args[0] = "ff" + args[0].(string)[2:]
@@ -518,7 +518,7 @@ func TestRollupGroth16_RejectBadBatchData(t *testing.T) {
 	if deployErr != nil {
 		t.Skipf("deploy failed (expected on constrained regtest): %v", deployErr)
 	}
-	_, proof, pubInputs := loadGate0Groth16Generic(t)
+	_, proof, pubInputs := loadGate0Groth16(t)
 	z32 := hexZeros32()
 	args := buildGroth16AdvanceArgs(z32, 1, proof, pubInputs)
 	args[3] = hexGenBatchData("ff"+z32[2:], hexStateRoot(99), batchDataSize)

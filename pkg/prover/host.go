@@ -52,6 +52,21 @@ type BlockContext struct {
 	Random types.Hash `json:"random"`
 }
 
+// Withdrawal is an L2 → BSV bridge withdrawal record carried into the
+// SP1 guest as part of ProveInput. The guest computes the withdrawal
+// Merkle root (committed in public values at offset 144) using these.
+//
+// Recipient is the 20-byte BSV address (RIPEMD160(SHA256(pubkey))).
+// AmountSatoshis is the satoshi-denominated amount (uint64 BE in the
+// Merkle leaf), Nonce is the bridge contract's per-withdrawal nonce.
+// The leaf is hash256(Recipient || AmountSatoshis_be || Nonce_be), with
+// the binary SHA256 tree built per pkg/bridge/withdrawal.go.
+type Withdrawal struct {
+	Recipient      types.Address `json:"recipient"`
+	AmountSatoshis uint64        `json:"amount"`
+	Nonce          uint64        `json:"nonce"`
+}
+
 // ProveInput contains everything needed to generate a STARK proof.
 type ProveInput struct {
 	// PreStateRoot is the state root before executing the batch.
@@ -70,6 +85,13 @@ type ProveInput struct {
 	// InboxRootAfter is the inbox queue hash after draining pending
 	// inbox transactions. Computed from InboxMonitor state.
 	InboxRootAfter types.Hash `json:"inbox_root_after"`
+
+	// Withdrawals is the list of L2 → BSV bridge withdrawals included in
+	// this batch. The SP1 guest folds these into a binary SHA256 Merkle
+	// tree and commits the root in public values at offset 144 so the
+	// bridge covenant can verify withdrawal claims off the STARK-attested
+	// root. May be empty: empty list ⇒ withdrawalRoot = bytes32(0).
+	Withdrawals []Withdrawal `json:"withdrawals,omitempty"`
 
 	// ExpectedResults holds the expected execution outputs from the Go EVM.
 	// In mock mode, these values are used to populate PublicValues so that
@@ -210,7 +232,7 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 	pv := &PublicValues{
 		PreStateRoot:      input.PreStateRoot,
 		BatchDataHash:     hashTransactions(input.Transactions),
-		WithdrawalRoot:    types.Hash{},
+		WithdrawalRoot:    computeWithdrawalRoot(input.Withdrawals),
 		InboxRootBefore:   input.InboxRootBefore,
 		InboxRootAfter:    input.InboxRootAfter,
 		MigrateScriptHash: types.Hash{},

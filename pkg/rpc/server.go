@@ -51,10 +51,11 @@ type RPCServer struct {
 	httpServer  *http.Server
 	wsServer    *http.Server // separate WebSocket server on WSAddr
 	limiter     *rateLimiter // per-IP rate limiting
-	registry    *metrics.Registry
-	authConfig  auth.Config
-	logStreamer *LogStreamer
-	indexer     IndexerReader
+	registry      *metrics.Registry
+	authConfig    auth.Config
+	logStreamer   *LogStreamer
+	indexer       IndexerReader
+	beefEndpoints *BEEFEndpoints
 }
 
 // IndexerReader is the read-side of pkg/indexer that bsv_getAddressTxs
@@ -174,39 +175,7 @@ func (s *RPCServer) Start() error {
 		s.limiter = newRateLimiter(s.config.RequestsPerSecond, s.config.BurstSize)
 	}
 
-	// HTTP server for JSON-RPC + static SPA.
-	httpMux := http.NewServeMux()
-	if s.registry != nil {
-		// Expose Prometheus scrape. Mounted before "/" so it bypasses
-		// the JSON-RPC dispatcher. OpenMetrics is negotiated via the
-		// Accept header by promhttp.
-		httpMux.Handle("/metrics", s.registry.HTTPHandler())
-	}
-	// /admin/rpc — authenticated admin JSON-RPC. Only mounted when
-	// admin auth has been configured; a node with no admin credentials
-	// simply doesn't expose the surface.
-	if s.authConfig.DevAuthSecret != "" || s.authConfig.GovernanceChecker != nil {
-		adminHandler := http.HandlerFunc(s.handleAdminRPC)
-		httpMux.Handle("/admin/rpc", s.authConfig.Middleware(adminHandler))
-	}
-
-	// /.well-known/auth — BRC-103 handshake endpoint. Required for
-	// admin wallets to open a session; gated on the same auth config
-	// so a node with no wallet-auth wiring returns 503 rather than
-	// silently missing the endpoint.
-	if s.authConfig.ServerIdentity != nil && s.authConfig.GovernanceChecker != nil && s.authConfig.SessionStore != nil {
-		httpMux.Handle("/.well-known/auth", s.authConfig.HandshakeHandler())
-	}
-
-	// Root handler: GET → embedded explorer SPA (spec 15), POST → JSON-RPC.
-	// webui.Handler delegates non-GET requests to the RPC handler, so the
-	// dispatcher still sees every JSON-RPC call exactly as before.
-	httpMux.Handle("/", webui.Handler(http.HandlerFunc(s.handleHTTP)))
-
-	var httpHandler http.Handler = httpMux
-	if s.limiter != nil {
-		httpHandler = s.limiter.middleware(httpHandler)
-	}
+	httpHandler := s.buildHTTPHandler()
 
 	s.httpServer = &http.Server{
 		Addr:    s.config.HTTPAddr,
@@ -244,6 +213,57 @@ func (s *RPCServer) Start() error {
 	}()
 
 	return nil
+}
+
+// buildHTTPHandler assembles the public HTTP mux: JSON-RPC dispatcher,
+// embedded explorer SPA, /admin/rpc, /.well-known/auth, and the
+// Prometheus /metrics scrape endpoint. Extracted from Start() so tests
+// can drive the same mux through httptest.ResponseRecorder without
+// binding a TCP port.
+func (s *RPCServer) buildHTTPHandler() http.Handler {
+	httpMux := http.NewServeMux()
+	if s.registry != nil {
+		// Expose Prometheus scrape. Mounted before "/" so it bypasses
+		// the JSON-RPC dispatcher. OpenMetrics is negotiated via the
+		// Accept header by promhttp. Per spec 15 the endpoint is
+		// unauthenticated — operators bind the HTTP server to
+		// localhost (or an internal interface) when running in modes
+		// that don't enable BRC-104 admin auth.
+		httpMux.Handle("/metrics", s.registry.HTTPHandler())
+	}
+	// /admin/rpc — authenticated admin JSON-RPC. Only mounted when
+	// admin auth has been configured; a node with no admin credentials
+	// simply doesn't expose the surface.
+	if s.authConfig.DevAuthSecret != "" || s.authConfig.GovernanceChecker != nil {
+		adminHandler := http.HandlerFunc(s.handleAdminRPC)
+		httpMux.Handle("/admin/rpc", s.authConfig.Middleware(adminHandler))
+	}
+
+	// /.well-known/auth — BRC-103 handshake endpoint. Required for
+	// admin wallets to open a session; gated on the same auth config
+	// so a node with no wallet-auth wiring returns 503 rather than
+	// silently missing the endpoint.
+	if s.authConfig.ServerIdentity != nil && s.authConfig.GovernanceChecker != nil && s.authConfig.SessionStore != nil {
+		httpMux.Handle("/.well-known/auth", s.authConfig.HandshakeHandler())
+	}
+
+	// Spec-17 BEEF gossip + ARC callback endpoints. Mounted before the
+	// catch-all "/" handler so they take precedence; each endpoint is a
+	// concrete path so there is no overlap with the explorer SPA.
+	if s.beefEndpoints != nil {
+		s.beefEndpoints.Mount(httpMux)
+	}
+
+	// Root handler: GET → embedded explorer SPA (spec 15), POST → JSON-RPC.
+	// webui.Handler delegates non-GET requests to the RPC handler, so the
+	// dispatcher still sees every JSON-RPC call exactly as before.
+	httpMux.Handle("/", webui.Handler(http.HandlerFunc(s.handleHTTP)))
+
+	var httpHandler http.Handler = httpMux
+	if s.limiter != nil {
+		httpHandler = s.limiter.middleware(httpHandler)
+	}
+	return httpHandler
 }
 
 // Stop gracefully shuts down the HTTP and WebSocket servers and the
@@ -865,6 +885,11 @@ func (s *RPCServer) handleEthEstimateGas(params json.RawMessage) (interface{}, e
 }
 
 // handleEthSendRawTransaction parses params for eth_sendRawTransaction.
+//
+// When the underlying batcher is paused (governance freeze), the
+// returned error matches overlay.IsBatcherPausedErr; we surface that as
+// a -32000 server error with a "shard frozen" message so wallets can
+// recognise the failure mode and stop retrying.
 func (s *RPCServer) handleEthSendRawTransaction(params json.RawMessage) (interface{}, error) {
 	var args []json.RawMessage
 	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
@@ -878,7 +903,14 @@ func (s *RPCServer) handleEthSendRawTransaction(params json.RawMessage) (interfa
 	if err != nil {
 		return nil, newRPCError(errCodeInvalidParams, "invalid hex encoding: "+err.Error())
 	}
-	return s.ethAPI.SendRawTransaction(txBytes)
+	hash, err := s.ethAPI.SendRawTransaction(txBytes)
+	if err != nil {
+		if overlay.IsBatcherPausedErr(err) {
+			return nil, newRPCError(errCodeServerError, "shard frozen: "+err.Error())
+		}
+		return nil, err
+	}
+	return hash, nil
 }
 
 // handleEthGetTransactionByHash parses params for eth_getTransactionByHash.

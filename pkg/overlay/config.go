@@ -76,21 +76,29 @@ type OverlayConfig struct {
 	// deployment. Read by the admin RPC surface so auth middleware
 	// and the explorer can show the operator which covenant is live.
 	ProveMode string
+
+	// ConfirmationPollInterval is how often the ConfirmationWatcher polls
+	// the broadcast client for BSV confirmation counts on outstanding
+	// covenant-advance broadcasts. Drives confirmedTip / finalizedTip
+	// and therefore the safe / finalized block tags. Default: 10s.
+	// A non-positive value is treated as the default at watcher start.
+	ConfirmationPollInterval time.Duration
 }
 
 // DefaultOverlayConfig returns an OverlayConfig with sensible defaults.
 func DefaultOverlayConfig() OverlayConfig {
 	return OverlayConfig{
-		BlockGasLimit:         30_000_000,
-		MaxBatchSize:          128,
-		MaxBatchFlushDelay:    2 * time.Second,
-		MinGasPrice:           big.NewInt(1_000_000_000), // 1 gwei
-		MaxSpeculativeDepth:   16,
-		ChainID:               1,
-		TargetBatchSize:       128,
-		MinBatchSize:          1,
-		MinProfitableBatchGas: 0,
-		BlockInterval:         1,
-		RequireRealProof:      false,
+		BlockGasLimit:            30_000_000,
+		MaxBatchSize:             128,
+		MaxBatchFlushDelay:       2 * time.Second,
+		MinGasPrice:              big.NewInt(1_000_000_000), // 1 gwei
+		MaxSpeculativeDepth:      16,
+		ChainID:                  1,
+		TargetBatchSize:          128,
+		MinBatchSize:             1,
+		MinProfitableBatchGas:    0,
+		BlockInterval:            1,
+		RequireRealProof:         false,
+		ConfirmationPollInterval: 10 * time.Second,
 	}
 }
