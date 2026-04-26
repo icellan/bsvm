@@ -37,8 +37,8 @@ struct BlockContext {
 /// account data revm needs to populate its CacheDB AND the Merkle witness
 /// the SP1 guest uses to bind that data to `pre_state_root`. The witness
 /// fields (`account_proof`, `storage_root`, `storage_slots[].proof`) come
-/// from `pkg/prover/state_export.go` and the older flat encoding (storage
-/// list with no proofs) is retained as a fallback for legacy callers.
+/// from `pkg/prover/state_export.go` and are MANDATORY (W4-1 mainnet
+/// hardening): an envelope without proofs is rejected at decode time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountExport {
     address: String,
@@ -46,29 +46,15 @@ struct AccountExport {
     balance: String,
     code_hash: String,
     code: String,
-    /// Flat storage list (legacy wire format). Only populated by older
-    /// callers. New callers use `storage_slots` which carries proofs.
-    #[serde(default)]
-    storage: Vec<StorageExport>,
     /// W4-1 witness: storage slots with proofs against `storage_root`.
-    /// Optional for backward compatibility.
     #[serde(default)]
     storage_slots: Vec<StorageSlotExport>,
     /// W4-1 witness: hex-encoded RLP MPT nodes proving this account
-    /// against `pre_state_root`. Optional for backward compatibility.
-    #[serde(default)]
+    /// against `pre_state_root`. Required (must be non-empty).
     account_proof: Vec<String>,
-    /// Storage trie root for this account. Required when `storage_slots`
-    /// is present so the guest can verify each slot proof.
-    #[serde(default)]
+    /// Storage trie root for this account. Required so the guest can
+    /// verify each storage slot proof under it.
     storage_root: String,
-}
-
-/// Storage slot from the legacy state export (no proof).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StorageExport {
-    key: String,
-    value: String,
 }
 
 /// Storage slot from the W4-1 witness (with proof against storage_root).
@@ -233,10 +219,10 @@ struct GuestBatchInput {
     inbox_queue: Vec<GuestInboxTx>,
     inbox_drain_count: u32,
     inbox_must_drain_all: bool,
-    /// W4-1 / Gate-0 Merkle witnesses. `None` falls back to the legacy
-    /// host-trusted path in the guest. The host always populates this when
-    /// the input carries proof data.
-    state_proofs: Option<Vec<GuestAccountProofWitness>>,
+    /// W4-1 / Gate-0 Merkle witnesses. Mandatory under mainnet hardening
+    /// — the guest rejects batches without proofs (the legacy host-
+    /// trusted fallback has been removed).
+    state_proofs: Vec<GuestAccountProofWitness>,
 }
 
 // ─── Output types (JSON to Go host) ──────────────────────────────────────────
@@ -289,7 +275,13 @@ fn hex_to_address(s: &str) -> [u8; 20] {
 }
 
 /// Convert host input to guest-compatible format.
-fn convert_input(input: &HostInput) -> GuestBatchInput {
+///
+/// Returns an error when the envelope is missing the W4-1 / Gate-0
+/// Merkle witnesses for any host-supplied account. The mainnet-hardened
+/// guest refuses to verify pre-state without proofs, so a degraded
+/// envelope is fatal at the bridge layer rather than producing an
+/// unprovable batch.
+fn convert_input(input: &HostInput) -> Result<GuestBatchInput, String> {
     let pre_state_root = hex_to_bytes32(&input.pre_state_root);
 
     // Each account is forwarded in two parallel arrays: the flat
@@ -299,25 +291,14 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         .accounts
         .iter()
         .map(|a| {
-            // Prefer the proof-bearing storage_slots when present; fall
-            // back to the legacy flat storage list otherwise.
-            let storage: Vec<GuestStorageSlot> = if !a.storage_slots.is_empty() {
-                a.storage_slots
-                    .iter()
-                    .map(|s| GuestStorageSlot {
-                        key: hex_to_bytes32(&s.key),
-                        value: hex_to_bytes32(&s.value),
-                    })
-                    .collect()
-            } else {
-                a.storage
-                    .iter()
-                    .map(|s| GuestStorageSlot {
-                        key: hex_to_bytes32(&s.key),
-                        value: hex_to_bytes32(&s.value),
-                    })
-                    .collect()
-            };
+            let storage: Vec<GuestStorageSlot> = a
+                .storage_slots
+                .iter()
+                .map(|s| GuestStorageSlot {
+                    key: hex_to_bytes32(&s.key),
+                    value: hex_to_bytes32(&s.value),
+                })
+                .collect();
 
             GuestAccountState {
                 address: hex_to_address(&a.address),
@@ -330,36 +311,37 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         })
         .collect();
 
-    // Build the Merkle witness array iff at least one account carries a
-    // proof. The guest treats `None` as legacy (host-trusted) input.
-    let any_proofs = input
+    // W4-1 mainnet hardening: every account MUST carry a Merkle witness.
+    // Reject the envelope if any are missing — the guest would otherwise
+    // bail out with error code 0x06 after wasting cycles on setup.
+    for a in &input.accounts {
+        if a.account_proof.is_empty() {
+            return Err(format!(
+                "account {} is missing the W4-1 account_proof — \
+                 mainnet-hardened guest requires Merkle witnesses for \
+                 every account in state_proofs",
+                a.address
+            ));
+        }
+    }
+    let state_proofs: Vec<GuestAccountProofWitness> = input
         .accounts
         .iter()
-        .any(|a| !a.account_proof.is_empty() || !a.storage_slots.is_empty());
-    let state_proofs: Option<Vec<GuestAccountProofWitness>> = if any_proofs {
-        Some(
-            input
-                .accounts
+        .map(|a| GuestAccountProofWitness {
+            address: hex_to_address(&a.address),
+            account_proof: a.account_proof.iter().map(|h| hex_decode(h)).collect(),
+            storage_root: hex_to_bytes32(&a.storage_root),
+            storage_slots: a
+                .storage_slots
                 .iter()
-                .map(|a| GuestAccountProofWitness {
-                    address: hex_to_address(&a.address),
-                    account_proof: a.account_proof.iter().map(|h| hex_decode(h)).collect(),
-                    storage_root: hex_to_bytes32(&a.storage_root),
-                    storage_slots: a
-                        .storage_slots
-                        .iter()
-                        .map(|s| GuestStorageProofWitness {
-                            key: hex_to_bytes32(&s.key),
-                            value: hex_to_bytes32(&s.value),
-                            proof: s.proof.iter().map(|h| hex_decode(h)).collect(),
-                        })
-                        .collect(),
+                .map(|s| GuestStorageProofWitness {
+                    key: hex_to_bytes32(&s.key),
+                    value: hex_to_bytes32(&s.value),
+                    proof: s.proof.iter().map(|h| hex_decode(h)).collect(),
                 })
                 .collect(),
-        )
-    } else {
-        None
-    };
+        })
+        .collect();
 
     let transactions: Vec<GuestTransaction> = input
         .transactions
@@ -432,7 +414,7 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         })
         .collect();
 
-    GuestBatchInput {
+    Ok(GuestBatchInput {
         pre_state_root,
         accounts,
         transactions,
@@ -442,7 +424,7 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         inbox_drain_count: input.inbox_drain_count,
         inbox_must_drain_all: input.inbox_must_drain_all,
         state_proofs,
-    }
+    })
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -472,8 +454,25 @@ async fn main() {
         }
     };
 
-    // Convert to guest-compatible format.
-    let guest_input = convert_input(&host_input);
+    // Convert to guest-compatible format. Rejects envelopes lacking the
+    // W4-1 / Gate-0 Merkle witnesses (mainnet hardening) — the previous
+    // legacy host-trusted fallback has been removed from the guest.
+    let guest_input = match convert_input(&host_input) {
+        Ok(g) => g,
+        Err(e) => {
+            let output = HostOutput {
+                proof: String::new(),
+                public_values: String::new(),
+                vk_hash: String::new(),
+                cycles: 0,
+                proving_time_ms: 0,
+                sp1_version: String::new(),
+                error: Some(format!("invalid host input: {}", e)),
+            };
+            println!("{}", serde_json::to_string(&output).unwrap());
+            return;
+        }
+    };
 
     // Set up SP1 prover client.
     let client = ProverClient::builder().cpu().build().await;

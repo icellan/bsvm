@@ -232,20 +232,17 @@ pub struct BatchInput {
     /// the proof is aborted.
     #[serde(default)]
     pub inbox_must_drain_all: bool,
-    /// Optional Merkle witnesses that bind every account/storage value the
-    /// guest loads to `pre_state_root`. When present, the guest verifies
-    /// each entry against the committed root before any opcode executes —
-    /// this is the W4-1 / Gate-0 anti-host-trust path mandated by
-    /// spec 12 §"Verify the pre-state root".
+    /// Merkle witnesses that bind every account/storage value the guest
+    /// loads to `pre_state_root`. The guest verifies each entry against
+    /// the committed root before any opcode executes — this is the
+    /// W4-1 / Gate-0 anti-host-trust path mandated by spec 12 §"Verify
+    /// the pre-state root".
     ///
-    /// When `None` (legacy wire format), the guest falls back to the
-    /// original "host-trusted accounts + recompute root" check. This is
-    /// the rollout flag described in W4-1 — it lets the host bridge
-    /// upgrade incrementally without breaking older callers. The flag
-    /// MUST be removed (and `state_proofs` made required) before the
-    /// guest VK is pinned for mainnet.
-    #[serde(default)]
-    pub state_proofs: Option<Vec<AccountProofWitness>>,
+    /// MUST cover every entry in `accounts` (one witness per address).
+    /// A missing witness is treated as a fatal error (code 0x06): the
+    /// host could otherwise hide an account from verification while
+    /// still feeding it to revm.
+    pub state_proofs: Vec<AccountProofWitness>,
 }
 
 /// A simplified receipt for RLP encoding and hashing.
@@ -307,35 +304,28 @@ pub fn main() {
 
     // ── 3. Verify the pre-state root matches ─────────────────────────────
     //
-    // W4-1 (Gate-0): when the host ships Merkle witnesses, verify EACH
-    // account and storage value against the committed pre_state_root via
-    // the proof. This is the only binding that prevents a malicious host
-    // from feeding the guest fabricated state. See spec 12 §"Verify the
-    // pre-state root" and pkg/prover/state_export.go.
-    //
-    // When state_proofs is None (older host bridge), fall back to the
-    // legacy "host-trusted accounts + recompute root" check. This is the
-    // rollout flag — drop the legacy branch before pinning a mainnet VK.
-    if let Some(witnesses) = input.state_proofs.as_ref() {
-        if let Err(code) =
-            verify_pre_state(&input.pre_state_root, &input.accounts, witnesses.as_slice())
-        {
-            // Error code 0x02..0x05: per-witness proof failure (see
-            // verify_pre_state for the code map). The host can detect
-            // this by inspecting public values [64..96].
-            let mut probe = [0u8; 32];
-            probe[0] = code;
-            commit_error(code, &input.pre_state_root, &probe);
-            return;
-        }
-    } else {
-        let computed_pre_root = mpt.root_hash();
-        if computed_pre_root != input.pre_state_root {
-            // Error code 0x01: pre-state root mismatch (legacy path).
-            commit_error(0x01, &input.pre_state_root, &computed_pre_root);
-            return;
-        }
+    // W4-1 (Gate-0, mainnet hardening): the host MUST ship Merkle
+    // witnesses for every accessed account/storage slot, and the guest
+    // verifies each against the committed `pre_state_root` before any
+    // opcode executes. This is the only binding that prevents a
+    // malicious host from feeding the guest fabricated state. See
+    // spec 12 §"Verify the pre-state root" and pkg/prover/state_export.go.
+    if let Err(code) = verify_pre_state(
+        &input.pre_state_root,
+        &input.accounts,
+        input.state_proofs.as_slice(),
+    ) {
+        // Error code 0x02..0x06: per-witness proof failure (see
+        // verify_pre_state for the code map). The host can detect
+        // this by inspecting public values [64..96].
+        let mut probe = [0u8; 32];
+        probe[0] = code;
+        commit_error(code, &input.pre_state_root, &probe);
+        return;
     }
+    // `mpt` is still loaded so the post-state root can be computed in
+    // step 5; it is no longer used for pre-state verification.
+    let _ = &mpt;
 
     // ── 4. Execute each transaction through revm ─────────────────────────
     let mut receipts: Vec<Receipt> = Vec::new();
@@ -645,7 +635,7 @@ fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
 
 /// Verify every host-supplied account (and accessed storage slot) against
 /// `pre_state_root` using the supplied Merkle witnesses. Returns an error
-/// code in the range 0x02..=0x05 on mismatch (see `commit_error` for the
+/// code in the range 0x02..=0x06 on mismatch (see `commit_error` for the
 /// reporting layout).
 ///
 /// This is the W4-1 / Gate-0 anti-host-trust check. Without it, the guest
@@ -657,11 +647,24 @@ fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
 ///   0x03 — account leaf disagrees with the host-supplied AccountState
 ///   0x04 — storage proof did not reconcile with the account's storage_root
 ///   0x05 — storage value disagrees with the host-supplied StorageSlot
+///   0x06 — host-supplied account is missing a corresponding witness
+///          (the host could otherwise feed unverified state to revm)
 fn verify_pre_state(
     pre_state_root: &[u8; 32],
     accounts: &[AccountState],
     witnesses: &[AccountProofWitness],
 ) -> Result<(), u8> {
+    // Coverage check (W4-1 mainnet hardening): every account that the
+    // host loads into revm MUST have a matching witness. Without this
+    // check, a malicious host could ship `accounts: [forged]` paired
+    // with `state_proofs: []` and the rest of the loop would happily
+    // verify zero witnesses against `pre_state_root`.
+    for acct in accounts {
+        if !witnesses.iter().any(|w| w.address == acct.address) {
+            return Err(0x06);
+        }
+    }
+
     // Build address -> account lookup.
     for w in witnesses {
         let host_acct = accounts.iter().find(|a| a.address == w.address);
@@ -1026,5 +1029,92 @@ fn bloom_add(bloom: &mut [u8; 256], data: &[u8]) {
     for i in 0..3 {
         let bit = (((hash[2 * i] as usize) << 8) | (hash[2 * i + 1] as usize)) & 2047;
         bloom[255 - bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+//
+// As with `inbox::tests` and `proof_verify::tests`, these cases live in a
+// `#[cfg(test)]` block alongside the production code. They cannot run on
+// the host stable rust toolchain today because the SP1 v6.0.2 SDK pins
+// MSRV gates the workspace crates inherit (see docs/decisions/inbox-drain.md
+// "D5 / D6"), but they document the contract and run inside the SP1
+// testing path when the toolchain catches up. The Go-side tests in
+// `pkg/prover/bridge_input_test.go` cover the host-bridge invariant end-
+// to-end against the public ProveInput API, which is the binding that
+// matters for production.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an empty `AccountState` for a given address.
+    fn empty_acct(addr: Address) -> AccountState {
+        AccountState {
+            address: addr,
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash: KECCAK_EMPTY,
+            code: Vec::new(),
+            storage: Vec::new(),
+        }
+    }
+
+    /// Build a witness-shaped value pointing at `addr` with no actual
+    /// proof data. We never invoke `verify_proof` from these unit tests
+    /// — the coverage rule fires before the proof walk on missing
+    /// witness, and the empty-accounts path doesn't enter the loop at
+    /// all.
+    fn empty_witness(addr: Address) -> AccountProofWitness {
+        AccountProofWitness {
+            address: addr,
+            account_proof: Vec::new(),
+            storage_root: EMPTY_ROOT.0,
+            storage_slots: Vec::new(),
+        }
+    }
+
+    /// W4-1 mainnet hardening: `state_proofs` may legitimately be empty
+    /// only when the host also passes zero accounts. This is the trivial
+    /// "empty batch" path — no opcode runs, no state is read, so there
+    /// is nothing to prove. `verify_pre_state` exits cleanly.
+    #[test]
+    fn empty_state_proofs_ok_when_no_accounts() {
+        let pre_state_root = [0u8; 32];
+        let accounts: Vec<AccountState> = Vec::new();
+        let witnesses: Vec<AccountProofWitness> = Vec::new();
+        let res = verify_pre_state(&pre_state_root, &accounts, &witnesses);
+        assert!(res.is_ok());
+    }
+
+    /// Coverage gate: any host-supplied account that has no matching
+    /// witness MUST trigger error 0x06. Without this rule a malicious
+    /// host could ship a forged account in `accounts` and an empty
+    /// `state_proofs` array — the rest of `verify_pre_state` would
+    /// happily verify zero witnesses against `pre_state_root` and revm
+    /// would then execute against the forged account.
+    #[test]
+    fn missing_witness_for_account_is_rejected() {
+        let pre_state_root = [0u8; 32];
+        let addr_a = Address::new([0xAA; 20]);
+        let accounts = vec![empty_acct(addr_a)];
+        let witnesses: Vec<AccountProofWitness> = Vec::new();
+        let err = verify_pre_state(&pre_state_root, &accounts, &witnesses)
+            .expect_err("must reject account without matching witness");
+        assert_eq!(err, 0x06);
+    }
+
+    /// Same coverage gate when ONE of N accounts is missing a witness.
+    /// The first uncovered account triggers the rejection.
+    #[test]
+    fn missing_witness_for_one_of_many_is_rejected() {
+        let pre_state_root = [0u8; 32];
+        let addr_a = Address::new([0xAA; 20]);
+        let addr_b = Address::new([0xBB; 20]);
+        let accounts = vec![empty_acct(addr_a), empty_acct(addr_b)];
+        // Only addr_a has a witness; addr_b is uncovered.
+        let witnesses = vec![empty_witness(addr_a)];
+        let err = verify_pre_state(&pre_state_root, &accounts, &witnesses)
+            .expect_err("must reject when ANY account lacks a witness");
+        assert_eq!(err, 0x06);
     }
 }
