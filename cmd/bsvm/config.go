@@ -118,7 +118,9 @@ type NetworkSection struct {
 	IdentitySeedHex string `toml:"identity_seed_hex"`
 }
 
-// BSVSection holds BSV node connection configuration.
+// BSVSection holds BSV node connection configuration. The Chaintracks
+// sub-section configures the SPV header oracle including W6-2 multi-
+// upstream quorum.
 type BSVSection struct {
 	NodeURL string `toml:"node_url"`
 	// ARCURL is the legacy single-endpoint ARC URL. Retained for
@@ -153,6 +155,10 @@ type BSVSection struct {
 	Network       string           `toml:"network"`        // mainnet, testnet, regtest
 	FeeWalletKey  string           `toml:"fee_wallet_key"` // Path to WIF key file
 	Confirmations int              `toml:"confirmations"`
+	// Chaintracks configures the SPV header oracle including the
+	// W6-2 multi-upstream quorum. See pkg/chaintracks.MultiClient and
+	// docs/decisions/header-oracle-quorum.md.
+	Chaintracks ChaintracksSection `toml:"chaintracks"`
 }
 
 // ARCEndpointSection describes a single ARC endpoint within the
@@ -203,6 +209,46 @@ type ARCBRC104IdentitySection struct {
 	// uncompressed) secp256k1 public key the ARC server signs
 	// callbacks with.
 	PublicKeyHex string `toml:"public_key_hex"`
+}
+
+// ChaintracksSection configures the chaintracks header oracle.
+// Single-provider configs (the default) supply exactly one entry in
+// Providers and leave QuorumM at zero (defaults to 1). Quorum is
+// opt-in: operators add additional [[bsv.chaintracks.providers]]
+// blocks and bump QuorumM to enable multi-upstream cross-checking.
+// See docs/decisions/header-oracle-quorum.md.
+type ChaintracksSection struct {
+	// Providers lists the upstream BHS endpoints. At least one
+	// entry is required when chaintracks is enabled.
+	Providers []ChaintracksProvider `toml:"providers"`
+	// QuorumStrategy selects the policy: "hybrid" (default) or
+	// "m_of_n".
+	QuorumStrategy string `toml:"quorum_strategy"`
+	// QuorumM is the minimum number of agreeing providers. Defaults
+	// to 1 (no cross-check). Mainnet shards should set this to >=2.
+	QuorumM int `toml:"quorum_m"`
+	// DisagreementAction is "log" (default), "drop", or "halt".
+	DisagreementAction string `toml:"disagreement_action"`
+	// DisagreementCooldown is how long a deviant provider stays
+	// suspended after ActionDrop. Default "10m".
+	DisagreementCooldown string `toml:"disagreement_cooldown"`
+	// ResponseTimeout caps each fan-out call. Default "5s".
+	ResponseTimeout string `toml:"response_timeout"`
+	// StreamSkewWindow is how long stream events buffer per child
+	// before quorum is resolved. Default "750ms".
+	StreamSkewWindow string `toml:"stream_skew_window"`
+	// StreamBufferMax bounds the per-child reorg buffer. Default 32.
+	StreamBufferMax int `toml:"stream_buffer_max"`
+}
+
+// ChaintracksProvider configures one upstream BHS endpoint.
+type ChaintracksProvider struct {
+	Name    string `toml:"name"`
+	URL     string `toml:"url"`
+	APIKey  string `toml:"api_key"`
+	Weight  uint   `toml:"weight"`
+	Timeout string `toml:"timeout"`
+	Enabled bool   `toml:"enabled"`
 }
 
 // BridgeSection holds BSV bridge configuration.
