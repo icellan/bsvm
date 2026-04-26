@@ -485,6 +485,12 @@ pub fn main() {
                 } else {
                     None
                 },
+                // EIP-4844: surface blob_versioned_hashes + max_fee_per_blob_gas
+                // to the EVM context so BLOBHASH (0x49) returns the correct
+                // values during execution. For non-blob txs both fields are
+                // zero / empty (set by tx::decode_and_recover).
+                blob_hashes: decoded.blob_versioned_hashes.clone(),
+                max_fee_per_blob_gas: decoded.blob_fee_cap,
                 ..Default::default()
             };
 

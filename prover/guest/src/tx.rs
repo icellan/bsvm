@@ -17,6 +17,7 @@
 //!   * Legacy        (no type byte, EIP-155 or pre-155)
 //!   * EIP-2930 / 0x01 (access list)
 //!   * EIP-1559 / 0x02 (dynamic fee)
+//!   * EIP-4844 / 0x03 (blob)
 //!
 //! Deposit system transactions (0x7E) are handled separately in `main.rs`:
 //! they have no signature and the SourceHash binds them to the on-chain
@@ -45,6 +46,12 @@ pub const SECP256K1_HALF_N: U256 = U256::from_be_slice(&[
 /// Decoded fields of a signed user EVM transaction, used to drive revm.
 /// The `sender` is recovered from the signature inside the guest, NEVER
 /// taken from the host.
+///
+/// EIP-4844 (type 0x03) additionally exposes:
+///   * `blob_fee_cap`            — `max_fee_per_blob_gas`
+///   * `blob_versioned_hashes`   — list of 32-byte hashes the BLOBHASH
+///                                 opcode resolves against
+/// For non-blob txs both fields are zero / empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedTx {
     pub tx_type: u8,
@@ -57,6 +64,11 @@ pub struct DecodedTx {
     pub value: U256,
     pub data: Vec<u8>,
     pub sender: Address,
+    /// EIP-4844 max_fee_per_blob_gas. Zero for non-blob txs.
+    pub blob_fee_cap: u128,
+    /// EIP-4844 blob_versioned_hashes. Empty for non-blob txs.
+    /// MUST be non-empty for type-0x03 — the wire decoder rejects empty.
+    pub blob_versioned_hashes: Vec<B256>,
 }
 
 /// Errors that can arise while decoding or recovering a signed transaction.
@@ -71,6 +83,13 @@ pub enum TxError {
     HighS,
     ChainIdMismatch,
     Recover,
+    /// EIP-4844: a type-0x03 tx must reference at least one blob versioned
+    /// hash. An empty list is wire-invalid and the guest rejects it before
+    /// signature recovery.
+    EmptyBlobHashes,
+    /// EIP-4844: a type-0x03 tx must specify a 20-byte recipient address.
+    /// Contract creation via blob tx is forbidden by the spec.
+    BlobMissingTo,
 }
 
 /// Decode a signed transaction from its raw RLP-encoded bytes and recover
@@ -94,6 +113,8 @@ pub fn decode_and_recover(
         decode_access_list(&raw[1..], expected_chain_id)
     } else if first == 0x02 {
         decode_dynamic_fee(&raw[1..], expected_chain_id)
+    } else if first == 0x03 {
+        decode_blob(&raw[1..], expected_chain_id)
     } else {
         Err(TxError::UnsupportedType)
     }
@@ -198,6 +219,8 @@ fn decode_legacy(raw: &[u8], expected_chain_id: u64) -> Result<DecodedTx, TxErro
         value: val,
         data,
         sender,
+        blob_fee_cap: 0,
+        blob_versioned_hashes: Vec::new(),
     })
 }
 
@@ -272,6 +295,8 @@ fn decode_access_list(body: &[u8], expected_chain_id: u64) -> Result<DecodedTx, 
         value,
         data,
         sender,
+        blob_fee_cap: 0,
+        blob_versioned_hashes: Vec::new(),
     })
 }
 
@@ -346,6 +371,106 @@ fn decode_dynamic_fee(body: &[u8], expected_chain_id: u64) -> Result<DecodedTx, 
         value,
         data,
         sender,
+        blob_fee_cap: 0,
+        blob_versioned_hashes: Vec::new(),
+    })
+}
+
+// ─── EIP-4844 (0x03) ────────────────────────────────────────────────────────
+
+/// Decode an EIP-4844 blob transaction. Body layout:
+///   RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gas, to, value,
+///        data, accessList, maxFeePerBlobGas, blobVersionedHashes, v, r, s])
+///
+/// Signing hash:
+///   keccak256(0x03 || RLP([chainId, nonce, maxPriorityFeePerGas,
+///                          maxFeePerGas, gas, to, value, data, accessList,
+///                          maxFeePerBlobGas, blobVersionedHashes]))
+///
+/// EIP-4844 constraints enforced here:
+///   * `to` MUST be a 20-byte address (no contract creation).
+///   * `blobVersionedHashes` MUST be a non-empty list. Empty lists are
+///     wire-invalid and the guest pins the batch as failed before recovery.
+///   * Chain id binding, low-s, and recovery-id range mirror type-2.
+fn decode_blob(body: &[u8], expected_chain_id: u64) -> Result<DecodedTx, TxError> {
+    let mut buf = body;
+    let payload = decode_list_payload(&mut buf)?;
+    let mut p = payload;
+
+    let chain_id = decode_u64(&mut p)?;
+    if chain_id != expected_chain_id {
+        return Err(TxError::ChainIdMismatch);
+    }
+    let nonce = decode_u64(&mut p)?;
+    let max_priority_fee = decode_u256(&mut p)?;
+    let max_fee = decode_u256(&mut p)?;
+    let gas_limit = decode_u64(&mut p)?;
+    let to = decode_optional_address(&mut p)?;
+    // EIP-4844: blob txs MUST have a non-nil destination. Contract creation
+    // is forbidden — an empty `to` field invalidates the tx.
+    let to_addr = to.ok_or(TxError::BlobMissingTo)?;
+    let value = decode_u256(&mut p)?;
+    let data = decode_bytes(&mut p)?.to_vec();
+    let access_list_raw = take_list_with_header(&mut p)?;
+    let max_fee_per_blob_gas = decode_u256(&mut p)?;
+    let blob_versioned_hashes_raw = take_list_with_header(&mut p)?;
+    let v = decode_u256(&mut p)?;
+    let r = decode_u256(&mut p)?;
+    let s = decode_u256(&mut p)?;
+
+    enforce_low_s(s)?;
+    let v_u64 = u256_to_u64(v).ok_or(TxError::InvalidSignature)?;
+    if v_u64 > 1 {
+        return Err(TxError::InvalidSignature);
+    }
+    let y_parity = v_u64 == 1;
+
+    // Decode the blob versioned hashes list — each entry is a 32-byte string.
+    let blob_versioned_hashes = decode_b256_list(blob_versioned_hashes_raw)?;
+    if blob_versioned_hashes.is_empty() {
+        return Err(TxError::EmptyBlobHashes);
+    }
+
+    // Reconstruct the signing payload by re-emitting decoded fields, then
+    // prepend the type byte and hash. Re-emitting keeps the access-list and
+    // blob-hash-list bytes opaque/byte-identical to what the sender hashed.
+    let signing_body = encode_blob_signing_payload(
+        chain_id,
+        nonce,
+        max_priority_fee,
+        max_fee,
+        gas_limit,
+        to_addr,
+        value,
+        &data,
+        access_list_raw,
+        max_fee_per_blob_gas,
+        blob_versioned_hashes_raw,
+    );
+    let mut buf2 = Vec::with_capacity(signing_body.len() + 1);
+    buf2.push(0x03);
+    buf2.extend_from_slice(&signing_body);
+    let sig_hash = keccak256(&buf2);
+
+    let sender = recover(sig_hash, r, s, y_parity)?;
+
+    let gp = u256_to_u128(max_fee).ok_or(TxError::InvalidSignature)?;
+    let mpf = u256_to_u128(max_priority_fee).ok_or(TxError::InvalidSignature)?;
+    let bfc = u256_to_u128(max_fee_per_blob_gas).ok_or(TxError::InvalidSignature)?;
+
+    Ok(DecodedTx {
+        tx_type: 0x03,
+        chain_id,
+        nonce,
+        gas_limit,
+        gas_price: gp,
+        max_priority_fee: mpf,
+        to: Some(to_addr),
+        value,
+        data,
+        sender,
+        blob_fee_cap: bfc,
+        blob_versioned_hashes,
     })
 }
 
@@ -539,6 +664,67 @@ fn encode_legacy_signing_fields(
         out.push(0x80); // 0
         out.push(0x80); // 0
     }
+}
+
+/// Decode an RLP-encoded list of 32-byte strings (B256). Used for the
+/// EIP-4844 blob_versioned_hashes field. Each entry must be exactly 32
+/// bytes; any deviation invalidates the tx.
+fn decode_b256_list(raw: &[u8]) -> Result<Vec<B256>, TxError> {
+    let mut buf = raw;
+    let payload = decode_list_payload(&mut buf)?;
+    let mut p = payload;
+    let mut out = Vec::new();
+    while !p.is_empty() {
+        let bytes = decode_bytes(&mut p)?;
+        if bytes.len() != 32 {
+            return Err(TxError::Rlp);
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(bytes);
+        out.push(B256::from(h));
+    }
+    Ok(out)
+}
+
+/// Re-emit an EIP-4844 signing payload wrapped in an RLP list header. The
+/// access list and blob-versioned-hashes list are passed through verbatim
+/// (`*_raw`) — they are opaque to sender recovery, and re-encoding them via
+/// our own emitter would risk drift from what the original signer hashed.
+#[allow(clippy::too_many_arguments)]
+fn encode_blob_signing_payload(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee: U256,
+    max_fee: U256,
+    gas: u64,
+    to: Address,
+    value: U256,
+    data: &[u8],
+    access_list_raw: &[u8],
+    max_fee_per_blob_gas: U256,
+    blob_versioned_hashes_raw: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(
+        96 + data.len() + access_list_raw.len() + blob_versioned_hashes_raw.len(),
+    );
+    encode_u64(chain_id, &mut body);
+    encode_u64(nonce, &mut body);
+    encode_u256(max_priority_fee, &mut body);
+    encode_u256(max_fee, &mut body);
+    encode_u64(gas, &mut body);
+    // EIP-4844 forbids contract creation, so the `to` field is always a
+    // 20-byte address — never the empty-string creation marker.
+    encode_bytes(to.as_slice(), &mut body);
+    encode_u256(value, &mut body);
+    encode_bytes(data, &mut body);
+    body.extend_from_slice(access_list_raw);
+    encode_u256(max_fee_per_blob_gas, &mut body);
+    body.extend_from_slice(blob_versioned_hashes_raw);
+
+    let mut out = Vec::with_capacity(body.len() + 9);
+    encode_list_header(body.len(), &mut out);
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Re-emit a typed-tx signing payload (EIP-2930 / EIP-1559) wrapped in an
@@ -916,6 +1102,221 @@ mod tests {
         assert_eq!(enforce_low_s(s), Err(TxError::HighS));
         assert_eq!(enforce_low_s(SECP256K1_HALF_N), Ok(()));
         assert_eq!(enforce_low_s(U256::ZERO), Err(TxError::HighS));
+    }
+
+    /// Build a signed EIP-4844 type-3 tx with an explicit blob versioned
+    /// hash list. `blob_hashes` MUST be non-empty per the spec, but we
+    /// allow callers to pass an empty list so we can exercise the
+    /// EmptyBlobHashes rejection path.
+    fn build_eip4844_signed(
+        key: &SigningKey,
+        chain_id: u64,
+        nonce: u64,
+        max_priority_fee: u64,
+        max_fee: u64,
+        gas: u64,
+        to: Address,
+        value: U256,
+        data: &[u8],
+        max_fee_per_blob_gas: u64,
+        blob_hashes: &[B256],
+    ) -> Vec<u8> {
+        let empty_access_list: [u8; 1] = [0xC0];
+        // Encode the blob versioned hashes list as RLP([h0, h1, ...]).
+        let mut hashes_body = Vec::new();
+        for h in blob_hashes {
+            encode_bytes(h.as_slice(), &mut hashes_body);
+        }
+        let blob_hashes_raw = rlp_list_envelope(&hashes_body);
+
+        let signing_body = encode_blob_signing_payload(
+            chain_id,
+            nonce,
+            U256::from(max_priority_fee),
+            U256::from(max_fee),
+            gas,
+            to,
+            value,
+            data,
+            &empty_access_list,
+            U256::from(max_fee_per_blob_gas),
+            &blob_hashes_raw,
+        );
+        let mut prehash_input = Vec::with_capacity(signing_body.len() + 1);
+        prehash_input.push(0x03);
+        prehash_input.extend_from_slice(&signing_body);
+        let prehash: [u8; 32] = keccak256(&prehash_input).0;
+        let (r, s, y_parity) = sign_prehash(key, &prehash);
+
+        let mut signed_body_inner = Vec::new();
+        encode_u64(chain_id, &mut signed_body_inner);
+        encode_u64(nonce, &mut signed_body_inner);
+        encode_u256(U256::from(max_priority_fee), &mut signed_body_inner);
+        encode_u256(U256::from(max_fee), &mut signed_body_inner);
+        encode_u64(gas, &mut signed_body_inner);
+        // EIP-4844 forbids creation: emit `to` as a 20-byte string, never
+        // the 0x80 empty-string marker.
+        encode_bytes(to.as_slice(), &mut signed_body_inner);
+        encode_u256(value, &mut signed_body_inner);
+        encode_bytes(data, &mut signed_body_inner);
+        signed_body_inner.extend_from_slice(&empty_access_list);
+        encode_u256(U256::from(max_fee_per_blob_gas), &mut signed_body_inner);
+        signed_body_inner.extend_from_slice(&blob_hashes_raw);
+        encode_u64(y_parity as u64, &mut signed_body_inner);
+        encode_u256(r, &mut signed_body_inner);
+        encode_u256(s, &mut signed_body_inner);
+        let signed_list = rlp_list_envelope(&signed_body_inner);
+        let mut out = Vec::with_capacity(signed_list.len() + 1);
+        out.push(0x03);
+        out.extend_from_slice(&signed_list);
+        out
+    }
+
+    #[test]
+    fn eip4844_roundtrip_recovers_signer() {
+        let key = fixed_key();
+        let expected = key_to_address(&key);
+        let to = Address::from(hex!("4242424242424242424242424242424242424242"));
+        let h0 = B256::from(hex!(
+            "0100000000000000000000000000000000000000000000000000000000000001"
+        ));
+        let h1 = B256::from(hex!(
+            "0100000000000000000000000000000000000000000000000000000000000002"
+        ));
+        let raw = build_eip4844_signed(
+            &key,
+            8453111,
+            9,
+            1_000_000_000,
+            2_000_000_000,
+            100_000,
+            to,
+            U256::from(7u64),
+            &[0xCA, 0xFE, 0xBA, 0xBE],
+            3_000_000_000,
+            &[h0, h1],
+        );
+        let dec = decode_and_recover(&raw, 8453111).expect("decode_and_recover");
+        assert_eq!(dec.tx_type, 0x03);
+        assert_eq!(dec.chain_id, 8453111);
+        assert_eq!(dec.nonce, 9);
+        assert_eq!(dec.gas_limit, 100_000);
+        assert_eq!(dec.gas_price, 2_000_000_000);
+        assert_eq!(dec.max_priority_fee, 1_000_000_000);
+        assert_eq!(dec.blob_fee_cap, 3_000_000_000);
+        assert_eq!(dec.to, Some(to));
+        assert_eq!(dec.value, U256::from(7u64));
+        assert_eq!(dec.data, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+        assert_eq!(dec.blob_versioned_hashes, vec![h0, h1]);
+        assert_eq!(dec.sender, expected);
+    }
+
+    #[test]
+    fn eip4844_rejects_empty_blob_hashes() {
+        // Per EIP-4844: blob_versioned_hashes must be non-empty. Sign a
+        // type-3 tx with an empty list and confirm the guest rejects it
+        // BEFORE running signature recovery.
+        let key = fixed_key();
+        let to = Address::from(hex!("4242424242424242424242424242424242424242"));
+        let raw = build_eip4844_signed(
+            &key,
+            8453111,
+            0,
+            1,
+            1,
+            21_000,
+            to,
+            U256::ZERO,
+            &[],
+            1,
+            &[], // empty blob hash list — wire-invalid
+        );
+        assert_eq!(
+            decode_and_recover(&raw, 8453111),
+            Err(TxError::EmptyBlobHashes)
+        );
+    }
+
+    #[test]
+    fn eip4844_rejects_chain_id_mismatch() {
+        let key = fixed_key();
+        let to = Address::from(hex!("4242424242424242424242424242424242424242"));
+        let h0 = B256::from(hex!(
+            "0100000000000000000000000000000000000000000000000000000000000001"
+        ));
+        let raw = build_eip4844_signed(
+            &key, 1, 0, 1, 1, 21_000, to, U256::ZERO, &[], 1, &[h0],
+        );
+        assert_eq!(decode_and_recover(&raw, 2), Err(TxError::ChainIdMismatch));
+    }
+
+    #[test]
+    fn eip4844_rejects_creation() {
+        // EIP-4844 forbids contract creation. Build a malformed signed type-3
+        // tx whose `to` field is an RLP empty string (0x80 — the creation
+        // marker) and confirm the guest refuses it. We construct this by
+        // hand because build_eip4844_signed always emits a 20-byte `to`.
+        let chain_id = 8453111u64;
+        let mut signed_body_inner = Vec::new();
+        encode_u64(chain_id, &mut signed_body_inner);
+        encode_u64(0, &mut signed_body_inner); // nonce
+        encode_u256(U256::from(1u64), &mut signed_body_inner); // priority fee
+        encode_u256(U256::from(1u64), &mut signed_body_inner); // max fee
+        encode_u64(21_000, &mut signed_body_inner); // gas
+        signed_body_inner.push(0x80); // `to` = empty string -> creation marker
+        encode_u256(U256::ZERO, &mut signed_body_inner); // value
+        encode_bytes(&[], &mut signed_body_inner); // data
+        signed_body_inner.extend_from_slice(&[0xC0]); // empty access list
+        encode_u256(U256::from(1u64), &mut signed_body_inner); // blob fee cap
+        // One blob hash so we don't fail EmptyBlobHashes first.
+        let mut hashes_body = Vec::new();
+        encode_bytes(&[0x01u8; 32], &mut hashes_body);
+        let hashes_raw = rlp_list_envelope(&hashes_body);
+        signed_body_inner.extend_from_slice(&hashes_raw);
+        encode_u64(0, &mut signed_body_inner); // v
+        encode_u256(U256::from(1u64), &mut signed_body_inner); // r
+        encode_u256(U256::from(1u64), &mut signed_body_inner); // s
+        let signed_list = rlp_list_envelope(&signed_body_inner);
+        let mut raw = Vec::with_capacity(signed_list.len() + 1);
+        raw.push(0x03);
+        raw.extend_from_slice(&signed_list);
+        assert_eq!(
+            decode_and_recover(&raw, chain_id),
+            Err(TxError::BlobMissingTo)
+        );
+    }
+
+    #[test]
+    fn eip4844_rejects_tampered_blob_hash() {
+        // Flip a byte inside the blob_versioned_hashes list. The tampered
+        // payload must NOT recover the original signer (or must fail
+        // decode/recovery outright).
+        let key = fixed_key();
+        let expected = key_to_address(&key);
+        let to = Address::from(hex!("4242424242424242424242424242424242424242"));
+        let h0 = B256::from(hex!(
+            "0100000000000000000000000000000000000000000000000000000000000033"
+        ));
+        let mut raw = build_eip4844_signed(
+            &key,
+            8453111,
+            0,
+            1,
+            1,
+            21_000,
+            to,
+            U256::ZERO,
+            &[],
+            1,
+            &[h0],
+        );
+        // Find and flip the marker byte 0x33 inside the encoded blob hash.
+        let pos = raw.iter().rposition(|&b| b == 0x33).expect("marker");
+        raw[pos] = 0x77;
+        match decode_and_recover(&raw, 8453111) {
+            Ok(dec) => assert_ne!(dec.sender, expected),
+            Err(_) => {}
+        }
     }
 
     #[test]

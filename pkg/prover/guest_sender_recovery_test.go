@@ -179,6 +179,45 @@ func TestGuestSenderRecovery_AccessList(t *testing.T) {
 	}
 }
 
+// TestGuestSenderRecovery_BlobTx pins the host-side wire encoding for an
+// EIP-4844 type-3 tx against the same canonical signer-bytes contract the
+// guest's tx::decode_and_recover relies on. The Rust side of this contract
+// is exercised by prover/guest/src/tx.rs::tests::eip4844_*.
+func TestGuestSenderRecovery_BlobTx(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	signer := types.NewLondonSigner(big.NewInt(guestChainID))
+	expected := types.Address(crypto.PubkeyToAddress(key.PublicKey))
+
+	to := types.HexToAddress("0x4242424242424242424242424242424242424242")
+	rawBytes, recovered := signEncodeAndRecover(t, key, signer, &types.BlobTx{
+		ChainID:    big.NewInt(guestChainID),
+		Nonce:      9,
+		GasTipCap:  big.NewInt(1_000_000_000),
+		GasFeeCap:  big.NewInt(2_000_000_000),
+		Gas:        100_000,
+		To:         &to,
+		Value:      uint256.NewInt(7),
+		Data:       []byte{0xCA, 0xFE, 0xBA, 0xBE},
+		AccessList: types.AccessList{},
+		BlobFeeCap: big.NewInt(3_000_000_000),
+		BlobVersionedHashes: []types.Hash{
+			types.HexToHash("0x0100000000000000000000000000000000000000000000000000000000000001"),
+			types.HexToHash("0x0100000000000000000000000000000000000000000000000000000000000002"),
+		},
+	})
+	if recovered != expected {
+		t.Fatalf("EIP-4844 recovered sender mismatch: got %s want %s",
+			recovered.Hex(), expected.Hex())
+	}
+	if rawBytes[0] != types.BlobTxType {
+		t.Fatalf("EIP-4844 raw bytes must start with type byte 0x03, got 0x%02X",
+			rawBytes[0])
+	}
+}
+
 func TestGuestSenderRecovery_DynamicFee(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	if err != nil {

@@ -106,6 +106,20 @@ func (s *londonSigner) Sender(tx *Transaction) (Address, error) {
 	}
 
 	switch tx.Type() {
+	case BlobTxType:
+		if tx.ChainId().Cmp(s.chainID) != 0 {
+			return Address{}, fmt.Errorf("invalid chain id: have %v want %v", tx.ChainId(), s.chainID)
+		}
+		// EIP-4844 V is the recovery id directly (0 or 1).
+		if v.BitLen() > 8 {
+			return Address{}, errors.New("invalid v value for blob tx")
+		}
+		vByte := byte(v.Uint64())
+		if !crypto.ValidateSignatureValues(vByte, r, ss, true) {
+			return Address{}, errors.New("invalid transaction signature")
+		}
+		return recoverPlain(s.Hash(tx), r, ss, vByte)
+
 	case DynamicFeeTxType:
 		if tx.ChainId().Cmp(s.chainID) != 0 {
 			return Address{}, fmt.Errorf("invalid chain id: have %v want %v", tx.ChainId(), s.chainID)
@@ -172,6 +186,10 @@ func (s *londonSigner) SignatureValues(tx *Transaction, sig []byte) (r, ss, v *b
 	v = new(big.Int).SetBytes([]byte{sig[64]})
 
 	switch tx.Type() {
+	case BlobTxType:
+		if v.Uint64() > 1 {
+			return nil, nil, nil, errors.New("invalid recovery id")
+		}
 	case DynamicFeeTxType:
 		// V is just 0 or 1 for typed transactions.
 		if v.Uint64() > 1 {
@@ -196,6 +214,26 @@ func (s *londonSigner) SignatureValues(tx *Transaction, sig []byte) (r, ss, v *b
 
 func (s *londonSigner) Hash(tx *Transaction) Hash {
 	switch tx.Type() {
+	case BlobTxType:
+		bt, ok := tx.inner.(*BlobTx)
+		if !ok || bt.To == nil {
+			// Best-effort fallback — should never happen for a well-formed
+			// BlobTx; the To check matches the EIP-4844 wire requirement.
+			return Hash{}
+		}
+		return prefixedRLPHash(tx.Type(), &blobSignData{
+			ChainID:             s.chainID,
+			Nonce:               tx.Nonce(),
+			GasTipCap:           tx.GasTipCap(),
+			GasFeeCap:           tx.GasFeeCap(),
+			Gas:                 tx.Gas(),
+			To:                  *bt.To,
+			Value:               tx.Value().ToBig(),
+			Data:                tx.Data(),
+			AccessList:          tx.AccessList(),
+			BlobFeeCap:          bt.blobFeeCap(),
+			BlobVersionedHashes: bt.blobVersionedHashes(),
+		})
 	case DynamicFeeTxType:
 		return prefixedRLPHash(tx.Type(), &dynamicFeeSignData{
 			ChainID:    s.chainID,
@@ -284,15 +322,15 @@ func (s *eip2930Signer) Equal(other Signer) bool {
 }
 
 func (s *eip2930Signer) Sender(tx *Transaction) (Address, error) {
-	if tx.Type() == DynamicFeeTxType {
-		return Address{}, fmt.Errorf("eip2930 signer does not support dynamic fee transactions")
+	if tx.Type() == DynamicFeeTxType || tx.Type() == BlobTxType {
+		return Address{}, fmt.Errorf("eip2930 signer does not support tx type %d", tx.Type())
 	}
 	return s.londonSigner.Sender(tx)
 }
 
 func (s *eip2930Signer) SignatureValues(tx *Transaction, sig []byte) (r, ss, v *big.Int, err error) {
-	if tx.Type() == DynamicFeeTxType {
-		return nil, nil, nil, fmt.Errorf("eip2930 signer does not support dynamic fee transactions")
+	if tx.Type() == DynamicFeeTxType || tx.Type() == BlobTxType {
+		return nil, nil, nil, fmt.Errorf("eip2930 signer does not support tx type %d", tx.Type())
 	}
 	return s.londonSigner.SignatureValues(tx, sig)
 }
@@ -504,6 +542,24 @@ type dynamicFeeSignData struct {
 	Value      *big.Int
 	Data       []byte
 	AccessList AccessList
+}
+
+// blobSignData is used for signing EIP-4844 blob transactions. The struct
+// fields and order match the EIP-4844 signing-payload layout exactly.
+// `To` is non-pointer because EIP-4844 forbids contract creation: the
+// signing hash must commit to a 20-byte address, never an empty RLP string.
+type blobSignData struct {
+	ChainID             *big.Int
+	Nonce               uint64
+	GasTipCap           *big.Int
+	GasFeeCap           *big.Int
+	Gas                 uint64
+	To                  Address
+	Value               *big.Int
+	Data                []byte
+	AccessList          AccessList
+	BlobFeeCap          *big.Int
+	BlobVersionedHashes []Hash
 }
 
 // -- helpers --
