@@ -95,11 +95,89 @@ type NetworkSection struct {
 
 // BSVSection holds BSV node connection configuration.
 type BSVSection struct {
-	NodeURL       string `toml:"node_url"`
-	ARCURL        string `toml:"arc_url"`
-	Network       string `toml:"network"`        // mainnet, testnet, regtest
-	FeeWalletKey  string `toml:"fee_wallet_key"` // Path to WIF key file
-	Confirmations int    `toml:"confirmations"`
+	NodeURL string `toml:"node_url"`
+	// ARCURL is the legacy single-endpoint ARC URL. Retained for
+	// backward compatibility with existing deployments. New deployments
+	// SHOULD configure one or more entries under ARCEndpoints instead;
+	// when both are set ARCEndpoints takes precedence.
+	ARCURL string `toml:"arc_url"`
+	// ARCEndpoints lists ARC providers for the W6-3 multi-endpoint
+	// fan-out broadcaster. See pkg/arc.MultiClient.
+	ARCEndpoints []ARCEndpointSection `toml:"arc_endpoint"`
+	// ARCStrategy is the fan-out strategy: "first_success" (default)
+	// or "quorum".
+	ARCStrategy string `toml:"arc_strategy"`
+	// ARCQuorum is the minimum endpoint successes required when
+	// ARCStrategy is "quorum". Ignored otherwise.
+	ARCQuorum int `toml:"arc_quorum"`
+	// ARCDefaultTimeout caps each ARC request when an endpoint does
+	// not specify its own. Parsed via time.ParseDuration. Defaults
+	// to 30s.
+	ARCDefaultTimeout string `toml:"arc_default_timeout"`
+	// ARCCallbackURL is the per-deployment X-CallbackUrl ARC posts
+	// status updates to. Same value across endpoints.
+	ARCCallbackURL string `toml:"arc_callback_url"`
+	// ARCCallbackToken is the legacy X-CallbackToken auth secret.
+	// Used for backward-compat ingress on the callback handler.
+	ARCCallbackToken string `toml:"arc_callback_token"`
+	// ARCBRC104 configures BRC-104 mutual-auth verification on the
+	// inbound callback handler (W6-10). When at least one identity is
+	// configured, BRC-104 verification is enabled; the legacy token
+	// path is retained based on AllowToken.
+	ARCBRC104     ARCBRC104Section `toml:"arc_brc104"`
+	Network       string           `toml:"network"`        // mainnet, testnet, regtest
+	FeeWalletKey  string           `toml:"fee_wallet_key"` // Path to WIF key file
+	Confirmations int              `toml:"confirmations"`
+}
+
+// ARCEndpointSection describes a single ARC endpoint within the
+// fan-out broadcaster (W6-3). All fields except URL are optional.
+type ARCEndpointSection struct {
+	Name          string `toml:"name"`
+	URL           string `toml:"url"`
+	AuthToken     string `toml:"auth_token"`
+	CallbackURL   string `toml:"callback_url"`
+	CallbackToken string `toml:"callback_token"`
+	// Timeout is parsed via time.ParseDuration. Empty inherits
+	// ARCDefaultTimeout.
+	Timeout    string `toml:"timeout"`
+	MaxRetries int    `toml:"max_retries"`
+	// RetryBackoff is parsed via time.ParseDuration. Defaults to 100ms.
+	RetryBackoff string `toml:"retry_backoff"`
+}
+
+// ARCBRC104Section configures BRC-104 mutual-auth on the inbound
+// ARC callback handler (W6-10). When Identities is empty BRC-104 is
+// disabled and the handler authenticates against the legacy token.
+type ARCBRC104Section struct {
+	// Enabled toggles the BRC-104 verifier. When false, callback
+	// auth uses the legacy X-CallbackToken path only.
+	Enabled bool `toml:"enabled"`
+	// Identities lists the trusted ARC server identities. Each entry
+	// pins one server's secp256k1 identity public key.
+	Identities []ARCBRC104IdentitySection `toml:"identity"`
+	// TimestampWindow is parsed via time.ParseDuration. Defaults to
+	// 60s. Callbacks outside this window from server clock are rejected.
+	TimestampWindow string `toml:"timestamp_window"`
+	// NonceCacheSize bounds the in-memory replay-suppression cache.
+	// Defaults to 8192. Set negative to disable replay caching
+	// (NOT recommended).
+	NonceCacheSize int `toml:"nonce_cache_size"`
+	// AllowToken keeps the legacy X-CallbackToken path active for
+	// ARC servers that have not yet migrated to BRC-104. Defaults
+	// to false on new deployments per spec 17 §"ARC callbacks are
+	// authenticated".
+	AllowToken bool `toml:"allow_token"`
+}
+
+// ARCBRC104IdentitySection pins one ARC server's BRC-104 identity.
+type ARCBRC104IdentitySection struct {
+	// Name is a human-readable label for logs and metrics.
+	Name string `toml:"name"`
+	// PublicKeyHex is the hex-encoded 33-byte compressed (or 65-byte
+	// uncompressed) secp256k1 public key the ARC server signs
+	// callbacks with.
+	PublicKeyHex string `toml:"public_key_hex"`
 }
 
 // BridgeSection holds BSV bridge configuration.

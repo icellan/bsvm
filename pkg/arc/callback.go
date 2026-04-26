@@ -1,9 +1,11 @@
 package arc
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,21 +40,41 @@ type CallbackEvent struct {
 
 // CallbackHandler is the HTTP handler attached at
 // `POST /bsv/arc/callback`. Each incoming callback is authenticated
-// against a shared token, parsed into a CallbackEvent, and delivered to
-// the registered consumer (typically the overlay's ARC consumer that
+// against either a shared token (legacy X-CallbackToken pattern) or a
+// BRC-104 mutual-auth verifier (preferred, see brc104.go). The
+// callback is parsed into a CallbackEvent and delivered to the
+// registered consumer (typically the overlay's ARC consumer that
 // upgrades the matching BEEF and gossips it).
+//
+// The handler enforces ONE of three authentication regimes, selected
+// at construction time:
+//
+//  1. BRC-104 only — pass a non-nil verifier and AllowToken=false. The
+//     recommended setting for new deployments.
+//  2. Token only — pass a nil verifier with one or more tokens. The
+//     legacy / migration setting.
+//  3. Both accepted — pass a verifier AND AllowToken=true. Useful as
+//     an interim during the BRC-104 rollout: requests carrying
+//     BRC-104 headers are verified strictly, requests carrying only
+//     a token use the legacy path. Both are accepted; neither is
+//     accepted means 401.
 type CallbackHandler struct {
-	tokens   []string
-	consumer func(*CallbackEvent)
-	tokenMu  sync.RWMutex
+	tokens     []string
+	consumer   func(*CallbackEvent)
+	verifier   *BRC104Verifier
+	allowToken bool
+	tokenMu    sync.RWMutex
 }
 
-// NewCallbackHandler constructs a CallbackHandler. tokens contains
-// one or more shared secrets that ARC must present via the
-// X-CallbackToken header; multiple tokens are supported so operators
-// can rotate without downtime. Pass an empty slice to disable auth
-// (NOT recommended outside dev). consumer is invoked synchronously
-// for every accepted callback; pass nil to drop events.
+// NewCallbackHandler constructs a CallbackHandler in legacy
+// token-auth mode. tokens contains one or more shared secrets that
+// ARC must present via the X-CallbackToken header; multiple tokens
+// are supported so operators can rotate without downtime. Pass an
+// empty slice to disable auth (NOT recommended outside dev). consumer
+// is invoked synchronously for every accepted callback; pass nil to
+// drop events.
+//
+// New deployments should prefer NewBRC104CallbackHandler.
 func NewCallbackHandler(tokens []string, consumer func(*CallbackEvent)) *CallbackHandler {
 	cleaned := make([]string, 0, len(tokens))
 	for _, t := range tokens {
@@ -61,7 +83,52 @@ func NewCallbackHandler(tokens []string, consumer func(*CallbackEvent)) *Callbac
 			cleaned = append(cleaned, t)
 		}
 	}
-	return &CallbackHandler{tokens: cleaned, consumer: consumer}
+	return &CallbackHandler{tokens: cleaned, consumer: consumer, allowToken: true}
+}
+
+// NewBRC104CallbackHandler constructs a CallbackHandler that
+// authenticates incoming callbacks using BRC-104 mutual auth.
+// allowToken controls the migration mode: when true, requests that
+// carry only the legacy X-CallbackToken (no BRC-104 headers) are
+// also accepted against the supplied tokens slice; when false, every
+// callback MUST present valid BRC-104 headers and the tokens slice
+// is ignored. consumer is invoked synchronously for every accepted
+// callback; pass nil to drop events.
+func NewBRC104CallbackHandler(verifier *BRC104Verifier, tokens []string, allowToken bool, consumer func(*CallbackEvent)) (*CallbackHandler, error) {
+	if verifier == nil {
+		return nil, errors.New("arc: BRC-104 callback handler requires a verifier")
+	}
+	cleaned := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			cleaned = append(cleaned, t)
+		}
+	}
+	return &CallbackHandler{
+		tokens:     cleaned,
+		consumer:   consumer,
+		verifier:   verifier,
+		allowToken: allowToken,
+	}, nil
+}
+
+// SetVerifier installs a BRC-104 verifier on an existing handler. Use
+// this to transition a token-mode handler to BRC-104 without
+// recreating the consumer wiring. Pass nil to revert to token-only
+// mode.
+func (h *CallbackHandler) SetVerifier(v *BRC104Verifier) {
+	h.tokenMu.Lock()
+	defer h.tokenMu.Unlock()
+	h.verifier = v
+}
+
+// SetAllowToken toggles whether the legacy token path is accepted in
+// addition to BRC-104. Defaults to true for backward compatibility.
+func (h *CallbackHandler) SetAllowToken(allow bool) {
+	h.tokenMu.Lock()
+	defer h.tokenMu.Unlock()
+	h.allowToken = allow
 }
 
 // SetTokens replaces the authorised token list. Used for atomic
@@ -95,9 +162,43 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.tokenMu.RLock()
 	tokens := append([]string(nil), h.tokens...)
 	consumer := h.consumer
+	verifier := h.verifier
+	allowToken := h.allowToken
 	h.tokenMu.RUnlock()
 
-	if len(tokens) > 0 {
+	// We need the body twice: once for BRC-104 canonical-bytes signing
+	// (over the raw bytes) and once for JSON decoding. Read it fully
+	// up front and substitute a bytes.Reader for json.NewDecoder.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	hasBRC104 := r.Header.Get(HeaderBRC104Signature) != "" ||
+		r.Header.Get(HeaderBRC104Identity) != ""
+	switch {
+	case verifier != nil && hasBRC104:
+		// BRC-104 path: any presented BRC-104 header MUST verify.
+		// Falling back to the token path on a BRC-104 failure would
+		// let an attacker downgrade the auth.
+		in := CallbackAuthInputs{
+			IdentityHex:  r.Header.Get(HeaderBRC104Identity),
+			NonceHex:     r.Header.Get(HeaderBRC104Nonce),
+			TimestampStr: r.Header.Get(HeaderBRC104Timestamp),
+			SignatureHex: r.Header.Get(HeaderBRC104Signature),
+			VersionStr:   r.Header.Get(HeaderBRC104Version),
+			Body:         body,
+		}
+		if _, err := verifier.VerifyCallback(in); err != nil {
+			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+	case verifier != nil && !allowToken:
+		// BRC-104 required and no headers presented.
+		http.Error(w, "unauthorized: BRC-104 required", http.StatusUnauthorized)
+		return
+	case len(tokens) > 0:
 		got := r.Header.Get("X-CallbackToken")
 		if got == "" {
 			got = r.Header.Get("X-ARC-Callback-Token")
@@ -109,7 +210,7 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload CallbackPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&payload); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
