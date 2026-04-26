@@ -32,7 +32,19 @@ bootstrap_peers = []
 max_peers = 50
 
 [bsv]
+# Legacy single-endpoint BSV-node JSON-RPC URL. Retained for backward
+# compat. Prefer node_urls below for testnet/mainnet failover (W6-11).
 node_url = ""
+# W6-11 BSV-node failover. List one or more endpoints in preference
+# order; index 0 is the primary, index 1+ are backups consulted on
+# transport / 5xx errors. Empty list falls back to node_url. When
+# both are set, node_urls wins. Application-level RPC errors are NOT
+# retried (a deterministic answer would not change between nodes).
+node_urls = []
+# Park a node after this many consecutive transport / 5xx failures.
+node_max_consecutive_failures = 3
+# Cooldown duration before a parked node is retried.
+node_cooldown = "30s"
 # Legacy single-endpoint ARC URL. Prefer [[bsv.arc_endpoint]] for
 # multi-endpoint fan-out (W6-3). When both are set, arc_endpoint wins.
 arc_url = ""
@@ -46,6 +58,10 @@ arc_callback_token = ""
 network = "mainnet"
 fee_wallet_key = ""
 confirmations = 6
+# In-process LRU bound for cached WhatsOnChain GetTx lookups (W6-8).
+# WoC enforces per-IP rate limits; caching content-addressed lookups
+# keeps the budget free for fresh queries. Set to 0 to disable.
+woc_cache_size = 1000
 
 # Multi-endpoint ARC fan-out (W6-3). Add one block per ARC provider.
 # [[bsv.arc_endpoint]]
@@ -125,3 +141,29 @@ enabled = true
 # verification gate passes. Devnet operators can flip this to true to
 # pre-flight the wiring without ancestry verification.
 accept_unverified_bridge_deposits = false
+
+# -----------------------------------------------------------------------------
+# Worked example: BSV-node failover (W6-11)
+# -----------------------------------------------------------------------------
+# A testnet operator with two self-hosted BSV nodes plus a public fallback
+# would set the [bsv] block roughly as follows:
+#
+# [bsv]
+# # Leave node_url empty (or set it to the primary, it is ignored when
+# # node_urls is non-empty).
+# node_url = ""
+# node_urls = [
+#   "http://rpc-user:rpc-pass@bsv-primary.internal:8332/",
+#   "http://rpc-user:rpc-pass@bsv-secondary.internal:8332/",
+#   "http://rpc-user:rpc-pass@bsv-public.example.com:8332/",
+# ]
+# node_max_consecutive_failures = 3
+# node_cooldown = "60s"
+# network = "testnet"
+#
+# Index 0 is hit on every call; index 1 only on connection error or 5xx
+# from index 0; index 2 only when both prior fail. After 3 consecutive
+# failures a node is parked for 60s, after which it is retried.
+# Application-level RPC errors (tx not found, mempool conflict, etc.)
+# are surfaced immediately and never trigger failover — the next node
+# would return the same answer.
