@@ -1,0 +1,21 @@
+[package]
+name = "bsvm-proof-verify-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone host crate that re-includes prover/guest/src/proof_verify.rs as
+# a library so its #[cfg(test)] unit tests can run with the system stable
+# toolchain (no SP1 / RISC-V cross-compile required).
+#
+# The guest crate itself uses an SP1-pinned nightly toolchain that is too old
+# for many of the guest's other deps (revm, p3-koala-bear), so its `cargo
+# test` cannot run as-is. The proof verifier is a small, dependency-light
+# module — extracting it into this crate lets us catch regressions in the
+# Gate-0 anti-host-trust check via plain `cargo test`.
+
+[dependencies]
+alloy-primitives = { version = "1.5.2", default-features = false }
+
+[lib]
+path = "src/lib.rs"

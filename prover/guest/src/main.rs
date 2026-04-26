@@ -24,9 +24,12 @@
 sp1_zkvm::entrypoint!(main);
 
 mod mpt;
+mod proof_verify;
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-use mpt::{AccountState, EthMPT, StorageSlot, KECCAK_EMPTY};
+use alloy_rlp::Encodable;
+use mpt::{AccountState, EthMPT, StorageSlot, EMPTY_ROOT, KECCAK_EMPTY};
+use proof_verify::verify_proof;
 use revm::{
     bytecode::Bytecode,
     context::{BlockEnv, CfgEnv, Context, Journal, TxEnv},
@@ -106,6 +109,38 @@ impl EvmTransaction {
     }
 }
 
+/// One per-account witness shipped from the host so the guest can verify
+/// the pre-state root with Merkle proofs (W4-1 / Gate-0). Each witness
+/// proves either inclusion (the account exists with the claimed values) or
+/// absence (the account is provably not in the trie at `pre_state_root`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountProofWitness {
+    /// Account address being proved.
+    pub address: Address,
+    /// RLP-encoded MPT nodes from the state root down to the account leaf
+    /// (or down to the deepest unmatched node, for an exclusion proof).
+    pub account_proof: Vec<Vec<u8>>,
+    /// Storage trie root claimed for this account. Used as the root for
+    /// per-slot proof verification.
+    pub storage_root: [u8; 32],
+    /// Per-slot witnesses for storage reads against this account.
+    pub storage_slots: Vec<StorageProofWitness>,
+}
+
+/// Per-storage-slot witness: proves the value of one slot under
+/// `storage_root` of the parent `AccountProofWitness`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageProofWitness {
+    /// Storage slot key (raw 32-byte slot index).
+    pub key: [u8; 32],
+    /// Storage slot value (left-padded big-endian u256, 32 bytes). Empty
+    /// (== zero) for an exclusion proof.
+    pub value: [u8; 32],
+    /// RLP-encoded MPT nodes from the storage root down to the value leaf
+    /// (or proof of absence).
+    pub proof: Vec<Vec<u8>>,
+}
+
 /// Complete batch input from the Go host to the SP1 guest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchInput {
@@ -124,6 +159,20 @@ pub struct BatchInput {
     /// The inbox queue hash after draining pending inbox transactions.
     /// Computed by the Go host from InboxMonitor state.
     pub inbox_root_after: [u8; 32],
+    /// Optional Merkle witnesses that bind every account/storage value the
+    /// guest loads to `pre_state_root`. When present, the guest verifies
+    /// each entry against the committed root before any opcode executes —
+    /// this is the W4-1 / Gate-0 anti-host-trust path mandated by
+    /// spec 12 §"Verify the pre-state root".
+    ///
+    /// When `None` (legacy wire format), the guest falls back to the
+    /// original "host-trusted accounts + recompute root" check. This is
+    /// the rollout flag described in W4-1 — it lets the host bridge
+    /// upgrade incrementally without breaking older callers. The flag
+    /// MUST be removed (and `state_proofs` made required) before the
+    /// guest VK is pinned for mainnet.
+    #[serde(default)]
+    pub state_proofs: Option<Vec<AccountProofWitness>>,
 }
 
 /// A simplified receipt for RLP encoding and hashing.
@@ -184,13 +233,35 @@ pub fn main() {
     mpt.load_accounts(input.accounts.clone());
 
     // ── 3. Verify the pre-state root matches ─────────────────────────────
-    let computed_pre_root = mpt.root_hash();
-    if computed_pre_root != input.pre_state_root {
-        // Error code 0x01: pre-state root mismatch.
-        // Commit error indicator and exit cleanly (no panic — panics
-        // produce no proof and stall the pipeline).
-        commit_error(0x01, &input.pre_state_root, &computed_pre_root);
-        return;
+    //
+    // W4-1 (Gate-0): when the host ships Merkle witnesses, verify EACH
+    // account and storage value against the committed pre_state_root via
+    // the proof. This is the only binding that prevents a malicious host
+    // from feeding the guest fabricated state. See spec 12 §"Verify the
+    // pre-state root" and pkg/prover/state_export.go.
+    //
+    // When state_proofs is None (older host bridge), fall back to the
+    // legacy "host-trusted accounts + recompute root" check. This is the
+    // rollout flag — drop the legacy branch before pinning a mainnet VK.
+    if let Some(witnesses) = input.state_proofs.as_ref() {
+        if let Err(code) =
+            verify_pre_state(&input.pre_state_root, &input.accounts, witnesses.as_slice())
+        {
+            // Error code 0x02..0x05: per-witness proof failure (see
+            // verify_pre_state for the code map). The host can detect
+            // this by inspecting public values [64..96].
+            let mut probe = [0u8; 32];
+            probe[0] = code;
+            commit_error(code, &input.pre_state_root, &probe);
+            return;
+        }
+    } else {
+        let computed_pre_root = mpt.root_hash();
+        if computed_pre_root != input.pre_state_root {
+            // Error code 0x01: pre-state root mismatch (legacy path).
+            commit_error(0x01, &input.pre_state_root, &computed_pre_root);
+            return;
+        }
     }
 
     // ── 4. Execute each transaction through revm ─────────────────────────
@@ -424,6 +495,138 @@ fn commit_error(error_code: u8, expected: &[u8; 32], actual: &[u8; 32]) {
     sp1_zkvm::io::commit_slice(&[0u8; 32]); // [208..240]
     sp1_zkvm::io::commit_slice(&[0u8; 32]); // [240..272]
     sp1_zkvm::io::commit_slice(&0u64.to_be_bytes()); // [272..280] block_number sentinel
+}
+
+/// Verify every host-supplied account (and accessed storage slot) against
+/// `pre_state_root` using the supplied Merkle witnesses. Returns an error
+/// code in the range 0x02..=0x05 on mismatch (see `commit_error` for the
+/// reporting layout).
+///
+/// This is the W4-1 / Gate-0 anti-host-trust check. Without it, the guest
+/// would prove "EVM ran on whatever the host claimed" rather than "EVM ran
+/// on the actual chain state at pre_state_root".
+///
+/// Error codes:
+///   0x02 — account proof did not reconcile with pre_state_root
+///   0x03 — account leaf disagrees with the host-supplied AccountState
+///   0x04 — storage proof did not reconcile with the account's storage_root
+///   0x05 — storage value disagrees with the host-supplied StorageSlot
+fn verify_pre_state(
+    pre_state_root: &[u8; 32],
+    accounts: &[AccountState],
+    witnesses: &[AccountProofWitness],
+) -> Result<(), u8> {
+    // Build address -> account lookup.
+    for w in witnesses {
+        let host_acct = accounts.iter().find(|a| a.address == w.address);
+
+        // Verify the account proof against pre_state_root.
+        let key = keccak256(w.address.as_slice());
+        let proved = match verify_proof(pre_state_root, key.as_slice(), &w.account_proof) {
+            Ok(v) => v,
+            Err(_) => return Err(0x02),
+        };
+
+        match (proved.as_ref(), host_acct) {
+            (Some(rlp_account), Some(acct)) => {
+                // Inclusion: encode the host-claimed AccountState the same
+                // way and demand byte-equality.
+                let storage_root_b256 = B256::from(w.storage_root);
+                let code_hash = if acct.code.is_empty() {
+                    KECCAK_EMPTY
+                } else {
+                    acct.code_hash
+                };
+                let mut want = Vec::new();
+                AccountRlpView {
+                    nonce: acct.nonce,
+                    balance: acct.balance,
+                    storage_root: storage_root_b256,
+                    code_hash,
+                }
+                .encode(&mut want);
+
+                if rlp_account.as_slice() != want.as_slice() {
+                    return Err(0x03);
+                }
+            }
+            (None, None) => {
+                // Absent in the trie AND no host claim — fine.
+            }
+            (None, Some(acct)) => {
+                // Host claims an account, but the trie says it's absent.
+                // This is only OK if the host claim is the empty-account
+                // sentinel (nonce=0, balance=0, no code, no storage).
+                let is_empty = acct.nonce == 0
+                    && acct.balance.is_zero()
+                    && acct.code.is_empty()
+                    && acct.storage.is_empty()
+                    && (acct.code_hash == KECCAK_EMPTY || acct.code_hash == B256::ZERO);
+                if !is_empty {
+                    return Err(0x03);
+                }
+            }
+            (Some(_), None) => {
+                // Trie has data but host omitted the account. Treat as a
+                // mismatch — the prover MUST surface every read it made.
+                return Err(0x03);
+            }
+        }
+
+        // Verify each storage slot proof against the account's storage_root.
+        // For an absent account, storage_root MUST be EMPTY_ROOT and any
+        // accessed slot MUST be a proof of absence (value = 0).
+        let storage_root = if proved.is_some() {
+            w.storage_root
+        } else {
+            EMPTY_ROOT.0
+        };
+
+        for s in &w.storage_slots {
+            let slot_key = keccak256(s.key);
+            let proved_value = match verify_proof(&storage_root, slot_key.as_slice(), &s.proof) {
+                Ok(v) => v,
+                Err(_) => return Err(0x04),
+            };
+
+            // The host-claimed value (32-byte big-endian U256, possibly zero).
+            let host_value_u256 = U256::from_be_bytes(s.value);
+
+            match proved_value {
+                Some(raw_value) => {
+                    // The MPT proof verifier returns the *unwrapped* leaf
+                    // value bytes. For the storage trie that is the trimmed
+                    // big-endian U256 (without leading zero bytes). Re-pad
+                    // and compare numerically against the host claim.
+                    if raw_value.len() > 32 {
+                        return Err(0x05);
+                    }
+                    let mut padded = [0u8; 32];
+                    padded[32 - raw_value.len()..].copy_from_slice(&raw_value);
+                    let trie_value = U256::from_be_bytes(padded);
+                    if trie_value != host_value_u256 {
+                        return Err(0x05);
+                    }
+                }
+                None => {
+                    // Trie says slot is absent => value MUST be zero.
+                    if !host_value_u256.is_zero() {
+                        return Err(0x05);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// RLP view of an Ethereum account (matches geth and `pkg/mpt`).
+#[derive(alloy_rlp::RlpEncodable)]
+struct AccountRlpView {
+    nonce: u64,
+    balance: U256,
+    storage_root: B256,
+    code_hash: B256,
 }
 
 /// Apply state changes from revm's CacheDB back to the MPT.

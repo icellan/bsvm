@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/types"
 )
@@ -172,10 +174,12 @@ func (p *SP1Prover) proveLocal(ctx context.Context, input *ProveInput) (*ProveOu
 		defer cancel()
 	}
 
-	// Serialize input to JSON for the host bridge.
-	inputJSON, err := json.Marshal(input)
+	// Translate ProveInput to the bridge's expected wire format. This
+	// flattens StateExport (which carries Merkle proofs for W4-1) into
+	// the per-account fields the Rust bridge consumes.
+	inputJSON, err := buildBridgeInput(input, p.config.SP1ProofMode)
 	if err != nil {
-		return nil, fmt.Errorf("serializing prove input: %w", err)
+		return nil, fmt.Errorf("building bridge input: %w", err)
 	}
 
 	// Build the command.
@@ -267,6 +271,174 @@ func (p *SP1Prover) proveMock(_ context.Context, input *ProveInput) (*ProveOutpu
 		Cycles:       0,
 		ProvingTime:  time.Since(start),
 	}, nil
+}
+
+// buildBridgeInput translates a ProveInput (the Go-side struct) into the
+// JSON envelope expected by prover/host-bridge/src/main.rs. This is where
+// the Merkle witnesses produced by ExportStateForProving (W4-1) are lifted
+// into the per-account fields the Rust bridge forwards to the SP1 guest.
+//
+// The bridge envelope intentionally lives next to its only call-site; the
+// public ProveInput type stays stable so the parallel prover and overlay
+// glue do not need to change.
+func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
+	// Decode the optional StateExport blob. nil/empty is acceptable; the
+	// guest will fall back to its legacy host-trusted code path.
+	var export *StateExport
+	if len(input.StateExport) > 0 {
+		dec, err := DeserializeExport(input.StateExport)
+		if err != nil {
+			return nil, fmt.Errorf("deserializing state export: %w", err)
+		}
+		export = dec
+	}
+
+	envelope := bridgeInput{
+		PreStateRoot:    input.PreStateRoot.Hex(),
+		Transactions:    transactionsToBridge(input.Transactions),
+		BlockContext:    blockContextToBridge(input.BlockContext),
+		InboxRootBefore: input.InboxRootBefore.Hex(),
+		InboxRootAfter:  input.InboxRootAfter.Hex(),
+		Mode:            sp1Mode,
+	}
+	if envelope.Mode == "" {
+		// Default mirrors the bridge's "execute" branch — safe for
+		// callers that didn't set SP1ProofMode (e.g. dry runs).
+		envelope.Mode = "execute"
+	}
+
+	if export != nil {
+		envelope.Accounts = make([]bridgeAccount, 0, len(export.Accounts))
+		for _, a := range export.Accounts {
+			ba := bridgeAccount{
+				Address:      a.Address.Hex(),
+				Nonce:        a.Nonce,
+				Balance:      uint256ToHex(a.Balance),
+				CodeHash:     a.CodeHash.Hex(),
+				StorageRoot:  a.StorageRoot.Hex(),
+				Code:         "0x" + bytesToHex(a.Code),
+				AccountProof: bytesSliceToHex(a.AccountProof),
+			}
+			for _, s := range a.StorageSlots {
+				ba.StorageSlots = append(ba.StorageSlots, bridgeStorageSlot{
+					Key:   s.Key.Hex(),
+					Value: s.Value.Hex(),
+					Proof: bytesSliceToHex(s.Proof),
+				})
+			}
+			envelope.Accounts = append(envelope.Accounts, ba)
+		}
+	}
+
+	return json.Marshal(envelope)
+}
+
+// bridgeInput, bridgeAccount, bridgeStorageSlot, bridgeTransaction,
+// bridgeBlockContext are the JSON shapes expected by
+// prover/host-bridge/src/main.rs. They mirror the Rust HostInput /
+// AccountExport / StorageSlotExport / TransactionExport / BlockContext
+// types one-to-one. Keep these in lock-step with the Rust bridge.
+type bridgeInput struct {
+	PreStateRoot    string               `json:"pre_state_root"`
+	Accounts        []bridgeAccount      `json:"accounts"`
+	Transactions    []bridgeTransaction  `json:"transactions"`
+	BlockContext    bridgeBlockContext   `json:"block_context"`
+	InboxRootBefore string               `json:"inbox_root_before,omitempty"`
+	InboxRootAfter  string               `json:"inbox_root_after,omitempty"`
+	Mode            string               `json:"mode"`
+}
+
+type bridgeAccount struct {
+	Address      string              `json:"address"`
+	Nonce        uint64              `json:"nonce"`
+	Balance      string              `json:"balance"`
+	CodeHash     string              `json:"code_hash"`
+	Code         string              `json:"code"`
+	StorageRoot  string              `json:"storage_root,omitempty"`
+	AccountProof []string            `json:"account_proof,omitempty"`
+	StorageSlots []bridgeStorageSlot `json:"storage_slots,omitempty"`
+}
+
+type bridgeStorageSlot struct {
+	Key   string   `json:"key"`
+	Value string   `json:"value"`
+	Proof []string `json:"proof,omitempty"`
+}
+
+type bridgeTransaction struct {
+	TxType         uint8  `json:"tx_type"`
+	From           string `json:"from"`
+	To             string `json:"to,omitempty"`
+	Value          string `json:"value"`
+	Data           string `json:"data"`
+	Nonce          uint64 `json:"nonce"`
+	GasLimit       uint64 `json:"gas_limit"`
+	GasPrice       uint64 `json:"gas_price"`
+	MaxPriorityFee uint64 `json:"max_priority_fee"`
+	RawBytes       string `json:"raw_bytes"`
+}
+
+type bridgeBlockContext struct {
+	Number     uint64 `json:"number"`
+	Timestamp  uint64 `json:"timestamp"`
+	Coinbase   string `json:"coinbase"`
+	GasLimit   uint64 `json:"gas_limit"`
+	BaseFee    uint64 `json:"base_fee"`
+	PrevRandao string `json:"prev_randao,omitempty"`
+}
+
+// transactionsToBridge unwraps each RLP transaction into the bridge's
+// flat transaction record. Most fields can't be recovered from the raw
+// bytes alone; the bridge cares about `raw_bytes` for batch hashing and
+// reconstructs the rest itself by re-decoding inside the guest. We pass
+// raw_bytes only and let the bridge / guest handle the rest.
+func transactionsToBridge(txs [][]byte) []bridgeTransaction {
+	out := make([]bridgeTransaction, len(txs))
+	for i, raw := range txs {
+		out[i] = bridgeTransaction{
+			RawBytes: "0x" + bytesToHex(raw),
+		}
+	}
+	return out
+}
+
+func blockContextToBridge(bc BlockContext) bridgeBlockContext {
+	return bridgeBlockContext{
+		Number:     bc.Number,
+		Timestamp:  bc.Timestamp,
+		Coinbase:   bc.Coinbase.Hex(),
+		GasLimit:   bc.GasLimit,
+		BaseFee:    bc.BaseFee,
+		PrevRandao: bc.Random.Hex(),
+	}
+}
+
+// uint256ToHex returns a 0x-prefixed left-padded 32-byte hex string. Empty
+// (nil) inputs render as 32 zero bytes.
+func uint256ToHex(v *uint256.Int) string {
+	if v == nil {
+		return "0x" + bytesToHex(make([]byte, 32))
+	}
+	b := v.Bytes32()
+	return "0x" + bytesToHex(b[:])
+}
+
+func bytesToHex(b []byte) string {
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, x := range b {
+		out[2*i] = hexChars[x>>4]
+		out[2*i+1] = hexChars[x&0x0f]
+	}
+	return string(out)
+}
+
+func bytesSliceToHex(slices [][]byte) []string {
+	out := make([]string, len(slices))
+	for i, s := range slices {
+		out[i] = "0x" + bytesToHex(s)
+	}
+	return out
 }
 
 // hashTransactions computes hash256 (double-SHA256) over all transaction bytes
