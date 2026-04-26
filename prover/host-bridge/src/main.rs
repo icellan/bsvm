@@ -33,7 +33,12 @@ struct BlockContext {
     prev_randao: String,
 }
 
-/// Account state from the Go host's state export.
+/// Account state from the Go host's state export. Carries both the flat
+/// account data revm needs to populate its CacheDB AND the Merkle witness
+/// the SP1 guest uses to bind that data to `pre_state_root`. The witness
+/// fields (`account_proof`, `storage_root`, `storage_slots[].proof`) come
+/// from `pkg/prover/state_export.go` and the older flat encoding (storage
+/// list with no proofs) is retained as a fallback for legacy callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountExport {
     address: String,
@@ -41,14 +46,39 @@ struct AccountExport {
     balance: String,
     code_hash: String,
     code: String,
+    /// Flat storage list (legacy wire format). Only populated by older
+    /// callers. New callers use `storage_slots` which carries proofs.
+    #[serde(default)]
     storage: Vec<StorageExport>,
+    /// W4-1 witness: storage slots with proofs against `storage_root`.
+    /// Optional for backward compatibility.
+    #[serde(default)]
+    storage_slots: Vec<StorageSlotExport>,
+    /// W4-1 witness: hex-encoded RLP MPT nodes proving this account
+    /// against `pre_state_root`. Optional for backward compatibility.
+    #[serde(default)]
+    account_proof: Vec<String>,
+    /// Storage trie root for this account. Required when `storage_slots`
+    /// is present so the guest can verify each slot proof.
+    #[serde(default)]
+    storage_root: String,
 }
 
-/// Storage slot from the state export.
+/// Storage slot from the legacy state export (no proof).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageExport {
     key: String,
     value: String,
+}
+
+/// Storage slot from the W4-1 witness (with proof against storage_root).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StorageSlotExport {
+    key: String,
+    value: String,
+    /// Hex-encoded RLP MPT nodes from the storage root down to this slot.
+    #[serde(default)]
+    proof: Vec<String>,
 }
 
 /// Transaction from the Go host.
@@ -137,6 +167,23 @@ struct GuestBlockContext {
     prev_randao: [u8; 32],
 }
 
+/// Per-storage-slot Merkle witness (mirrors guest's StorageProofWitness).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuestStorageProofWitness {
+    key: [u8; 32],
+    value: [u8; 32],
+    proof: Vec<Vec<u8>>,
+}
+
+/// Per-account Merkle witness (mirrors guest's AccountProofWitness).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuestAccountProofWitness {
+    address: [u8; 20],
+    account_proof: Vec<Vec<u8>>,
+    storage_root: [u8; 32],
+    storage_slots: Vec<GuestStorageProofWitness>,
+}
+
 /// Complete batch input as expected by the guest program.
 ///
 /// Field order MUST match prover/guest/src/main.rs::BatchInput exactly.
@@ -148,6 +195,10 @@ struct GuestBatchInput {
     block_context: GuestBlockContext,
     inbox_root_before: [u8; 32],
     inbox_root_after: [u8; 32],
+    /// W4-1 / Gate-0 Merkle witnesses. `None` falls back to the legacy
+    /// host-trusted path in the guest. The host always populates this when
+    /// the input carries proof data.
+    state_proofs: Option<Vec<GuestAccountProofWitness>>,
 }
 
 // ─── Output types (JSON to Go host) ──────────────────────────────────────────
@@ -203,18 +254,32 @@ fn hex_to_address(s: &str) -> [u8; 20] {
 fn convert_input(input: &HostInput) -> GuestBatchInput {
     let pre_state_root = hex_to_bytes32(&input.pre_state_root);
 
+    // Each account is forwarded in two parallel arrays: the flat
+    // GuestAccountState that revm consumes, and the witness that the
+    // guest's W4-1 verifier uses to bind that state to pre_state_root.
     let accounts: Vec<GuestAccountState> = input
         .accounts
         .iter()
         .map(|a| {
-            let storage: Vec<GuestStorageSlot> = a
-                .storage
-                .iter()
-                .map(|s| GuestStorageSlot {
-                    key: hex_to_bytes32(&s.key),
-                    value: hex_to_bytes32(&s.value),
-                })
-                .collect();
+            // Prefer the proof-bearing storage_slots when present; fall
+            // back to the legacy flat storage list otherwise.
+            let storage: Vec<GuestStorageSlot> = if !a.storage_slots.is_empty() {
+                a.storage_slots
+                    .iter()
+                    .map(|s| GuestStorageSlot {
+                        key: hex_to_bytes32(&s.key),
+                        value: hex_to_bytes32(&s.value),
+                    })
+                    .collect()
+            } else {
+                a.storage
+                    .iter()
+                    .map(|s| GuestStorageSlot {
+                        key: hex_to_bytes32(&s.key),
+                        value: hex_to_bytes32(&s.value),
+                    })
+                    .collect()
+            };
 
             GuestAccountState {
                 address: hex_to_address(&a.address),
@@ -226,6 +291,37 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
             }
         })
         .collect();
+
+    // Build the Merkle witness array iff at least one account carries a
+    // proof. The guest treats `None` as legacy (host-trusted) input.
+    let any_proofs = input
+        .accounts
+        .iter()
+        .any(|a| !a.account_proof.is_empty() || !a.storage_slots.is_empty());
+    let state_proofs: Option<Vec<GuestAccountProofWitness>> = if any_proofs {
+        Some(
+            input
+                .accounts
+                .iter()
+                .map(|a| GuestAccountProofWitness {
+                    address: hex_to_address(&a.address),
+                    account_proof: a.account_proof.iter().map(|h| hex_decode(h)).collect(),
+                    storage_root: hex_to_bytes32(&a.storage_root),
+                    storage_slots: a
+                        .storage_slots
+                        .iter()
+                        .map(|s| GuestStorageProofWitness {
+                            key: hex_to_bytes32(&s.key),
+                            value: hex_to_bytes32(&s.value),
+                            proof: s.proof.iter().map(|h| hex_decode(h)).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let transactions: Vec<GuestTransaction> = input
         .transactions
@@ -274,6 +370,7 @@ fn convert_input(input: &HostInput) -> GuestBatchInput {
         block_context,
         inbox_root_before,
         inbox_root_after,
+        state_proofs,
     }
 }
 
