@@ -32,8 +32,33 @@ type NodeConfig struct {
 	Database   DatabaseSection   `toml:"database"`
 	Governance GovernanceSection `toml:"governance"`
 	Indexer    IndexerSection    `toml:"indexer"`
+	BEEF       BEEFSection       `toml:"beef"`
 	LogLevel   string            `toml:"log_level"`
 	LogFormat  string            `toml:"log_format"`
+}
+
+// BEEFSection configures the spec-17 BEEF gossip + ARC callback HTTP
+// endpoints exposed under /bsvm/* on the JSON-RPC HTTP server.
+//
+// AcceptUnverifiedBridgeDeposits is the security-critical knob: when
+// false (the default) the /bsvm/bridge/deposit endpoint stores the
+// envelope but never credits the deposit on L2 — full BRC-62 ancestry
+// + script re-execution lands in W6-4 and is the only thing trusted
+// to advance bridge balances. Operators running a devnet-style setup
+// who want to pre-flight the wiring can flip this to true to allow
+// deposits to be funneled into the bridge monitor's pending list
+// without ancestry verification.
+type BEEFSection struct {
+	// Enabled toggles the BEEF endpoints. Default true; set to false
+	// on nodes that should not expose the spec-17 surface (e.g.
+	// hermetic test deployments or shards that haven't yet onboarded
+	// BEEF-producing wallets).
+	Enabled bool `toml:"enabled"`
+	// AcceptUnverifiedBridgeDeposits relaxes the bridge-deposit
+	// security default. Leave false for production; full BRC-62
+	// verification is the W6-4 work item and is REQUIRED before
+	// flipping this to true on mainnet.
+	AcceptUnverifiedBridgeDeposits bool `toml:"accept_unverified_bridge_deposits"`
 }
 
 // IndexerSection configures the per-address transaction indexer.
@@ -168,6 +193,13 @@ func DefaultNodeConfig() *NodeConfig {
 			Enabled:    true,
 			CacheMB:    16,
 			MaxResults: 500,
+		},
+		BEEF: BEEFSection{
+			// Endpoints on by default — spec 17 makes them part of
+			// the standard surface. Bridge-deposit verification stays
+			// strict until W6-4 lands.
+			Enabled:                        true,
+			AcceptUnverifiedBridgeDeposits: false,
 		},
 		// Governance defaults to zero value (Mode "", no keys, threshold 0)
 		// which is treated as "none" -- fully trustless, no governance keys.
