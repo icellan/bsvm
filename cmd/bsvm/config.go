@@ -318,6 +318,13 @@ type BridgeSection struct {
 	MinDepositSatoshis    uint64 `toml:"min_deposit_satoshis"`
 	MinWithdrawalSatoshis uint64 `toml:"min_withdrawal_satoshis"`
 	BSVConfirmations      int    `toml:"bsv_confirmations"`
+	// BridgeScriptHex is the hex-encoded BSV-side bridge covenant
+	// locking script the deposit verifier matches against. Operators
+	// derive this from the deployed bridge covenant transaction once
+	// the L1 bridge is provisioned. When empty the BEEF bridge
+	// consumer falls through to the pre-Item-3 fail-closed path:
+	// envelopes are stored but no L2 credit is applied.
+	BridgeScriptHex string `toml:"bridge_script_hex"`
 }
 
 // DatabaseSection holds database configuration.

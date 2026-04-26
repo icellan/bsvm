@@ -625,8 +625,13 @@ func cmdRun(ctx *cli.Context) error {
 		}
 	}
 
-	// 5.6: Bridge monitor (requires BSV client).
-	slog.Info("bridge monitor: requires BSV client (will be available with BSV SDK integration)")
+	// 5.6: BEEF-driven bridge monitor is constructed below
+	// (BuildBridgeMonitor at the WireBEEFEndpoints call site). Block-
+	// scanning mode (BSVClient.SubscribeNewBlocks etc.) is still gated
+	// on the BSV-SDK block-notification path landing.
+	// TODO(W6-x): when SubscribeNewBlocks lands, supply a real
+	// bridge.BSVClient to BuildBridgeMonitor so the monitor can scan
+	// blocks in addition to receiving BEEF envelopes.
 
 	// 5.7: Double-spend monitor (requires BSV block notifications).
 	slog.Info("double-spend monitor: initialized, waiting for BSV block notifications")
@@ -819,19 +824,38 @@ func cmdRun(ctx *cli.Context) error {
 	} else {
 		slog.Warn("no chaintracks providers configured — bridge deposits will fail-closed (no L2 credit). Configure [[bsv.chaintracks.providers]] to enable BEEF verification.")
 	}
+	// Build the bridge monitor used as the BEEF deposit-consumer
+	// sink. Returns (nil, nil, nil) when [bridge].bridge_script_hex
+	// is empty — operators on shards without a deployed L1 bridge
+	// keep running, but the BEEF consumer falls through to its fail-
+	// closed branch (envelope stored, no L2 credit).
+	bridgeMonitor, bridgeScriptHash, err := BuildBridgeMonitor(
+		nodeCfg.Bridge,
+		nodeCfg.Bridge.BridgeScriptHex,
+		chainID,
+		boot.DB,
+		overlayNode,
+	)
+	if err != nil {
+		return fmt.Errorf("build bridge monitor: %w", err)
+	}
+	if bridgeMonitor == nil {
+		slog.Warn("bridge monitor not wired — [bridge].bridge_script_hex is empty, BEEF deposits will not credit L2 (fail-closed)")
+	} else {
+		slog.Info("bridge monitor wired",
+			"script_hash_bytes", len(bridgeScriptHash),
+			"local_shard_id", uint32(chainID),
+		)
+	}
 	WireBEEFEndpoints(beefWireOpts{
-		Cfg:         nodeCfg.BEEF,
-		DB:          boot.DB,
-		ShardID:     uint64(chainID),
-		Metrics:     metrics.NewNetworkMetrics(metricsRegistry),
-		Chaintracks: chaintracksClient,
-		// BridgeMonitor + scriptHash + localShardID intentionally left
-		// nil/zero: the monitor isn't constructed in cmdRun yet (see
-		// the "bridge monitor: requires BSV client" log above), so the
-		// unverified-deposit relaxation cannot route anywhere even if
-		// an operator flipped the config flag. Once the bridge monitor
-		// is wired here, populate these fields so the relaxation has
-		// a sink.
+		Cfg:              nodeCfg.BEEF,
+		DB:               boot.DB,
+		ShardID:          uint64(chainID),
+		Metrics:          metrics.NewNetworkMetrics(metricsRegistry),
+		Chaintracks:      chaintracksClient,
+		BridgeMonitor:    bridgeMonitor,
+		BridgeScriptHash: bridgeScriptHash,
+		LocalShardID:     uint32(chainID),
 	}, rpcServer)
 
 	// 8. Start services.
