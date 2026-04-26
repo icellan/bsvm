@@ -174,6 +174,12 @@ type BSVSection struct {
 	Network       string           `toml:"network"`        // mainnet, testnet, regtest
 	FeeWalletKey  string           `toml:"fee_wallet_key"` // Path to WIF key file
 	Confirmations int              `toml:"confirmations"`
+	// WoCCacheSize bounds the in-process LRU cache that wraps the
+	// WhatsOnChain client (W6-8). Cached methods are content-addressed
+	// and immutable (e.g. GetTx by txid); mutable lookups (chain tip,
+	// UTXO sets) bypass the cache. Default 1000 entries. Set to 0 to
+	// disable caching entirely (every call hits WoC upstream).
+	WoCCacheSize int `toml:"woc_cache_size"`
 	// Chaintracks configures the SPV header oracle including the
 	// W6-2 multi-upstream quorum. See pkg/chaintracks.MultiClient and
 	// docs/decisions/header-oracle-quorum.md.
@@ -322,6 +328,7 @@ func DefaultNodeConfig() *NodeConfig {
 		BSV: BSVSection{
 			Network:       "mainnet",
 			Confirmations: 6,
+			WoCCacheSize:  1000,
 		},
 		Bridge: BridgeSection{
 			MinDepositSatoshis:    10000,

@@ -46,6 +46,10 @@ arc_callback_token = ""
 network = "mainnet"
 fee_wallet_key = ""
 confirmations = 6
+# In-process LRU bound for cached WhatsOnChain GetTx lookups (W6-8).
+# WoC enforces per-IP rate limits; caching content-addressed lookups
+# keeps the budget free for fresh queries. Set to 0 to disable.
+woc_cache_size = 1000
 
 # Multi-endpoint ARC fan-out (W6-3). Add one block per ARC provider.
 # [[bsv.arc_endpoint]]
