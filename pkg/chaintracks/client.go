@@ -32,7 +32,11 @@ var ErrUnknownHeader = errors.New("chaintracks: unknown header")
 // BlockHeader carries the SPV-relevant fields of a BSV block header
 // plus cumulative chainwork.
 type BlockHeader struct {
-	Height     uint64
+	Height uint64
+	// Version is the 4-byte block version. Zero is treated as 1 by the
+	// PoW validator, matching the BRC-64 wire formats that frequently
+	// omit the field.
+	Version    int32
 	Hash       [32]byte
 	PrevHash   [32]byte
 	MerkleRoot [32]byte

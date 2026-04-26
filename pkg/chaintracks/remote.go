@@ -19,23 +19,30 @@ import (
 // RemoteConfig configures a RemoteClient. URL is the BRC-64 base URL
 // (e.g. https://headers.example.com/api/v1/chain). Timeout caps each
 // HTTP request. APIKey is forwarded via the X-API-Key header when set.
+//
+// Stream configures the long-lived WS subscription used by
+// SubscribeReorgs. A zero value yields production defaults
+// (path=/api/v1/headers/ws, 64-event buffer, exponential backoff
+// 500ms → 30s, default BSV mainnet checkpoints enforced).
 type RemoteConfig struct {
 	URL     string
 	Timeout time.Duration
 	APIKey  string
+	Stream  StreamConfig
 }
 
-// RemoteClient is a stub HTTP client for a BRC-64 Block Headers
-// Service. It implements the read-only header lookups required for
-// SPV verification. Subscribe-forward streaming and quorum-checking
-// across multiple upstreams are follow-up work; until those land the
-// production wiring should compose RemoteClient with InMemoryClient
-// (seed from a checkpoint and periodically poll Tip()).
+// RemoteClient is the BRC-64-style HTTP + WebSocket client for a
+// chaintracks Block Headers Service. It implements the read-only
+// header lookups required for SPV verification and a long-lived
+// SubscribeReorgs stream. Multi-upstream quorum is follow-up work
+// (see W6-2); a single RemoteClient talks to a single upstream.
 type RemoteClient struct {
-	cfg    RemoteConfig
-	http   *http.Client
-	subsMu sync.Mutex
-	subs   []chan *ReorgEvent
+	cfg  RemoteConfig
+	http *http.Client
+
+	hubOnce sync.Once
+	hub     *streamHub
+	hubErr  error
 }
 
 // NewRemoteClient builds a RemoteClient. cfg.URL is required.
@@ -48,6 +55,9 @@ func NewRemoteClient(cfg RemoteConfig) (*RemoteClient, error) {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
+	}
+	if cfg.Stream.Checkpoints == nil {
+		cfg.Stream.Checkpoints = DefaultCheckpoints()
 	}
 	return &RemoteClient{
 		cfg:  cfg,
@@ -206,30 +216,40 @@ func (c *RemoteClient) Confirmations(ctx context.Context, height uint64, blockHa
 	return int64(tip.Height-h.Height) + 1, nil
 }
 
-// SubscribeReorgs is a SCAFFOLD: in this wave RemoteClient does not
-// open a WebSocket / SSE stream. Production wiring polls Tip() on a
-// timer and emits a synthetic ReorgEvent whenever the tip's PrevHash
-// no longer matches the previously-observed best chain. The returned
-// channel is closed when ctx is cancelled. Until the live-server
-// integration lands, callers should expect zero events.
+// SubscribeReorgs opens (lazily, once) a long-lived WebSocket
+// subscription to the upstream and returns a channel of ReorgEvents.
+// Multiple in-process callers share a single connection; each receives
+// its own bounded channel. Slow consumers are disconnected (channel
+// closed) when the buffer overflows — events are NEVER silently
+// dropped.
+//
+// On disconnect the hub reconnects with exponential backoff
+// (cfg.Stream.BackoffInitial → BackoffMax) and resumes from the last
+// validated tip hash. Every received header is PoW-verified, link-
+// checked, and matched against the configured checkpoints before being
+// fanned out; reorgs that fail cumulative-work checks are rejected.
+//
+// The returned channel is closed when ctx is cancelled.
 func (c *RemoteClient) SubscribeReorgs(ctx context.Context) (<-chan *ReorgEvent, error) {
-	c.subsMu.Lock()
-	ch := make(chan *ReorgEvent, 8)
-	c.subs = append(c.subs, ch)
-	c.subsMu.Unlock()
-	go func() {
-		<-ctx.Done()
-		c.subsMu.Lock()
-		for i, s := range c.subs {
-			if s == ch {
-				c.subs = append(c.subs[:i], c.subs[i+1:]...)
-				break
-			}
+	c.hubOnce.Do(func() {
+		hub, err := newStreamHub(c.cfg.URL, c.cfg.APIKey, c.cfg.Stream)
+		if err != nil {
+			c.hubErr = err
+			return
 		}
-		c.subsMu.Unlock()
-		close(ch)
-	}()
-	return ch, nil
+		// Seed the resume cursor with the current tip, best-effort.
+		seedCtx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
+		if tip, err := c.Tip(seedCtx); err == nil {
+			hub.SetTip(tip)
+		}
+		cancel()
+		c.hub = hub
+		c.hub.Start()
+	})
+	if c.hubErr != nil {
+		return nil, c.hubErr
+	}
+	return c.hub.Subscribe(ctx), nil
 }
 
 // Ping implements ChaintracksClient by GETing /ping.
@@ -238,5 +258,11 @@ func (c *RemoteClient) Ping(ctx context.Context) error {
 	return err
 }
 
-// Close implements ChaintracksClient.
-func (c *RemoteClient) Close() error { return nil }
+// Close implements ChaintracksClient. Tears down the streaming hub if
+// one was started.
+func (c *RemoteClient) Close() error {
+	if c.hub != nil {
+		c.hub.Stop()
+	}
+	return nil
+}
