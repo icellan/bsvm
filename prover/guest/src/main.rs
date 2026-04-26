@@ -26,6 +26,12 @@ sp1_zkvm::entrypoint!(main);
 mod mpt;
 mod proof_verify;
 
+// `tx` lives in the crate's library facet (see `lib.rs`) so its pure-Rust
+// unit tests can run on the host with `cargo test --lib`. Re-exporting
+// here lets the binary use it via the same `tx::` path the rest of the
+// guest already uses.
+use bsvm_guest::tx;
+
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
 use mpt::{AccountState, EthMPT, StorageSlot, EMPTY_ROOT, KECCAK_EMPTY};
@@ -76,29 +82,59 @@ pub struct BlockContext {
     pub prev_randao: B256,
 }
 
-/// A serialized EVM transaction with its fields pre-decoded.
+/// A serialized EVM transaction.
+///
+/// IMPORTANT (Gate 0 / W4-2): for user-signed transactions (legacy,
+/// EIP-2930, EIP-1559) the `from` field is NOT trusted — the guest
+/// re-decodes `raw_bytes` and recovers the sender from the signature
+/// using SP1's secp256k1 + keccak256 precompiles via
+/// `tx::decode_and_recover`. The `to`, `value`, `nonce`, `gas_limit`,
+/// `gas_price`, and `max_priority_fee` fields are likewise re-derived
+/// from `raw_bytes` by the guest before being fed to revm — that way
+/// the proof covers the canonical signed contents end-to-end and a
+/// malicious host cannot swap any signed field without invalidating
+/// the signature.
+///
+/// Deposit system transactions (`tx_type = 0x7E`) are the ONE exception:
+/// they have no ECDSA signature (the bridge inbox covenant has already
+/// verified them on-chain), so the guest uses the host-supplied `from`,
+/// `to`, `value`, and `nonce` directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvmTransaction {
     /// Transaction type byte. 0x7E = deposit system transaction.
     /// 0x00 = legacy, 0x01 = EIP-2930, 0x02 = EIP-1559.
     pub tx_type: u8,
-    /// The sender address (recovered from signature by the host).
+    /// Sender address. Trusted ONLY for deposit system txs (`tx_type=0x7E`);
+    /// IGNORED for all signed user txs (the guest recovers the sender from
+    /// `raw_bytes` instead).
     pub from: Address,
-    /// The destination address. None for contract creation.
+    /// The destination address. For non-deposit txs, re-derived from
+    /// `raw_bytes`; for deposits, used as-is. None for contract creation.
     pub to: Option<Address>,
-    /// The value to transfer in wei.
+    /// The value to transfer in wei. Re-derived from `raw_bytes` for
+    /// non-deposit txs; used as-is for deposits.
     pub value: U256,
-    /// The transaction data (calldata or init code).
+    /// The transaction data (calldata or init code). Re-derived from
+    /// `raw_bytes` for non-deposit txs; ignored for deposits.
     pub data: Vec<u8>,
-    /// The nonce of the sender.
+    /// The nonce of the sender. Re-derived from `raw_bytes` for non-deposit
+    /// txs; used as-is for deposits (deposits don't actually consume a
+    /// nonce, but the field is retained for wire-format stability).
     pub nonce: u64,
-    /// The gas limit for this transaction.
+    /// The gas limit for this transaction. Re-derived from `raw_bytes` for
+    /// non-deposit txs.
     pub gas_limit: u64,
     /// The gas price (for legacy txs) or max fee per gas (for EIP-1559).
+    /// Re-derived from `raw_bytes` for non-deposit txs.
     pub gas_price: u64,
-    /// The max priority fee per gas (EIP-1559). 0 for legacy.
+    /// The max priority fee per gas (EIP-1559). 0 for legacy. Re-derived
+    /// from `raw_bytes` for non-deposit txs.
     pub max_priority_fee: u64,
-    /// The raw RLP-encoded transaction bytes (for batch data hashing).
+    /// The raw RLP-encoded transaction bytes. For non-deposit txs this is
+    /// the full signed RLP (legacy `RLP([... v r s])` or `0x{type} ||
+    /// RLP([... v r s])` for typed txs); the guest uses these as the
+    /// authoritative source for sender + every signed field. Also used by
+    /// the batch-data-hash binding (spec 12).
     pub raw_bytes: Vec<u8>,
 }
 
@@ -322,20 +358,37 @@ pub fn main() {
             });
         } else {
             // ── Standard EVM transaction ────────────────────────────
+            // Re-decode every signed field — including the sender — from
+            // `raw_bytes` so the proof attests to the canonical signed
+            // contents. A malicious host cannot swap any signed field
+            // (sender, nonce, value, to, data, gas, fees) without
+            // invalidating the signature, which `decode_and_recover`
+            // detects and reports as a fatal batch error.
+            let decoded = match tx::decode_and_recover(&tx.raw_bytes, CHAIN_ID) {
+                Ok(d) => d,
+                Err(_) => {
+                    // A single bad signature invalidates the whole batch
+                    // (matches Ethereum block validity). Bail out with a
+                    // structured error code; do NOT panic, because panics
+                    // produce no proof and stall the pipeline.
+                    commit_error(0x20, &[0u8; 32], &[0u8; 32]);
+                    return;
+                }
+            };
             let tx_env = TxEnv {
-                caller: tx.from,
-                gas_limit: tx.gas_limit,
-                gas_price: tx.gas_price as u128,
-                kind: match tx.to {
+                caller: decoded.sender,
+                gas_limit: decoded.gas_limit,
+                gas_price: decoded.gas_price,
+                kind: match decoded.to {
                     Some(addr) => TxKind::Call(addr),
                     None => TxKind::Create,
                 },
-                value: tx.value,
-                data: Bytes::from(tx.data.clone()),
-                nonce: tx.nonce,
+                value: decoded.value,
+                data: Bytes::from(decoded.data.clone()),
+                nonce: decoded.nonce,
                 chain_id: Some(CHAIN_ID),
-                gas_priority_fee: if tx.max_priority_fee > 0 {
-                    Some(tx.max_priority_fee as u128)
+                gas_priority_fee: if decoded.max_priority_fee > 0 {
+                    Some(decoded.max_priority_fee)
                 } else {
                     None
                 },
@@ -387,8 +440,9 @@ pub fn main() {
                 Err(_) => {
                     // Transaction failed at the EVM level — create a failed receipt.
                     // In Ethereum, failed transactions still consume gas and
-                    // are included in the block.
-                    cumulative_gas_used += tx.gas_limit;
+                    // are included in the block. Use the signature-derived
+                    // gas limit so a malicious host can't inflate it.
+                    cumulative_gas_used += decoded.gas_limit;
                     receipts.push(Receipt {
                         status: false,
                         cumulative_gas_used,
