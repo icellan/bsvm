@@ -141,7 +141,25 @@ type NetworkSection struct {
 // sub-section configures the SPV header oracle including W6-2 multi-
 // upstream quorum.
 type BSVSection struct {
+	// NodeURL is the legacy single-endpoint BSV-node JSON-RPC URL.
+	// Retained for backward compatibility. New deployments SHOULD
+	// list one or more entries under NodeURLs instead; when both are
+	// set NodeURLs takes precedence and NodeURL is ignored. When only
+	// NodeURL is set, the failover wrapper is constructed with a
+	// single-element list (effectively single-node behaviour).
 	NodeURL string `toml:"node_url"`
+	// NodeURLs lists BSV-node JSON-RPC endpoints in preference order
+	// for the W6-11 failover wrapper (pkg/bsvclient.MultiRPCProvider).
+	// Index 0 is the primary; subsequent entries are backups consulted
+	// on transport / 5xx failures. Application-level RPC errors are
+	// NOT retried.
+	NodeURLs []string `toml:"node_urls"`
+	// NodeMaxConsecutiveFailures parks a node after this many
+	// consecutive transport / 5xx failures. Default 3.
+	NodeMaxConsecutiveFailures int `toml:"node_max_consecutive_failures"`
+	// NodeCooldown is how long a parked node stays out of rotation.
+	// Parsed via time.ParseDuration. Default "30s".
+	NodeCooldown string `toml:"node_cooldown"`
 	// ARCURL is the legacy single-endpoint ARC URL. Retained for
 	// backward compatibility with existing deployments. New deployments
 	// SHOULD configure one or more entries under ARCEndpoints instead;
@@ -184,6 +202,25 @@ type BSVSection struct {
 	// W6-2 multi-upstream quorum. See pkg/chaintracks.MultiClient and
 	// docs/decisions/header-oracle-quorum.md.
 	Chaintracks ChaintracksSection `toml:"chaintracks"`
+}
+
+// EffectiveNodeURLs returns the BSV-node URL list to use for the
+// W6-11 failover wrapper. Resolution order:
+//
+//  1. NodeURLs (when non-empty) — multi-endpoint deployments.
+//  2. NodeURL (when non-empty)  — legacy single-endpoint deployments.
+//  3. nil                       — node operates without a BSV-node
+//     RPC backup (chaintracks + ARC + WoC carry the load).
+//
+// The slice is returned in preference order: index 0 is primary.
+func (b BSVSection) EffectiveNodeURLs() []string {
+	if len(b.NodeURLs) > 0 {
+		return b.NodeURLs
+	}
+	if b.NodeURL != "" {
+		return []string{b.NodeURL}
+	}
+	return nil
 }
 
 // ARCEndpointSection describes a single ARC endpoint within the
@@ -326,9 +363,11 @@ func DefaultNodeConfig() *NodeConfig {
 			MaxPeers:       50,
 		},
 		BSV: BSVSection{
-			Network:       "mainnet",
-			Confirmations: 6,
-			WoCCacheSize:  1000,
+			Network:                    "mainnet",
+			Confirmations:              6,
+			WoCCacheSize:               1000,
+			NodeMaxConsecutiveFailures: 3,
+			NodeCooldown:               "30s",
 		},
 		Bridge: BridgeSection{
 			MinDepositSatoshis:    10000,
