@@ -7,13 +7,17 @@ import (
 	"fmt"
 )
 
-// BEEF magic bytes per BRC-62 ("Atomic BEEF" version 0100BEEF and
-// the V2 0200BEEF extension carry the same wire prefix; we accept
-// both variants and reject anything else). Stored as little-endian
-// uint32 on the wire.
+// BEEF magic bytes per BRC-62 / BRC-96. The on-disk byte sequence is
+// `01 00 BE EF` for V1 (BRC-62) and `02 00 BE EF` for V2 (BRC-96).
+// When read as a little-endian uint32 those are 0xEFBE0001 and
+// 0xEFBE0002 respectively — matching go-sdk's `BEEF_V1` /
+// `BEEF_V2` constants byte-for-byte. The earlier scaffold used the
+// reversed values; W6-4 corrects this so envelopes produced by any
+// BRC-62 wallet (go-sdk, go-wallet-toolbox, ts-sdk) parse without
+// transformation.
 const (
-	beefMagicV1 uint32 = 0x0100BEEF
-	beefMagicV2 uint32 = 0x0200BEEF
+	beefMagicV1 uint32 = 0xEFBE0001
+	beefMagicV2 uint32 = 0xEFBE0002
 )
 
 // ParsedTx is a minimal representation of a parsed BSV transaction
@@ -118,7 +122,12 @@ func ParseBEEF(body []byte) (*ParsedBEEF, error) {
 			return nil, fmt.Errorf("beef: bump %d tree height: %w", i, therr)
 		}
 		pos += thn
-		for lvl := uint64(0); lvl <= treeHeight; lvl++ {
+		// BRC-74: a BUMP of declared height N has exactly N levels of
+		// leaves on the wire. Earlier scaffold revisions used `<=` and
+		// over-read into the following bytes, which surfaced as a
+		// "unknown flag" error the moment a real BSV wallet sent a
+		// non-trivial BUMP. W6-4 fix: walk exactly N levels.
+		for lvl := uint64(0); lvl < treeHeight; lvl++ {
 			leafCount, lcn, lcerr := readVarInt(body[pos:])
 			if lcerr != nil {
 				return nil, fmt.Errorf("beef: bump %d level %d leaf count: %w", i, lvl, lcerr)
@@ -135,23 +144,22 @@ func ParseBEEF(body []byte) (*ParsedBEEF, error) {
 				}
 				flag := body[pos]
 				pos++
-				switch flag {
-				case 0x00:
-					// Hash follows.
+				// BRC-74 leaf flag is a bitfield, not an enum:
+				//   bit 0 (0x01) = duplicate-of-working-hash leaf
+				//                  (no hash bytes follow)
+				//   bit 1 (0x02) = leaf is the client's txid (hash
+				//                  bytes still follow unless bit 0 is
+				//                  also set)
+				// Any other bits are reserved and MUST be zero on the
+				// wire per BRC-74 §"Leaf flags".
+				if flag&^0x03 != 0 {
+					return nil, fmt.Errorf("beef: bump %d leaf %d reserved flag bits set 0x%02x", i, leaf, flag)
+				}
+				if flag&0x01 == 0 {
 					if pos+32 > len(body) {
 						return nil, errBEEFTruncated
 					}
 					pos += 32
-				case 0x01:
-					// Duplicate: nothing more on this leaf.
-				case 0x02:
-					// Client tx leaf at the bottom level: hash follows.
-					if pos+32 > len(body) {
-						return nil, errBEEFTruncated
-					}
-					pos += 32
-				default:
-					return nil, fmt.Errorf("beef: bump %d leaf %d unknown flag 0x%02x", i, leaf, flag)
 				}
 			}
 		}
