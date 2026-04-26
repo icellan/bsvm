@@ -134,8 +134,9 @@ func verifyCovenantCodeMatches(mode covenant.VerificationMode, deployedScriptHex
 	dummyStateRoot := "00000000000000000000000000000000000000000000000000000000000000ff"
 	contract := runar.NewRunarContract(artifact, []interface{}{
 		dummyStateRoot,
-		int64(0),
-		int64(0),
+		int64(0), // blockNumber
+		int64(0), // frozen
+		int64(0), // advancesSinceInbox (spec 10)
 	})
 	expectedFull := contract.GetLockingScript()
 	expectedCode := stripStatefulSuffix(expectedFull)

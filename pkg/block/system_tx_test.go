@@ -332,7 +332,7 @@ func TestDecodeWithdrawCalldata_Errors(t *testing.T) {
 			func() []byte {
 				d := make([]byte, 68)
 				copy(d[:4], WithdrawSelector[:])
-				d[28] = 0 // amount zero
+				d[28] = 0       // amount zero
 				d[36+20] = 0xff // padding byte non-zero
 				return d
 			}(),

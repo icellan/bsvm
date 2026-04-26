@@ -39,18 +39,18 @@ const maxRequestSize = 5 * 1024 * 1024
 // RPCServer is the HTTP JSON-RPC server that exposes the Ethereum-compatible
 // API to clients like MetaMask, ethers.js, Hardhat, and Foundry.
 type RPCServer struct {
-	config      RPCConfig
-	ethAPI      *EthAPI
-	netAPI      *NetAPI
-	web3API     *Web3API
-	bsvAPI      *BsvAPI
-	debugAPI    *DebugAPI
-	adminAPI    *AdminAPI
-	overlay     *overlay.OverlayNode
-	wsManager   *WSManager
-	httpServer  *http.Server
-	wsServer    *http.Server // separate WebSocket server on WSAddr
-	limiter     *rateLimiter // per-IP rate limiting
+	config        RPCConfig
+	ethAPI        *EthAPI
+	netAPI        *NetAPI
+	web3API       *Web3API
+	bsvAPI        *BsvAPI
+	debugAPI      *DebugAPI
+	adminAPI      *AdminAPI
+	overlay       *overlay.OverlayNode
+	wsManager     *WSManager
+	httpServer    *http.Server
+	wsServer      *http.Server // separate WebSocket server on WSAddr
+	limiter       *rateLimiter // per-IP rate limiting
 	registry      *metrics.Registry
 	authConfig    auth.Config
 	logStreamer   *LogStreamer

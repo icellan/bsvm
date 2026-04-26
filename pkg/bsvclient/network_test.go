@@ -46,7 +46,7 @@ func (f *fakeWoC) GetUTXOs(ctx context.Context, addr string) ([]whatsonchain.UTX
 	return nil, nil
 }
 func (f *fakeWoC) ChainInfo(ctx context.Context) (*whatsonchain.ChainInfo, error) { return nil, nil }
-func (f *fakeWoC) Ping(ctx context.Context) error                                  { return nil }
+func (f *fakeWoC) Ping(ctx context.Context) error                                 { return nil }
 
 func TestNetworkClientBroadcastFromARC(t *testing.T) {
 	a := &fakeARC{}

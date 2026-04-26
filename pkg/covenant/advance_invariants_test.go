@@ -322,6 +322,9 @@ func TestAdvance_SingleDataOutput(t *testing.T) {
 //   - [32..64)   postStateRoot
 //   - [104..136) batchDataHash
 //   - [136..144) chainId (little-endian 8 bytes)
+//   - [144..176) withdrawalRoot (spec 07 / 13 — published in advance OP_RETURN)
+//   - [176..208) inboxRootBefore (spec 10 forced-inclusion gate)
+//   - [208..240) inboxRootAfter
 //   - [272..280) blockNumber (little-endian 8 bytes)
 //
 // The offsets are encoded as load_const bindings resolved from the ANF
@@ -333,6 +336,9 @@ func TestAdvance_PublicValueOffsets(t *testing.T) {
 		{Start: 32, Length: 32},
 		{Start: 104, Length: 32},
 		{Start: 136, Length: 8},
+		{Start: 144, Length: 32},
+		{Start: 176, Length: 32},
+		{Start: 208, Length: 32},
 		{Start: 272, Length: 8},
 	}
 	for _, fx := range buildRollupFixtures(t) {
@@ -395,47 +401,60 @@ func assertSubstrSlotsMatch(got, want []substrSlot) error {
 // permanently frozen. More than one would mean duplicated auth paths
 // and is likely a codegen bug.
 func TestGovernance_PathsCarrySignatureCheck(t *testing.T) {
-	// (name suffix, expected single-key or multisig gate)
-	singleKeyMethods := []string{"freezeSingleKey", "unfreezeSingleKey", "upgradeSingleKey"}
-	multiSigMethods := []string{
+	// upgrade* methods carry an additional BSVM\x03 OP_RETURN per spec 10
+	// migration: covenant publishes newScriptHash + newAnfHash so observers
+	// can verify the migration target. freeze/unfreeze paths stay output-free.
+	freezeUnfreezeSingleKey := []string{"freezeSingleKey", "unfreezeSingleKey"}
+	upgradeSingleKey := []string{"upgradeSingleKey"}
+	freezeUnfreezeMultiSig := []string{
 		"freezeMultiSig2", "freezeMultiSig3",
 		"unfreezeMultiSig2", "unfreezeMultiSig3",
-		"upgradeMultiSig2", "upgradeMultiSig3",
+	}
+	upgradeMultiSig := []string{"upgradeMultiSig2", "upgradeMultiSig3"}
+	checkSingleKey := func(t *testing.T, fx rollupFixture, names []string, wantOutputs int) {
+		t.Helper()
+		for _, name := range names {
+			m := fx.ANF[name]
+			if m == nil {
+				t.Errorf("%s missing from compiled ANF", name)
+				continue
+			}
+			if m.CheckSigCount != 1 {
+				t.Errorf("%s must contain exactly 1 checkSig, got %d", name, m.CheckSigCount)
+			}
+			if m.CheckMultiSig != 0 {
+				t.Errorf("%s must NOT contain checkMultiSig, got %d", name, m.CheckMultiSig)
+			}
+			if m.AddDataOutput != wantOutputs {
+				t.Errorf("%s must emit %d data outputs, got %d", name, wantOutputs, m.AddDataOutput)
+			}
+		}
+	}
+	checkMultiSig := func(t *testing.T, fx rollupFixture, names []string, wantOutputs int) {
+		t.Helper()
+		for _, name := range names {
+			m := fx.ANF[name]
+			if m == nil {
+				t.Errorf("%s missing from compiled ANF", name)
+				continue
+			}
+			if m.CheckMultiSig != 1 {
+				t.Errorf("%s must contain exactly 1 checkMultiSig, got %d", name, m.CheckMultiSig)
+			}
+			if m.CheckSigCount != 0 {
+				t.Errorf("%s must NOT contain checkSig, got %d", name, m.CheckSigCount)
+			}
+			if m.AddDataOutput != wantOutputs {
+				t.Errorf("%s must emit %d data outputs, got %d", name, wantOutputs, m.AddDataOutput)
+			}
+		}
 	}
 	for _, fx := range buildRollupFixtures(t) {
 		t.Run(fx.Name, func(t *testing.T) {
-			for _, name := range singleKeyMethods {
-				m := fx.ANF[name]
-				if m == nil {
-					t.Errorf("%s missing from compiled ANF", name)
-					continue
-				}
-				if m.CheckSigCount != 1 {
-					t.Errorf("%s must contain exactly 1 checkSig, got %d", name, m.CheckSigCount)
-				}
-				if m.CheckMultiSig != 0 {
-					t.Errorf("%s must NOT contain checkMultiSig, got %d", name, m.CheckMultiSig)
-				}
-				if m.AddDataOutput != 0 {
-					t.Errorf("%s must NOT emit a data output, got %d", name, m.AddDataOutput)
-				}
-			}
-			for _, name := range multiSigMethods {
-				m := fx.ANF[name]
-				if m == nil {
-					t.Errorf("%s missing from compiled ANF", name)
-					continue
-				}
-				if m.CheckMultiSig != 1 {
-					t.Errorf("%s must contain exactly 1 checkMultiSig, got %d", name, m.CheckMultiSig)
-				}
-				if m.CheckSigCount != 0 {
-					t.Errorf("%s must NOT contain checkSig, got %d", name, m.CheckSigCount)
-				}
-				if m.AddDataOutput != 0 {
-					t.Errorf("%s must NOT emit a data output, got %d", name, m.AddDataOutput)
-				}
-			}
+			checkSingleKey(t, fx, freezeUnfreezeSingleKey, 0)
+			checkSingleKey(t, fx, upgradeSingleKey, 1)
+			checkMultiSig(t, fx, freezeUnfreezeMultiSig, 0)
+			checkMultiSig(t, fx, upgradeMultiSig, 1)
 		})
 	}
 }

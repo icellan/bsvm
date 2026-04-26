@@ -11,8 +11,8 @@ import (
 
 func TestCallbackHandlerAuthAndDispatch(t *testing.T) {
 	var (
-		mu    sync.Mutex
-		seen  []*CallbackEvent
+		mu   sync.Mutex
+		seen []*CallbackEvent
 	)
 	h := NewCallbackHandler([]string{"tok-1"}, func(ev *CallbackEvent) {
 		mu.Lock()

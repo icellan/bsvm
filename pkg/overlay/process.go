@@ -482,10 +482,12 @@ func (n *OverlayNode) processBatchInternal(
 				slog.Warn("covenant broadcast failed", "block", l2Block.NumberU64(), "error", bcErr)
 			} else {
 				broadcastResult = result
-				// Read the watcher under the node mutex via the
-				// accessor; the field is mutated by
-				// StartConfirmationWatcher / Stop on a different goroutine.
-				if w := n.ConfirmationWatcherRef(); w != nil {
+				// processBatchInternal is documented to be called with
+				// n.mu held, so the field read is already serialised
+				// against StartConfirmationWatcher; reaching for the
+				// public ConfirmationWatcherRef accessor here would
+				// re-enter n.mu and deadlock.
+				if w := n.confirmationWatcher; w != nil {
 					w.Track(l2Block.NumberU64(), result.TxID)
 				}
 			}

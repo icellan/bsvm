@@ -673,7 +673,7 @@ func TestRoundTripMockBatchMultipleTransfers(t *testing.T) {
 //   - [104..136) BatchDataHash ← hash256(tx-encoded-bytes)
 //   - [136..144) ChainID       ← 1337
 //   - [144..176) WithdrawalRoot ← bridge-side Merkle root over the two
-//                                  fixture withdrawals (NOT zero)
+//     fixture withdrawals (NOT zero)
 //   - [272..280) BlockNumber   ← l2Block.NumberU64()
 //
 // This is the canonical 280-byte spec-12 layout (PublicValuesSize). The

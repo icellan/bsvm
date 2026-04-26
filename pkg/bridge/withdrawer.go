@@ -123,11 +123,11 @@ func NewWithdrawer(
 	config WithdrawalConfig,
 ) *Withdrawer {
 	return &Withdrawer{
-		bsvBroadcaster: broadcaster,
-		bridgeUTXO:     bridgeUTXO,
-		scanner:        scanner,
-		advanceFinder:  advanceFinder,
-		config:         config,
+		bsvBroadcaster:   broadcaster,
+		bridgeUTXO:       bridgeUTXO,
+		scanner:          scanner,
+		advanceFinder:    advanceFinder,
+		config:           config,
 		broadcastRetries: 3,
 		broadcastBackoffs: []time.Duration{
 			time.Second,

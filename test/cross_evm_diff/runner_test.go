@@ -2,11 +2,23 @@ package cross_evm_diff
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/icellan/bsvm/test/evmtest"
 )
+
+// requireTestdata skips when the ethereum/tests submodule isn't
+// checked out. The submodule has no entry in .gitmodules, so CI jobs
+// that don't pre-clone ethereum/tests separately can't access it; the
+// nightly cross-EVM workflow restores it explicitly.
+func requireTestdata(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat(testdataRoot); os.IsNotExist(err) {
+		t.Skipf("ethereum/tests testdata absent at %s; clone https://github.com/ethereum/tests into test/evmtest/testdata to run", testdataRoot)
+	}
+}
 
 // testdataRoot is the GeneralStateTests directory. Resolved relative
 // to this test file so go test ./test/cross_evm_diff/... finds it
@@ -36,6 +48,7 @@ var smokeFixtures = []string{
 // balance, and hashing. Designed to complete in seconds so it can run
 // on every CI push.
 func TestCrossEVMDiff_Smoke(t *testing.T) {
+	requireTestdata(t)
 	runner := NewRunner()
 	rep := &Report{Fork: runner.fork}
 
@@ -83,6 +96,7 @@ func TestCrossEVMDiff(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping full cross-EVM diff suite in short mode")
 	}
+	requireTestdata(t)
 
 	fixtures, err := FixtureWalk(testdataRoot)
 	if err != nil {
@@ -136,6 +150,7 @@ func TestCrossEVMDiff(t *testing.T) {
 // Without this, a missing fixture would silently inflate the pass
 // count to zero and the smoke test would pass trivially.
 func TestSmokeFixturesExist(t *testing.T) {
+	requireTestdata(t)
 	for _, rel := range smokeFixtures {
 		path := filepath.Join(testdataRoot, rel)
 		tests, err := LoadFixture(path)
@@ -155,6 +170,7 @@ func TestSmokeFixturesExist(t *testing.T) {
 // differential harness will spuriously flag every fixture as a
 // mismatch.
 func TestExecuteStateTestRoot(t *testing.T) {
+	requireTestdata(t)
 	path := filepath.Join(testdataRoot, smokeFixtures[0])
 	tests, err := LoadFixture(path)
 	if err != nil {

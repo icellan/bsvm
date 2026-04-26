@@ -86,12 +86,12 @@ type ChaintracksClient interface {
 // are exposed so tests can drive the client through specific
 // scenarios; production wiring uses RemoteClient instead.
 type InMemoryClient struct {
-	mu          sync.RWMutex
-	byHash      map[[32]byte]*BlockHeader
-	byHeight    map[uint64]*BlockHeader
-	tipHash     [32]byte
-	subs        []chan *ReorgEvent
-	closed      bool
+	mu       sync.RWMutex
+	byHash   map[[32]byte]*BlockHeader
+	byHeight map[uint64]*BlockHeader
+	tipHash  [32]byte
+	subs     []chan *ReorgEvent
+	closed   bool
 }
 
 // NewInMemoryClient returns an empty InMemoryClient.

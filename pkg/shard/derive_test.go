@@ -87,6 +87,7 @@ func deriveTestFixture(t *testing.T, chainID int64, sp1VK []byte, gov covenant.G
 		stateRootHex,
 		int64(0), // blockNumber
 		int64(0), // frozen
+		int64(0), // advancesSinceInbox (spec 10 forced-inclusion counter)
 	})
 	scriptHex := contract.GetLockingScript()
 	if scriptHex == "" {

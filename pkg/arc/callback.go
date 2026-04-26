@@ -42,9 +42,9 @@ type CallbackEvent struct {
 // the registered consumer (typically the overlay's ARC consumer that
 // upgrades the matching BEEF and gossips it).
 type CallbackHandler struct {
-	tokens     []string
-	consumer   func(*CallbackEvent)
-	tokenMu    sync.RWMutex
+	tokens   []string
+	consumer func(*CallbackEvent)
+	tokenMu  sync.RWMutex
 }
 
 // NewCallbackHandler constructs a CallbackHandler. tokens contains

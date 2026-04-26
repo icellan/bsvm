@@ -276,6 +276,7 @@ func cmdDeployShard(ctx *cli.Context) error {
 		stateRootHex,
 		int64(0), // blockNumber
 		int64(0), // frozen
+		int64(0), // advancesSinceInbox (spec 10 forced-inclusion counter)
 	})
 	lockingScriptHex := contract.GetLockingScript()
 

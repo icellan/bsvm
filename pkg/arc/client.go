@@ -33,21 +33,21 @@ import (
 type Status string
 
 const (
-	StatusUnknown                Status = "UNKNOWN"
-	StatusQueued                 Status = "QUEUED"
-	StatusReceived               Status = "RECEIVED"
-	StatusStored                 Status = "STORED"
-	StatusAnnouncedToNetwork     Status = "ANNOUNCED_TO_NETWORK"
-	StatusRequestedByNetwork     Status = "REQUESTED_BY_NETWORK"
-	StatusSentToNetwork          Status = "SENT_TO_NETWORK"
-	StatusAcceptedByNetwork      Status = "ACCEPTED_BY_NETWORK"
-	StatusSeenOnNetwork          Status = "SEEN_ON_NETWORK"
-	StatusMined                  Status = "MINED"
-	StatusConfirmed              Status = "CONFIRMED"
-	StatusRejected               Status = "REJECTED"
-	StatusSeenInOrphanMempool    Status = "SEEN_IN_ORPHAN_MEMPOOL"
-	StatusDoubleSpendAttempted   Status = "DOUBLE_SPEND_ATTEMPTED"
-	StatusDoubleSpendConfirmed   Status = "DOUBLE_SPEND_CONFIRMED"
+	StatusUnknown              Status = "UNKNOWN"
+	StatusQueued               Status = "QUEUED"
+	StatusReceived             Status = "RECEIVED"
+	StatusStored               Status = "STORED"
+	StatusAnnouncedToNetwork   Status = "ANNOUNCED_TO_NETWORK"
+	StatusRequestedByNetwork   Status = "REQUESTED_BY_NETWORK"
+	StatusSentToNetwork        Status = "SENT_TO_NETWORK"
+	StatusAcceptedByNetwork    Status = "ACCEPTED_BY_NETWORK"
+	StatusSeenOnNetwork        Status = "SEEN_ON_NETWORK"
+	StatusMined                Status = "MINED"
+	StatusConfirmed            Status = "CONFIRMED"
+	StatusRejected             Status = "REJECTED"
+	StatusSeenInOrphanMempool  Status = "SEEN_IN_ORPHAN_MEMPOOL"
+	StatusDoubleSpendAttempted Status = "DOUBLE_SPEND_ATTEMPTED"
+	StatusDoubleSpendConfirmed Status = "DOUBLE_SPEND_CONFIRMED"
 )
 
 // BroadcastResponse is the parsed result of a successful Broadcast
@@ -55,13 +55,13 @@ const (
 // before broadcast (rare but legal); otherwise MerklePath is nil and
 // the caller waits for the callback.
 type BroadcastResponse struct {
-	TxID         [32]byte
-	Status       Status
-	BlockHash    [32]byte
-	BlockHeight  uint64
-	ExtraInfo    string
-	MerklePath   []byte
-	SubmittedAt  time.Time
+	TxID        [32]byte
+	Status      Status
+	BlockHash   [32]byte
+	BlockHeight uint64
+	ExtraInfo   string
+	MerklePath  []byte
+	SubmittedAt time.Time
 }
 
 // TxStatus is the parsed result of a Status() call.
