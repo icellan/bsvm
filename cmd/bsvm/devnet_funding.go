@@ -20,7 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/icellan/bsvm/pkg/bsvclient"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/types"
 	runar "github.com/icellan/runar/packages/runar-go"
@@ -49,7 +48,12 @@ const utxoPollBudget = 30 * time.Second
 // BootstrapOpts carries every input BootstrapFeeWallet needs.
 // MinBalanceSats and FundBTC default to sensible values if zero.
 type BootstrapOpts struct {
-	Provider       *bsvclient.RPCProvider
+	// Provider is the BSV-node JSON-RPC client. Typed as the union
+	// interface so callers can pass either a single-endpoint
+	// *bsvclient.RPCProvider or the W6-11 failover wrapper
+	// *bsvclient.MultiRPCProvider — the bootstrap path only needs
+	// Call(...) + GetUtxos(string).
+	Provider       BSVProviderClient
 	FeeWallet      *overlay.FeeWallet
 	Address        string  // BSV P2PKH for the fee-wallet key
 	Network        string  // "regtest" only — others return (0, nil)

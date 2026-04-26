@@ -26,7 +26,6 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
-	"github.com/icellan/bsvm/pkg/bsvclient"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/shard"
 	"github.com/icellan/bsvm/pkg/state"
@@ -116,10 +115,12 @@ type bootGenesisOpts struct {
 	// Precedence: FIRST (operator-provided bytes are trusted over
 	// any cached or remote source).
 	TxFilePath string
-	// Provider is a live BSV RPC provider. When non-nil, the boot
+	// Provider is a live BSV RPC client. When non-nil, the boot
 	// layer can fetch the raw tx via getrawtransaction if file /
-	// cache are unavailable.
-	Provider *bsvclient.RPCProvider
+	// cache are unavailable. Typed as BSVProviderClient so a
+	// failover *bsvclient.MultiRPCProvider plugs in transparently
+	// alongside a single-endpoint *bsvclient.RPCProvider.
+	Provider BSVProviderClient
 	// PeerSync, when non-nil, is called to sync the raw tx from
 	// peers over libp2p as a last-resort fallback. Typically this
 	// wraps GossipManager.RequestGenesisFromPeers.

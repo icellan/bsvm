@@ -25,7 +25,6 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
-	"github.com/icellan/bsvm/pkg/bsvclient"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/governance"
 	"github.com/icellan/bsvm/pkg/indexer"
@@ -460,7 +459,7 @@ func cmdRun(ctx *cli.Context) error {
 	// 2. Boot — select Phase 8 derivation path or legacy shard.json.
 	var (
 		boot        *bootResult
-		bsvProvider *bsvclient.RPCProvider
+		bsvProvider BSVProviderClient
 	)
 	if genesisTxID != "" {
 		// Phase 8/9: derive everything from the genesis covenant tx.
@@ -474,13 +473,18 @@ func cmdRun(ctx *cli.Context) error {
 		bootOpts := bootGenesisOpts{
 			TxFilePath: genesisTxFile,
 		}
-		// Only build an RPC provider when the node config has one.
-		// Followers run without BSV.NodeURL and don't need it.
-		if nodeCfg.BSV.NodeURL != "" {
-			provider, provErr := bsvclient.NewRPCProvider(nodeCfg.BSV.NodeURL, bsvNet)
-			if provErr != nil {
-				return fmt.Errorf("build BSV RPC provider: %w", provErr)
-			}
+		// Only build an RPC provider when the node config declares at
+		// least one BSV-node URL. Followers run without
+		// BSV.NodeURL/NodeURLs and don't need one. BuildBSVProvider
+		// returns the W6-11 failover wrapper (MultiRPCProvider) when
+		// EffectiveNodeURLs() yields ≥1 entry, so single-node
+		// deployments (legacy NodeURL) and multi-node deployments
+		// (NodeURLs[]) both flow through the same code path.
+		provider, provErr := BuildBSVProvider(nodeCfg.BSV)
+		if provErr != nil {
+			return fmt.Errorf("build BSV RPC provider: %w", provErr)
+		}
+		if provider != nil {
 			bsvProvider = provider
 			bootOpts.Provider = provider
 		}
@@ -583,9 +587,9 @@ func cmdRun(ctx *cli.Context) error {
 
 	// 5.5: Sync from BSV covenant chain if not fully synced.
 	if !boot.Synced {
-		if nodeCfg.BSV.NodeURL != "" {
+		if urls := nodeCfg.BSV.EffectiveNodeURLs(); len(urls) > 0 {
 			slog.Info("BSV sync not yet available, will sync via P2P gossip",
-				"bsv_node_url", nodeCfg.BSV.NodeURL)
+				"bsv_node_urls", urls)
 		} else {
 			slog.Info("BSV client not configured, will sync via P2P gossip")
 		}
@@ -604,7 +608,7 @@ func cmdRun(ctx *cli.Context) error {
 	if role == "follower" {
 		slog.Info("node role=follower — skipping BSV broadcast wiring; syncing via P2P only")
 	}
-	if role != "follower" && (proveMode == "execute" || proveMode == "prove") && nodeCfg.BSV.NodeURL != "" {
+	if role != "follower" && (proveMode == "execute" || proveMode == "prove") && len(nodeCfg.BSV.EffectiveNodeURLs()) > 0 {
 		if err := wireBSVBroadcast(ctx.Context, bsvWireOpts{
 			NodeCfg:     nodeCfg,
 			ShardCfg:    boot.LegacyShardConfig,
@@ -621,8 +625,13 @@ func cmdRun(ctx *cli.Context) error {
 		}
 	}
 
-	// 5.6: Bridge monitor (requires BSV client).
-	slog.Info("bridge monitor: requires BSV client (will be available with BSV SDK integration)")
+	// 5.6: BEEF-driven bridge monitor is constructed below
+	// (BuildBridgeMonitor at the WireBEEFEndpoints call site). Block-
+	// scanning mode (BSVClient.SubscribeNewBlocks etc.) is still gated
+	// on the BSV-SDK block-notification path landing.
+	// TODO(W6-x): when SubscribeNewBlocks lands, supply a real
+	// bridge.BSVClient to BuildBridgeMonitor so the monitor can scan
+	// blocks in addition to receiving BEEF envelopes.
 
 	// 5.7: Double-spend monitor (requires BSV block notifications).
 	slog.Info("double-spend monitor: initialized, waiting for BSV block notifications")
@@ -815,19 +824,38 @@ func cmdRun(ctx *cli.Context) error {
 	} else {
 		slog.Warn("no chaintracks providers configured — bridge deposits will fail-closed (no L2 credit). Configure [[bsv.chaintracks.providers]] to enable BEEF verification.")
 	}
+	// Build the bridge monitor used as the BEEF deposit-consumer
+	// sink. Returns (nil, nil, nil) when [bridge].bridge_script_hex
+	// is empty — operators on shards without a deployed L1 bridge
+	// keep running, but the BEEF consumer falls through to its fail-
+	// closed branch (envelope stored, no L2 credit).
+	bridgeMonitor, bridgeScriptHash, err := BuildBridgeMonitor(
+		nodeCfg.Bridge,
+		nodeCfg.Bridge.BridgeScriptHex,
+		chainID,
+		boot.DB,
+		overlayNode,
+	)
+	if err != nil {
+		return fmt.Errorf("build bridge monitor: %w", err)
+	}
+	if bridgeMonitor == nil {
+		slog.Warn("bridge monitor not wired — [bridge].bridge_script_hex is empty, BEEF deposits will not credit L2 (fail-closed)")
+	} else {
+		slog.Info("bridge monitor wired",
+			"script_hash_bytes", len(bridgeScriptHash),
+			"local_shard_id", uint32(chainID),
+		)
+	}
 	WireBEEFEndpoints(beefWireOpts{
-		Cfg:         nodeCfg.BEEF,
-		DB:          boot.DB,
-		ShardID:     uint64(chainID),
-		Metrics:     metrics.NewNetworkMetrics(metricsRegistry),
-		Chaintracks: chaintracksClient,
-		// BridgeMonitor + scriptHash + localShardID intentionally left
-		// nil/zero: the monitor isn't constructed in cmdRun yet (see
-		// the "bridge monitor: requires BSV client" log above), so the
-		// unverified-deposit relaxation cannot route anywhere even if
-		// an operator flipped the config flag. Once the bridge monitor
-		// is wired here, populate these fields so the relaxation has
-		// a sink.
+		Cfg:              nodeCfg.BEEF,
+		DB:               boot.DB,
+		ShardID:          uint64(chainID),
+		Metrics:          metrics.NewNetworkMetrics(metricsRegistry),
+		Chaintracks:      chaintracksClient,
+		BridgeMonitor:    bridgeMonitor,
+		BridgeScriptHash: bridgeScriptHash,
+		LocalShardID:     uint32(chainID),
 	}, rpcServer)
 
 	// 8. Start services.
