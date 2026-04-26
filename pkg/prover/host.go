@@ -82,11 +82,32 @@ type ProveInput struct {
 	BlockContext BlockContext `json:"block_context"`
 
 	// InboxRootBefore is the inbox queue hash before draining pending
-	// inbox transactions. Computed from InboxMonitor state.
+	// inbox transactions. The SP1 guest verifies this against InboxQueue
+	// (W4-3, spec 10): it recomputes the chain root over InboxQueue and
+	// asserts equality. A mismatch aborts the proof, which is the
+	// censorship-resistance gate.
 	InboxRootBefore types.Hash `json:"inbox_root_before"`
-	// InboxRootAfter is the inbox queue hash after draining pending
-	// inbox transactions. Computed from InboxMonitor state.
+	// InboxRootAfter is the inbox queue hash after draining
+	// InboxDrainCount entries off the front of InboxQueue. The guest
+	// recomputes this from the carry-forward remainder; the host
+	// supplies it for cross-check / mock-mode use only.
 	InboxRootAfter types.Hash `json:"inbox_root_after"`
+	// InboxQueue is the full ordered list of currently-queued inbox
+	// transactions, exactly as the on-chain inbox covenant has them
+	// (raw RLP, identical to what `InboxMonitor.AddInboxTransaction`
+	// recorded). The leading InboxDrainCount entries are executed at the
+	// HEAD of the batch (before user txs); the remainder is carried
+	// forward. The guest verifies the chain root over this list against
+	// InboxRootBefore.
+	InboxQueue []InboxQueuedTx `json:"inbox_queue,omitempty"`
+	// InboxDrainCount is how many leading entries to consume from
+	// InboxQueue this batch. Must be <= len(InboxQueue).
+	InboxDrainCount uint32 `json:"inbox_drain_count,omitempty"`
+	// InboxMustDrainAll is set when on-chain `advancesSinceInbox` has
+	// reached the forced-inclusion threshold (spec 10, default 10) and
+	// the covenant will REJECT any advance that doesn't fully drain the
+	// queue. The guest enforces this defensively.
+	InboxMustDrainAll bool `json:"inbox_must_drain_all,omitempty"`
 
 	// Withdrawals is the list of L2 → BSV bridge withdrawals included in
 	// this batch. The SP1 guest folds these into a binary SHA256 Merkle
@@ -294,12 +315,15 @@ func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
 	}
 
 	envelope := bridgeInput{
-		PreStateRoot:    input.PreStateRoot.Hex(),
-		Transactions:    transactionsToBridge(input.Transactions),
-		BlockContext:    blockContextToBridge(input.BlockContext),
-		InboxRootBefore: input.InboxRootBefore.Hex(),
-		InboxRootAfter:  input.InboxRootAfter.Hex(),
-		Mode:            sp1Mode,
+		PreStateRoot:      input.PreStateRoot.Hex(),
+		Transactions:      transactionsToBridge(input.Transactions),
+		BlockContext:      blockContextToBridge(input.BlockContext),
+		InboxRootBefore:   input.InboxRootBefore.Hex(),
+		InboxRootAfter:    input.InboxRootAfter.Hex(),
+		InboxQueue:        inboxQueueToBridge(input.InboxQueue),
+		InboxDrainCount:   input.InboxDrainCount,
+		InboxMustDrainAll: input.InboxMustDrainAll,
+		Mode:              sp1Mode,
 	}
 	if envelope.Mode == "" {
 		// Default mirrors the bridge's "execute" branch — safe for
@@ -339,13 +363,22 @@ func buildBridgeInput(input *ProveInput, sp1Mode string) ([]byte, error) {
 // AccountExport / StorageSlotExport / TransactionExport / BlockContext
 // types one-to-one. Keep these in lock-step with the Rust bridge.
 type bridgeInput struct {
-	PreStateRoot    string               `json:"pre_state_root"`
-	Accounts        []bridgeAccount      `json:"accounts"`
-	Transactions    []bridgeTransaction  `json:"transactions"`
-	BlockContext    bridgeBlockContext   `json:"block_context"`
-	InboxRootBefore string               `json:"inbox_root_before,omitempty"`
-	InboxRootAfter  string               `json:"inbox_root_after,omitempty"`
-	Mode            string               `json:"mode"`
+	PreStateRoot      string                  `json:"pre_state_root"`
+	Accounts          []bridgeAccount         `json:"accounts"`
+	Transactions      []bridgeTransaction     `json:"transactions"`
+	BlockContext      bridgeBlockContext      `json:"block_context"`
+	InboxRootBefore   string                  `json:"inbox_root_before,omitempty"`
+	InboxRootAfter    string                  `json:"inbox_root_after,omitempty"`
+	InboxQueue        []bridgeInboxQueuedTx   `json:"inbox_queue,omitempty"`
+	InboxDrainCount   uint32                  `json:"inbox_drain_count,omitempty"`
+	InboxMustDrainAll bool                    `json:"inbox_must_drain_all,omitempty"`
+	Mode              string                  `json:"mode"`
+}
+
+// bridgeInboxQueuedTx mirrors the Rust bridge's `InboxQueuedTxExport`
+// (prover/host-bridge/src/main.rs). Field shape MUST stay in sync.
+type bridgeInboxQueuedTx struct {
+	RawTxRLP string `json:"raw_tx_rlp"`
 }
 
 type bridgeAccount struct {
@@ -397,6 +430,23 @@ func transactionsToBridge(txs [][]byte) []bridgeTransaction {
 	for i, raw := range txs {
 		out[i] = bridgeTransaction{
 			RawBytes: "0x" + bytesToHex(raw),
+		}
+	}
+	return out
+}
+
+// inboxQueueToBridge serializes the inbox witness for the Rust bridge.
+// Each entry carries only the canonical raw EVM RLP bytes — the Rust
+// bridge populates the rest of the guest's `EvmTransaction` fields from
+// `raw_tx_rlp` via the W4-2 decoder.
+func inboxQueueToBridge(queue []InboxQueuedTx) []bridgeInboxQueuedTx {
+	if len(queue) == 0 {
+		return nil
+	}
+	out := make([]bridgeInboxQueuedTx, len(queue))
+	for i, q := range queue {
+		out[i] = bridgeInboxQueuedTx{
+			RawTxRLP: "0x" + bytesToHex(q.RawTxRLP),
 		}
 	}
 	return out

@@ -23,6 +23,7 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
+mod inbox;
 mod mpt;
 mod proof_verify;
 
@@ -177,6 +178,23 @@ pub struct StorageProofWitness {
     pub proof: Vec<Vec<u8>>,
 }
 
+/// A pending inbox transaction provided as part of the drain witness.
+///
+/// Carries both the on-chain RLP (used to recompute the inbox hash chain
+/// against `inbox_root_before`) and the pre-decoded EVM tx fields the
+/// guest needs to apply it through revm exactly like a user tx. The host
+/// is responsible for sender recovery on these — the guest treats them
+/// as standard EVM transactions inserted at the head of the batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxTx {
+    /// Pre-decoded EVM fields, ready to feed into revm.
+    pub tx: EvmTransaction,
+    /// The exact on-chain RLP bytes the inbox covenant hashed (i.e. the
+    /// `evmTxRLP` parameter passed to the inbox `Submit` method). Used by
+    /// `inbox::verify_and_split` to recompute the queue chain root.
+    pub raw_tx_rlp: Vec<u8>,
+}
+
 /// Complete batch input from the Go host to the SP1 guest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchInput {
@@ -189,12 +207,31 @@ pub struct BatchInput {
     /// The block context for execution.
     pub block_context: BlockContext,
     /// The inbox queue hash before draining pending inbox transactions.
-    /// Computed by the Go host from InboxMonitor state. The guest passes
-    /// this through as a public value; the covenant verifies it separately.
+    /// Claimed by the host; the guest verifies it by recomputing the hash
+    /// chain over `inbox_queue` (W4-3, spec 10).
     pub inbox_root_before: [u8; 32],
-    /// The inbox queue hash after draining pending inbox transactions.
-    /// Computed by the Go host from InboxMonitor state.
-    pub inbox_root_after: [u8; 32],
+    /// The full ordered list of currently-queued inbox transactions, exactly
+    /// as the on-chain inbox covenant has them. The leading
+    /// `inbox_drain_count` entries are applied as part of this batch (at the
+    /// HEAD, before user txs); the remainder is carried forward and used to
+    /// recompute `inboxRootAfter`.
+    ///
+    /// Empty vec means the on-chain inbox queue is empty: in that case
+    /// `inbox_root_before` MUST equal `hash256(zero32)` (the genesis empty-
+    /// chain marker).
+    #[serde(default)]
+    pub inbox_queue: Vec<InboxTx>,
+    /// Number of leading entries from `inbox_queue` to consume in this
+    /// batch. Must be `<= inbox_queue.len()`.
+    #[serde(default)]
+    pub inbox_drain_count: u32,
+    /// True when the on-chain `advancesSinceInbox` counter is at the
+    /// forced-inclusion threshold and the covenant will REJECT any advance
+    /// that doesn't fully drain the queue (spec 10). The guest enforces
+    /// this defensively: if set and the host left a non-empty remainder,
+    /// the proof is aborted.
+    #[serde(default)]
+    pub inbox_must_drain_all: bool,
     /// Optional Merkle witnesses that bind every account/storage value the
     /// guest loads to `pre_state_root`. When present, the guest verifies
     /// each entry against the committed root before any opcode executes —
@@ -315,7 +352,59 @@ pub fn main() {
         ..Default::default()
     };
 
-    for tx in &input.transactions {
+    // ── 4a. Verify the inbox witness and split the queue ─────────────────
+    // The host hands us the full ordered queue and a `drain_count`. We
+    // recompute the chain root from the queue and check it equals
+    // `inbox_root_before` — this catches a censoring host that withholds
+    // a queued tx (W4-3, spec 10). The leading `drain_count` entries are
+    // executed at the HEAD of the batch, before user-submitted txs (spec
+    // 11, "Inbox Scanning"). The remainder is carried forward and used to
+    // recompute `inbox_root_after`.
+    let raw_queue: Vec<Vec<u8>> = input
+        .inbox_queue
+        .iter()
+        .map(|t| t.raw_tx_rlp.clone())
+        .collect();
+    let drain_count_usize = input.inbox_drain_count as usize;
+    let inbox_plan = match inbox::verify_and_split(
+        &raw_queue,
+        &input.inbox_root_before,
+        drain_count_usize,
+        input.inbox_must_drain_all,
+    ) {
+        Ok(plan) => plan,
+        Err(inbox::InboxError::BeforeRootMismatch) => {
+            // Host claimed an inbox_root_before that doesn't match the
+            // queue it provided — this is the censorship-resistance gate
+            // tripping. Surface the mismatch as a structured error.
+            commit_error(0x10, &input.inbox_root_before, &inbox::chain_root(&raw_queue));
+            return;
+        }
+        Err(inbox::InboxError::DrainCountExceedsQueue) => {
+            commit_error(0x11, &input.inbox_root_before, &[0u8; 32]);
+            return;
+        }
+        Err(inbox::InboxError::PartialDrainWhileForced) => {
+            commit_error(0x12, &input.inbox_root_before, &[0u8; 32]);
+            return;
+        }
+    };
+    let inbox_root_after = inbox_plan.root_after;
+
+    // Execute drained inbox txs first (at the HEAD), then the user-
+    // submitted batch. Both go through the exact same EVM path — there
+    // is no inbox-specific opcode handling on the L2.
+    let drained_inbox_txs: Vec<&EvmTransaction> = input
+        .inbox_queue
+        .iter()
+        .take(drain_count_usize)
+        .map(|t| &t.tx)
+        .collect();
+    let user_txs: Vec<&EvmTransaction> = input.transactions.iter().collect();
+    let all_txs: Vec<&EvmTransaction> =
+        drained_inbox_txs.into_iter().chain(user_txs).collect();
+
+    for tx in all_txs {
         if tx.is_deposit() {
             // ── Deposit system transaction (type 0x7E) ──────────────
             // Direct state mutations, NOT an EVM call. No Solidity code
@@ -500,10 +589,13 @@ pub fn main() {
     // Build withdrawal Merkle tree (binary SHA-256).
     let withdrawal_root = build_withdrawal_merkle_root(&withdrawal_hashes);
 
-    // Inbox roots: passed through from the Go host. The covenant verifies
-    // these against the on-chain inbox covenant state independently.
+    // Inbox roots: `inbox_root_before` was independently verified above
+    // against the host-supplied queue (W4-3, spec 10). `inbox_root_after`
+    // was computed by `inbox::verify_and_split` from the carry-forward
+    // remainder. The covenant reads these out of the public-values blob
+    // at offsets 176/208 and applies the spec-10 forced-inclusion rule.
     let inbox_root_before = input.inbox_root_before;
-    let inbox_root_after = input.inbox_root_after;
+    // (`inbox_root_after` already declared above in step 4a.)
 
     // Migration script hash: reserved for future covenant migration.
     // Currently unused — set to zeros. Will be populated when the Upgrade
