@@ -788,6 +788,26 @@ func cmdRun(ctx *cli.Context) error {
 		rpcServer.SetIndexer(txIndexer)
 	}
 
+	// 7.7 Spec-17 BEEF endpoints. Mounts /bsvm/bridge/deposit,
+	// /bsvm/inbox/submission, /bsvm/governance/action, and
+	// /bsvm/beef/covenant-chain on the JSON-RPC HTTP listener.
+	// Bridge-deposit credit on L2 stays gated until W6-4 ships full
+	// BRC-62 verification — see beef_wiring.go for the policy
+	// rationale and the W6-4 TODO breadcrumbs.
+	WireBEEFEndpoints(beefWireOpts{
+		Cfg:     nodeCfg.BEEF,
+		DB:      boot.DB,
+		ShardID: uint64(chainID),
+		Metrics: metrics.NewNetworkMetrics(metricsRegistry),
+		// BridgeMonitor + scriptHash + localShardID intentionally left
+		// nil/zero: the monitor isn't constructed in cmdRun yet (see
+		// the "bridge monitor: requires BSV client" log above), so the
+		// unverified-deposit relaxation cannot route anywhere even if
+		// an operator flipped the config flag. Once the bridge monitor
+		// is wired here, populate these fields so the relaxation has
+		// a sink.
+	}, rpcServer)
+
 	// 8. Start services.
 	if err := rpcServer.Start(); err != nil {
 		return fmt.Errorf("failed to start RPC server: %w", err)

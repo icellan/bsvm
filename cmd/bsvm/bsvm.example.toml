@@ -82,3 +82,15 @@ cache_mb = 256
 mode = "none"
 keys = []
 threshold = 0
+
+[beef]
+# Spec-17 BEEF gossip + ARC callback endpoints under /bsvm/* on the
+# JSON-RPC HTTP listener. Keep enabled on any node that participates
+# in the BEEF gossip topic (effectively every shard node).
+enabled = true
+# Bridge-deposit security default. Leave false until W6-4 ships full
+# BRC-62 ancestry + script re-exec verification — the route always
+# stores the envelope, but only credits the deposit on L2 when the
+# verification gate passes. Devnet operators can flip this to true to
+# pre-flight the wiring without ancestry verification.
+accept_unverified_bridge_deposits = false
