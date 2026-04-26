@@ -791,14 +791,36 @@ func cmdRun(ctx *cli.Context) error {
 	// 7.7 Spec-17 BEEF endpoints. Mounts /bsvm/bridge/deposit,
 	// /bsvm/inbox/submission, /bsvm/governance/action, and
 	// /bsvm/beef/covenant-chain on the JSON-RPC HTTP listener.
-	// Bridge-deposit credit on L2 stays gated until W6-4 ships full
-	// BRC-62 verification — see beef_wiring.go for the policy
-	// rationale and the W6-4 TODO breadcrumbs.
+	//
+	// Chaintracks is the SPV anchor the BEEF verifier consults for
+	// BUMP-to-header binding. When [bsv.chaintracks].providers is
+	// empty we still mount the endpoints, but the bridge consumer
+	// stays in fail-closed mode — verified deposits never credit. A
+	// startup WARN (below) surfaces this so operators see why their
+	// /bsvm/bridge/deposit posts are not minting wBSV.
+	chaintracksClient, err := BuildChaintracksClient(ctx.Context, nodeCfg.BSV.Chaintracks, slog.Default())
+	if err != nil {
+		return fmt.Errorf("build chaintracks client: %w", err)
+	}
+	if chaintracksClient != nil {
+		defer func() {
+			if cerr := chaintracksClient.Close(); cerr != nil {
+				slog.Warn("closing chaintracks client", "error", cerr)
+			}
+		}()
+		slog.Info("BEEF verifier active (ancestry + script re-exec)",
+			"providers", len(nodeCfg.BSV.Chaintracks.Providers),
+			"quorum_m", nodeCfg.BSV.Chaintracks.QuorumM,
+		)
+	} else {
+		slog.Warn("no chaintracks providers configured — bridge deposits will fail-closed (no L2 credit). Configure [[bsv.chaintracks.providers]] to enable BEEF verification.")
+	}
 	WireBEEFEndpoints(beefWireOpts{
-		Cfg:     nodeCfg.BEEF,
-		DB:      boot.DB,
-		ShardID: uint64(chainID),
-		Metrics: metrics.NewNetworkMetrics(metricsRegistry),
+		Cfg:         nodeCfg.BEEF,
+		DB:          boot.DB,
+		ShardID:     uint64(chainID),
+		Metrics:     metrics.NewNetworkMetrics(metricsRegistry),
+		Chaintracks: chaintracksClient,
 		// BridgeMonitor + scriptHash + localShardID intentionally left
 		// nil/zero: the monitor isn't constructed in cmdRun yet (see
 		// the "bridge monitor: requires BSV client" log above), so the
