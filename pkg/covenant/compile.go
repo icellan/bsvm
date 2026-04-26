@@ -11,6 +11,7 @@ import (
 	"runtime"
 
 	gocompiler "github.com/icellan/runar/compilers/go/compiler"
+	runar "github.com/icellan/runar/packages/runar-go"
 )
 
 // CompiledCovenant holds the compiled covenant script and metadata.
@@ -521,6 +522,13 @@ func DetectVerificationMode(scriptHex string) (VerificationMode, error) {
 	if scriptHex == "" {
 		return 0, fmt.Errorf("empty script")
 	}
+	// Reject inputs above maxDetectScriptHexLen up front. The matcher
+	// would otherwise walk the entire blob comparing it against every
+	// candidate template, which is expensive on hostile input. See
+	// detect.go for the size-bound rationale and the spec TODO.
+	if len(scriptHex) > maxDetectScriptHexLen {
+		return 0, fmt.Errorf("detect: script hex length %d exceeds max %d", len(scriptHex), maxDetectScriptHexLen)
+	}
 
 	// Candidate modes in search order. We skip generic Groth16
 	// (Mode 2) because its template also compiles with no
@@ -543,6 +551,30 @@ func DetectVerificationMode(scriptHex string) (VerificationMode, error) {
 	}
 
 	return 0, fmt.Errorf("detect: script matches no known covenant template")
+}
+
+// compileTemplateArtifact compiles the named template source file
+// WITHOUT constructor args so the resulting artifact retains its
+// ConstructorSlots, then JSON-round-trips the gocompiler.Artifact
+// into a runar.RunarArtifact (the shape MatchesArtifact consumes —
+// both structs share JSON tags). Used by the detect.go template
+// artifact cache (cachedTemplateArtifact) to memoise per-mode
+// template compilation. Exported in-package so detect.go can call it
+// without re-importing the gocompiler.
+func compileTemplateArtifact(srcPath string) (*runar.RunarArtifact, error) {
+	compiled, err := gocompiler.CompileFromSource(srcPath, gocompiler.CompileOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("compile %s: %w", srcPath, err)
+	}
+	blob, err := json.Marshal(compiled)
+	if err != nil {
+		return nil, fmt.Errorf("marshal artifact: %w", err)
+	}
+	var out runar.RunarArtifact
+	if err := json.Unmarshal(blob, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal artifact: %w", err)
+	}
+	return &out, nil
 }
 
 // findFRIContractSource locates the Mode 1 FRI rollup source file.
