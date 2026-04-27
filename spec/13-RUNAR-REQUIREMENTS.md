@@ -3,23 +3,23 @@
 ## Context
 
 BSVM builds Bitcoin Script artifacts with the Rúnar Go compiler: three
-rollup covenant variants (Mode 1 FRI bridge, Mode 2 Groth16, Mode 3
-Groth16-WA), a bridge covenant, an inbox covenant, and — future work —
-an on-chain SP1 FRI verifier (Gate 0a Full). This document describes
-what each artifact does, what maps to existing Rúnar capabilities, and
-what new work is required.
+rollup covenant variants (Mode 1 on-chain SP1 STARK verifier, Mode 2
+Groth16, Mode 3 Groth16-WA), a bridge covenant, and an inbox covenant.
+This document describes what each artifact does, what maps to existing
+Rúnar capabilities, and what new work is required.
 
 The Go compiler already supports stateful contracts, covenant recursion
 via OP_PUSH_TX, Hash256/SHA256, secp256k1 EC math, BN254 G1/G2/pairing
 primitives (Rúnar R1/R2), WOTS+/SLH-DSA verification, KoalaBear field
-arithmetic, Ext4 arithmetic, arithmetic, comparisons, byte manipulation,
-and multi-output patterns. Most of the basic building blocks for both
-the rollup covenants and the future FRI verifier exist.
+arithmetic, Ext4 arithmetic, Poseidon2 over KoalaBear, the full SP1
+v6.0.2 FRI verifier exposed as `runar.VerifySP1FRI`, and the
+Groth16/Groth16-WA verifiers used by Modes 2 and 3.
 
-The gaps for Gate 0a Full are: full FRI-verifier composition on top of
-the KoalaBear / Ext4 / SHA-256-Merkle primitives, and the SP1 proof
-transcoding host bridge that serialises Poseidon2 Merkle paths into
-SHA-256 Merkle paths for on-chain consumption.
+Gate 0a Full landed in commit `6bf7751`. The Mode 1 covenant
+(`pkg/covenant/contracts/rollup_fri.runar.go`) verifies the SP1
+v6.0.2 STARK proof on-chain via `runar.VerifySP1FRI`. Earlier drafts
+of this spec described Mode 1 as a future "trust-minimized FRI
+bridge" with no on-chain proof check — that wording is superseded.
 
 ---
 
@@ -31,13 +31,19 @@ SHA-256 Merkle paths for on-chain consumption.
 spends the current covenant UTXO and creates a new one.
 
 The covenant ships in three variants selected at genesis (see spec 12
-"Verification modes"):
+"Verification modes"). All three verify their proof on-chain; they
+differ in proof system and trusted-setup requirements, not in whether
+the covenant trusts the prover.
 
-- **Mode 1 `VerifyFRI`** — trust-minimized FRI bridge. `advanceState`
-  takes 5 args (`newStateRoot`, `newBlockNumber`, `publicValues`,
-  `batchData`, `proofBlob`) and performs NO on-chain FRI verification.
-  Off-chain nodes verify the proof; governance freeze is the safety
-  backstop. **Not mainnet-eligible.**
+- **Mode 1 `VerifyFRI`** — on-chain SP1 v6.0.2 STARK verifier.
+  `advanceState` takes 5 args (`newStateRoot`, `newBlockNumber`,
+  `publicValues`, `batchData`, `proofBlob`) and invokes
+  `runar.VerifySP1FRI(proofBlob, publicValues, SP1VerifyingKeyHash)`,
+  which replays the full FRI argument (KoalaBear field arithmetic,
+  Poseidon2 KoalaBear Merkle openings, colinearity folds, final-poly
+  Horner check, Fiat-Shamir transcript replay) inside Bitcoin Script.
+  ~849 KB locking script for the evm-guest preset. **Mainnet-eligible**
+  under VK pinning. See `pkg/covenant/contracts/rollup_fri.runar.go:121`.
 - **Mode 2 `VerifyGroth16`** — generic BN254 multi-pairing check of the
   SP1-wrapped Groth16 proof. 16-arg `advanceState`.
 - **Mode 3 `VerifyGroth16WA`** — witness-assisted BN254 verifier, VK
@@ -64,10 +70,20 @@ reused across branches).
 4. OP_RETURN data output with `BSVM\x02` magic + `batchData` is emitted
    and bound into the tx via the Rúnar-injected continuation-hash check.
 
-Mode 2 and Mode 3 additionally verify the BN254 pairing. Mode 1 does
-not. The Gate 0a Full upgrade path replaces Mode 1's missing proof
-check with a full on-chain FRI verifier; it does not alter the shared
-invariants.
+All three modes verify the underlying proof on-chain on top of the
+shared invariants above:
+
+- Mode 1 calls `runar.VerifySP1FRI(proofBlob, publicValues,
+  SP1VerifyingKeyHash)` to replay the SP1 v6.0.2 STARK FRI argument
+  in Bitcoin Script.
+- Mode 2 / Mode 3 call the BN254 multi-pairing primitive over the
+  SP1-wrapped Groth16 proof.
+
+This is the only structural difference between the variants. Mode 1
+neither requires a trusted setup nor produces a smaller locking
+script; it produces a larger script (~849 KB) with hash-based
+soundness, while Mode 3 produces a smaller script (~688 KB) with
+pairing-based soundness under the SP1 BN254 CRS.
 
 **What already works in Rúnar**:
 - `StatefulSmartContract` with mutable `ByteString` and `Bigint` state
@@ -172,28 +188,27 @@ advances.
 
 ### 4. SP1 FRI Verifier
 
-**Status**: **Gate 0a Full — future work, not scheduled.** This section
-describes the design target for the on-chain FRI verifier. The
-compiled Mode 1 rollup covenant today (`rollup_fri.runar.go`) does NOT
-verify the FRI proof on-chain; it is the trust-minimized FRI bridge
-described in spec 12 "Verification modes". When Gate 0a Full lands,
-Mode 1 upgrades to a fully self-verifying rollup.
+**Status**: **Shipped (commit `6bf7751`).** Exposed as
+`runar.VerifySP1FRI(proofBlob, publicValues, sp1VKeyHash) bool` in
+the runar-go DSL. Emitted inline by
+`runar/compilers/go/codegen/sp1_fri.go::EmitFullSP1FriVerifierBody`
+during contract compile, so the verifier becomes part of the locking
+script (no external precompile, no host-side Merkle transcoding).
+The Mode 1 covenant `pkg/covenant/contracts/rollup_fri.runar.go`
+calls it on every advance (line 121).
 
-**Purpose**: Verify SP1 v6.0.2 STARK proofs in Bitcoin Script. This is
-the make-or-break component. If it doesn't fit within BSV constraints,
-the architecture stays on Mode 2 / Mode 3 (Groth16) for production and
-Mode 1 stays a trust-minimized bridge indefinitely.
+**Purpose**: Verify SP1 v6.0.2 STARK proofs in Bitcoin Script.
+Mainnet-eligible under VK pinning.
 
-**Boundary note**: SP1 v6 uses Poseidon2 over KoalaBear for FRI Merkle
-commitments and Fiat-Shamir challenges inside the proof. The on-chain
-verifier uses SHA-256 (`OP_HASH256` / `OP_SHA256`) for Merkle path
-hashing. The SP1 host bridge transcodes each Poseidon2 Merkle path
-into a SHA-256 Merkle path before submission, so "Poseidon2 on-chain"
-mentions below refer to transcript challenge derivation that the
-verifier may still need to simulate, not to Merkle operations.
+**Boundary note**: SP1 v6 uses Poseidon2 over KoalaBear for FRI
+Merkle commitments and Fiat-Shamir challenges inside the proof.
+**Rúnar implements Poseidon2 + KoalaBear arithmetic + Ext4 +
+colinearity directly in Bitcoin Script**, so the on-chain verifier
+replays the SP1 FRI argument natively on the wire-format proof
+bytes — there is no host-side Merkle transcoding step.
 
 **What it does**: Takes a serialized SP1 proof, public values, and a
-verifying key. Returns valid/invalid.
+verifying-key hash. Returns valid/invalid.
 
 The FRI verification algorithm:
 1. Deserialize proof (Merkle roots, query responses, coefficients)
@@ -312,14 +327,11 @@ The FRI (Fast Reed-Solomon Interactive Oracle Proof) verifier in Bitcoin Script 
 | Poseidon2 compress | ~19 | ~1,900 | ~30-50KB (subroutine) |
 | Poseidon2 Merkle path | ~19 levels | ~1,900 levels | uses compress subroutine |
 
-**Script size estimate**: The full FRI verifier size depends on the
-number of FRI layers, queries (all unrolled), and the Poseidon2
-permutation subroutine size. With 100 queries × ~19 Poseidon2
-compressions each = ~1,900 Poseidon2 calls, the Poseidon2
-permutation dominates script size. If the permutation compiles to
-~30-50KB as a subroutine, the total verifier is estimated at **1-5MB**.
-This is larger than the original SHA-256 estimate but within BSV's
-limits (4GB max script). Gate 0a Full must measure the actual size.
+**Measured locking script size**: ~849 KB for the evm-guest preset
+(commit `6bf7751`). The Poseidon2 permutation, KoalaBear / Ext4
+arithmetic, and FRI loop body are all emitted inline by
+`EmitFullSP1FriVerifierBody`. Well under the 4 GB BSV script limit
+and on par with the Groth16-WA verifier (~688 KB).
 
 **Measured regtest timing** (per-vector deploy + call, single-threaded):
 | Operation | Time per vector |
@@ -338,10 +350,11 @@ operations is sub-millisecond.
 ## New Primitives (Status)
 
 Four primitives are required for the FRI verifier and bridge covenant.
-Two are complete and validated (KoalaBear arithmetic, SHA-256 Merkle
-proofs). One (Poseidon2) is newly required based on Gate 0b findings.
-The fourth (cross-covenant output reference) is needed for the bridge
-covenant but not the FRI verifier.
+Three are complete and shipped: KoalaBear / Ext4 arithmetic, SHA-256
+Merkle proofs, and Poseidon2 over KoalaBear (the latter integrated
+into `runar.VerifySP1FRI` per commit `6bf7751`). The fourth
+(cross-covenant output reference) is needed for the bridge covenant
+but not the FRI verifier.
 
 ### A. KoalaBear Field Arithmetic — COMPLETE
 
@@ -418,12 +431,18 @@ including all Keccak-256 MPT operations. The bridge only verifies
 withdrawal inclusion in a SHA256 Merkle tree built by the SP1 guest
 and committed as a STARK public value.
 
-### D. Poseidon2 over KoalaBear — REQUIRED (Gate 0b confirmed)
+### D. Poseidon2 over KoalaBear — COMPLETE
 
 SP1 hardcodes KoalaBearPoseidon2 as its STARK configuration. All FRI
 Merkle commitments and Fiat-Shamir challenge derivation use the
 Poseidon2 permutation over KoalaBear field elements. There is no
 SHA256 alternative in SP1.
+
+**Shipped** in commit `6bf7751` as part of the
+`runar.VerifySP1FRI` codegen path
+(`runar/compilers/go/codegen/sp1_fri.go::EmitFullSP1FriVerifierBody`).
+Mode 1 of the BSVM rollup covenant invokes it inline on every
+advance.
 
 The FRI verifier needs:
 
@@ -468,9 +487,11 @@ Rúnar codegen module. At minimum:
 - 50+ compression vectors (two 8-element digests → compressed digest)
 - Verify against a reference Poseidon2 implementation
 
-**Gate 0a dependency**: The Poseidon2 codegen module MUST be complete
-and tested before the FRI verifier can be assembled. This is the
-FIRST implementation target for Gate 0a Full.
+**Gate 0a dependency**: Historically, the Poseidon2 codegen module was
+the prerequisite for the FRI verifier. Both shipped together in
+commit `6bf7751` and are now part of the
+`runar/compilers/go/codegen/sp1_fri.go` codegen path; this paragraph
+is preserved for historical context.
 
 ### C. Cross-Covenant Output Reference
 
@@ -565,30 +586,36 @@ verifier work on BSV. The remaining Gate 0a work is building the actual
 FRI verifier from these proven primitives and measuring the compiled
 script size.
 
-### Gate 0a Full: Can the FRI verifier run on BSV?
+### Gate 0a Full: SHIPPED (commit `6bf7751`)
 
-Build the SP1 FRI verifier using Rúnar. This is the Rúnar project's
-main deliverable for BSVM. The verifier is a contract method that
-takes serialized proof data as unlocking script parameters and
-verifies the FRI protocol on-chain.
+The SP1 FRI verifier was built with Rúnar and ships as the
+`runar.VerifySP1FRI` intrinsic, emitted inline by
+`runar/compilers/go/codegen/sp1_fri.go::EmitFullSP1FriVerifierBody`.
+The Mode 1 BSVM rollup covenant
+(`pkg/covenant/contracts/rollup_fri.runar.go:121`) invokes it on
+every `AdvanceState` call, replaying the SP1 v6.0.2 STARK proof
+against the pinned `SP1VerifyingKeyHash`.
 
-**Prerequisites**: The FRI verifier depends on primitives already
-confirmed working on BSV (see Gate 0a Primitive Validation above),
-plus the Poseidon2 hash function:
-- KoalaBear field arithmetic (confirmed)
-- SHA-256 Merkle proof verification (confirmed — used for BSVM-specific
-  bindings, NOT for FRI)
-- Poseidon2 permutation over KoalaBear — **REQUIRED**. SP1 hardcodes
-  KoalaBearPoseidon2 as its STARK configuration. All FRI Merkle
-  commitments and Fiat-Shamir challenge derivation use Poseidon2.
-  There is no SHA256 alternative in SP1. The Rúnar FRI verifier MUST
-  implement the full Poseidon2 permutation in Bitcoin Script using
-  KoalaBear field arithmetic (multiplications, additions, constant
-  additions — no bitwise operations). Parameters: width=16, rate=8,
-  capacity=8, sbox_degree=7, external_rounds=8, internal_rounds=13.
-  Round constants from Plonky3's p3-poseidon2 crate. Estimated script
-  size: 30-50KB for the permutation subroutine. Generate test vectors
-  from Plonky3 with SP1's exact parameters before implementing.
+**Shipped primitives**:
+- KoalaBear field arithmetic
+- KoalaBear Ext4 arithmetic
+- Poseidon2 permutation over KoalaBear (width=16, rate=8, capacity=8,
+  sbox_degree=7, external_rounds=8, internal_rounds=13; Plonky3
+  `p3-poseidon2` round constants)
+- Poseidon2 KoalaBear Merkle proof verification (used for FRI query
+  responses)
+- SHA-256 Merkle proof verification (used for BSVM-specific bindings —
+  bridge withdrawals, batch data hash, hashOutputs)
+- Full SP1 FRI verifier (FRI rounds + colinearity + final-poly
+  Horner check + Fiat-Shamir transcript replay)
+
+**Measured locking script**: ~849 KB for the evm-guest preset.
+~88 ms per advance on BSV regtest, including mining.
+
+The Gate 0a Primitive Validation table below records the per-primitive
+measurements that fed into the shipped verifier. The "Implementation
+steps" outline below is preserved for historical context — the steps
+have all been completed.
 
 **Implementation steps**:
 
@@ -679,7 +706,7 @@ The following subroutines are referenced in Specs 10, 12, and 13. They are imple
 
 | Subroutine | Signature | Description |
 |------------|-----------|-------------|
-| `m.Verify(vk, proof)` | `([]byte, []byte)` | Runs FRI verification of SP1 proof against verifying key |
+| `runar.VerifySP1FRI(proofBlob, publicValues, sp1VKeyHash)` | `(ByteString, ByteString, ByteString) bool` | Replays the SP1 v6.0.2 STARK FRI argument inline in Bitcoin Script. Absorbs `proofBlob`, `publicValues`, and the pinned `sp1VKeyHash` into a Fiat-Shamir transcript (Poseidon2 over KoalaBear), verifies all FRI Merkle authentication paths, checks colinearity / folding equations, checks the final polynomial via Horner evaluation, and returns false if any step mismatches. Compiled via `runar/compilers/go/codegen/sp1_fri.go::EmitFullSP1FriVerifierBody`. Shipped in commit `6bf7751`. Used by Mode 1 (`pkg/covenant/contracts/rollup_fri.runar.go:121`). |
 | `m.ExtractPublicValues(proof)` | `([]byte) → []byte` | Extracts the public values segment from the proof |
 | `m.ExtractBytes32(data, offset)` | `([]byte, int) → []byte` | Extracts 32 bytes at the given offset |
 | `m.ExtractUint64(data, offset)` | `([]byte, int) → uint64` | Extracts 8 bytes as big-endian uint64 |
@@ -751,8 +778,8 @@ These are NOT built-in Bitcoin opcodes — they are Rúnar DSL abstractions that
 | P2PKH construction | **Exists** — manual via `Hash160` + `Cat` |
 | KoalaBear field arithmetic | **COMPLETE** — codegen module, 1,326 test vectors |
 | SHA256 Merkle proof verification | **COMPLETE** — for bridge/BSVM bindings (NOT FRI) |
-| Poseidon2 over KoalaBear | **NEW — REQUIRED** — for FRI Merkle commitments + Fiat-Shamir |
-| Poseidon2 Merkle proof verification | **NEW — REQUIRED** — for FRI query verification |
+| Poseidon2 over KoalaBear | **COMPLETE** — shipped in commit `6bf7751` (Gate 0a Full) |
+| Poseidon2 Merkle proof verification | **COMPLETE** — shipped in commit `6bf7751` (Gate 0a Full) |
 | Cross-covenant output read | **NEW** — calling convention + pattern |
-| SP1 FRI verifier (with Poseidon2) | **NEW** — the main deliverable |
+| SP1 FRI verifier (`runar.VerifySP1FRI`) | **COMPLETE** — shipped in commit `6bf7751`; ~849 KB locking script |
 | Keccak-256 / Ethereum MPT in Script | **NOT NEEDED** — STARK proof covers it |
