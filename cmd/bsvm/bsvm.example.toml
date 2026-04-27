@@ -142,6 +142,14 @@ enabled = true
 # pre-flight the wiring without ancestry verification.
 accept_unverified_bridge_deposits = false
 
+[evm]
+# EVM hardfork rule set. Both the Go EVM (pkg/vm) and the SP1 guest's
+# revm pin Cancun in v1; this knob makes the active fork explicit in
+# operator config. Future fork bumps (e.g. Prague) require updating
+# both EVMs AND the supportedEVMForks list in cmd/bsvm/config.go before
+# this value is changed. An unsupported fork name is a startup error.
+fork = "cancun"
+
 # -----------------------------------------------------------------------------
 # Worked example: BSV-node failover (W6-11)
 # -----------------------------------------------------------------------------
