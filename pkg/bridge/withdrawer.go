@@ -80,6 +80,31 @@ type BSVBroadcaster interface {
 	Broadcast(rawTx []byte) (types.Hash, error)
 }
 
+// BridgeUTXOProvider is an optional seam the Withdrawer consults at
+// the start of every ProcessFinalizedWithdrawals pass. When set, the
+// returned snapshot replaces the Withdrawer's working bridgeUTXO so
+// the next pass sees fresh balance / outpoint data without restarting
+// the loop. Returning nil leaves the existing snapshot in place — the
+// Withdrawer continues with whatever it had after the last claim.
+type BridgeUTXOProvider interface {
+	CurrentBridgeUTXO() *BridgeUTXO
+}
+
+// BridgeUTXOSink is an optional hook the Withdrawer fires after every
+// successful claim. The argument is the post-claim bridge UTXO state
+// (new TxID, new balance, new lastClaimedNonce). Daemon wiring uses it
+// to push the mutation back to the BridgeMonitor's snapshot so other
+// readers see the latest state.
+type BridgeUTXOSink interface {
+	SetBridgeUTXO(*BridgeUTXO)
+}
+
+// BridgeUTXOSinkFunc adapts a plain function to BridgeUTXOSink.
+type BridgeUTXOSinkFunc func(*BridgeUTXO)
+
+// SetBridgeUTXO implements BridgeUTXOSink.
+func (f BridgeUTXOSinkFunc) SetBridgeUTXO(u *BridgeUTXO) { f(u) }
+
 // BSVSigner signs an input of a partial BSV transaction. The interface
 // matches pkg/covenant.PrivateKey so the production wiring can pass
 // the FeeWallet's underlying key directly without an adapter — the
@@ -117,6 +142,12 @@ type Withdrawer struct {
 	// advances use, scaled to fit a per-block claim deadline.
 	broadcastRetries  int
 	broadcastBackoffs []time.Duration
+	// utxoProvider, when set, supplies a fresh bridge UTXO snapshot at
+	// the start of every ProcessFinalizedWithdrawals pass. utxoSink, when
+	// set, receives the post-claim snapshot after every successful claim.
+	// Both are nil-safe; tests that don't need them leave them unset.
+	utxoProvider BridgeUTXOProvider
+	utxoSink     BridgeUTXOSink
 }
 
 // NewWithdrawer creates a new Withdrawer with the given dependencies.
@@ -151,6 +182,15 @@ func NewWithdrawer(
 // claim is abandoned (no partial broadcast).
 func (w *Withdrawer) WithSigner(s BSVSigner) *Withdrawer {
 	w.signer = s
+	return w
+}
+
+// WithBridgeUTXOTracker wires both ends of the live-snapshot seam at
+// once: provider is consulted at the start of every pass, sink is
+// notified after every successful claim. Either or both may be nil.
+func (w *Withdrawer) WithBridgeUTXOTracker(provider BridgeUTXOProvider, sink BridgeUTXOSink) *Withdrawer {
+	w.utxoProvider = provider
+	w.utxoSink = sink
 	return w
 }
 
@@ -197,6 +237,20 @@ func (w *Withdrawer) SetBroadcastRetryPolicy(attempts int, backoffs []time.Durat
 //     wallet key.
 //  5. Broadcasting via ARC, retrying on transient failure.
 func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
+	// Refresh the working bridge UTXO from the live tracker if one is
+	// wired. The provider returns a fresh defensive copy; we replace
+	// the Withdrawer's pointer so downstream mutations
+	// (UpdateAfterWithdrawal) stay confined to this pass and surface
+	// back to the tracker via the sink hook.
+	if w.utxoProvider != nil {
+		if fresh := w.utxoProvider.CurrentBridgeUTXO(); fresh != nil {
+			w.bridgeUTXO = fresh
+		}
+	}
+	if w.bridgeUTXO == nil {
+		return fmt.Errorf("withdrawer: no bridge UTXO snapshot available")
+	}
+
 	nextNonce := w.bridgeUTXO.LastClaimedNonce + 1
 	pendingWithdrawals, err := w.scanner.ScanPendingWithdrawals(nextNonce)
 	if err != nil {
@@ -293,6 +347,17 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 
 		// Update bridge UTXO tracking.
 		w.bridgeUTXO.UpdateAfterWithdrawal(txid, wd.AmountSatoshis, wd.Nonce)
+
+		// Push the post-claim snapshot back to the live tracker so other
+		// readers (e.g. operator UI, next loop iteration) see the latest
+		// state.
+		if w.utxoSink != nil {
+			snap := *w.bridgeUTXO
+			if w.bridgeUTXO.Script != nil {
+				snap.Script = append([]byte(nil), w.bridgeUTXO.Script...)
+			}
+			w.utxoSink.SetBridgeUTXO(&snap)
+		}
 	}
 
 	return nil

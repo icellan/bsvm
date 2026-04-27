@@ -132,16 +132,32 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 		slog.Warn("withdrawal processor disabled: bridge covenant script not configured")
 		return noop
 	}
-	// Placeholder UTXO. The real bridge-UTXO tracker (monitor-driven)
-	// is a separate piece of work; wiring the Withdrawer with this
-	// stub keeps the loop running so production deployments observe
-	// "no claimable balance" rather than "no withdrawer at all".
-	bridgeUTXO := &bridge.BridgeUTXO{
-		TxID:             types.Hash{},
-		Vout:             0,
-		Balance:          0,
-		LastClaimedNonce: 0,
-		Script:           append([]byte(nil), opts.BridgeScript...),
+	// Live bridge UTXO snapshot is owned by the BridgeMonitor (set at
+	// daemon boot from operator config + advance/deposit deltas applied
+	// in-flight). The Withdrawer mutates the snapshot after each claim
+	// (UpdateAfterWithdrawal); for now we hand it the monitor's pointer
+	// directly so post-claim mutations are observable via
+	// CurrentBridgeUTXO. When the monitor has no snapshot yet (operator
+	// hasn't seeded the L1 bridge state) we fall through to a zero-
+	// balance stub so the loop runs idle until the snapshot is set.
+	bridgeUTXO := opts.BridgeMonitor.CurrentBridgeUTXO()
+	if bridgeUTXO == nil {
+		slog.Info("withdrawal processor: no live bridge UTXO from monitor, starting with zero-balance stub",
+			"hint", "call BridgeMonitor.SetBridgeUTXO from boot wiring once L1 bridge UTXO is known")
+		bridgeUTXO = &bridge.BridgeUTXO{
+			TxID:             types.Hash{},
+			Vout:             0,
+			Balance:          0,
+			LastClaimedNonce: 0,
+			Script:           append([]byte(nil), opts.BridgeScript...),
+		}
+	} else {
+		// Ensure the script field is populated even if the monitor's
+		// snapshot was seeded without one (the operator might have only
+		// supplied (txid, vout, balance) at boot).
+		if len(bridgeUTXO.Script) == 0 {
+			bridgeUTXO.Script = append([]byte(nil), opts.BridgeScript...)
+		}
 	}
 
 	finder := bridge.NewChainDBAdvanceFinder(
@@ -156,7 +172,8 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 
 	cfg := bridge.DefaultWithdrawalConfig()
 	w := bridge.NewWithdrawer(broadcaster, bridgeUTXO, scanner, finder, cfg).
-		WithSigner(signer)
+		WithSigner(signer).
+		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor)
 
 	pollInterval := opts.PollInterval
 	if pollInterval <= 0 {

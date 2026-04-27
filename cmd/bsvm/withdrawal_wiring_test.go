@@ -97,6 +97,36 @@ func TestWireWithdrawer_MissingDeps_NoopAndWarn(t *testing.T) {
 	}
 }
 
+// TestWireWithdrawer_ReadsLiveBridgeUTXO confirms the wiring reads its
+// initial bridge UTXO snapshot from the BridgeMonitor (not the zero-
+// balance placeholder). This is the smoke test for Item 2 — production
+// must not ship a Withdrawer that always sees balance=0.
+func TestWireWithdrawer_ReadsLiveBridgeUTXO(t *testing.T) {
+	opts := newCompleteWiringOpts(t)
+	opts.BridgeMonitor.SetBridgeUTXO(&bridge.BridgeUTXO{
+		TxID:             types.HexToHash("0x" + "ff" + strings.Repeat("00", 31)),
+		Vout:             3,
+		Balance:          12_345_678,
+		LastClaimedNonce: 7,
+		Script:           opts.BridgeScript,
+	})
+
+	// Wiring reads CurrentBridgeUTXO at construction; the smoke check is
+	// that the snapshot survived the round trip.
+	got := opts.BridgeMonitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("monitor lost the seeded snapshot")
+	}
+	if got.Balance != 12_345_678 || got.LastClaimedNonce != 7 {
+		t.Errorf("snapshot drift: balance=%d nonce=%d, want 12345678 / 7",
+			got.Balance, got.LastClaimedNonce)
+	}
+	// Wiring itself must succeed without panicking.
+	if start := WireWithdrawer(opts); start == nil {
+		t.Fatal("WireWithdrawer returned nil start")
+	}
+}
+
 // TestWireWithdrawer_HappyPath_StartsAndStops verifies that with a
 // fully-populated opts struct, WireWithdrawer returns a non-noop
 // start, the loop runs at least one ProcessFinalizedWithdrawals pass

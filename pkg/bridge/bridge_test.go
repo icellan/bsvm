@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -1696,3 +1697,64 @@ func (m *mockAdvanceFinder) FindCovenantAdvanceForBlock(_ uint64) (*BSVTransacti
 
 // Ensure fmt is used (for error formatting in tests).
 var _ = fmt.Sprintf
+
+// TestBridgeMonitor_BridgeUTXOLifecycle exercises the live bridge-UTXO
+// tracker the Withdrawer reads from. Set seeds the snapshot, Apply*
+// helpers mutate it in place, and Current returns a defensive copy.
+func TestBridgeMonitor_BridgeUTXOLifecycle(t *testing.T) {
+	m, _ := newTestMonitor(t)
+
+	// Initially nil — the daemon hasn't seeded yet.
+	if got := m.CurrentBridgeUTXO(); got != nil {
+		t.Fatalf("CurrentBridgeUTXO before seed = %v, want nil", got)
+	}
+
+	// Seed.
+	want := &BridgeUTXO{
+		TxID:             types.HexToHash("0x" + "11" + strings.Repeat("00", 31)),
+		Vout:             0,
+		Balance:          1_000_000_000,
+		LastClaimedNonce: 0,
+		Script:           []byte{0x76, 0xa9},
+	}
+	m.SetBridgeUTXO(want)
+
+	got := m.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO after seed = nil")
+	}
+	if got.TxID != want.TxID || got.Balance != want.Balance {
+		t.Errorf("Current = (%s, %d), want (%s, %d)",
+			got.TxID.BSVString(), got.Balance, want.TxID.BSVString(), want.Balance)
+	}
+	// Defensive copy: mutating the result must not bleed back.
+	got.Balance = 0
+	if again := m.CurrentBridgeUTXO(); again.Balance != want.Balance {
+		t.Errorf("Current after mutating result = %d, want %d (defensive copy broken)",
+			again.Balance, want.Balance)
+	}
+
+	// ApplyBridgeAdvance rolls (txid, vout) forward.
+	newTxID := types.HexToHash("0x" + "22" + strings.Repeat("00", 31))
+	m.ApplyBridgeAdvance(newTxID, 1)
+	if got := m.CurrentBridgeUTXO(); got.TxID != newTxID || got.Vout != 1 {
+		t.Errorf("after Advance: txid=%s vout=%d, want %s 1",
+			got.TxID.BSVString(), got.Vout, newTxID.BSVString())
+	}
+	// Balance must be unchanged.
+	if got := m.CurrentBridgeUTXO(); got.Balance != want.Balance {
+		t.Errorf("Advance leaked into balance: %d, want %d", got.Balance, want.Balance)
+	}
+
+	// ApplyBridgeDeposit credits balance.
+	post := m.ApplyBridgeDeposit(500)
+	if post != want.Balance+500 {
+		t.Errorf("ApplyBridgeDeposit returned %d, want %d", post, want.Balance+500)
+	}
+
+	// Clear: passing nil drops the snapshot.
+	m.SetBridgeUTXO(nil)
+	if got := m.CurrentBridgeUTXO(); got != nil {
+		t.Errorf("CurrentBridgeUTXO after nil-set = %v, want nil", got)
+	}
+}

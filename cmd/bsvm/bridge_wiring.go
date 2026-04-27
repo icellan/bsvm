@@ -29,6 +29,7 @@ import (
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/overlay"
+	"github.com/icellan/bsvm/pkg/types"
 )
 
 // BuildBridgeMonitor constructs a bridge.BridgeMonitor wired for the
@@ -125,6 +126,15 @@ func BuildBridgeMonitor(
 		return nil, nil, fmt.Errorf("bridge: load processed deposits: %w", err)
 	}
 
+	// Seed the live bridge UTXO snapshot the Withdrawer reads. The
+	// operator supplies the current on-chain bridge UTXO via
+	// [bridge].bridge_utxo_txid_hex / vout / balance; missing or
+	// malformed values leave the snapshot nil so the withdrawal claim
+	// loop runs idle (and logs a clear hint) until configured.
+	if seedErr := seedBridgeUTXO(monitor, cfg, scriptHash); seedErr != nil {
+		return nil, nil, fmt.Errorf("bridge: seed bridge UTXO: %w", seedErr)
+	}
+
 	// The bridge.Withdrawer claim-loop is wired in main.go (see the
 	// "8.2 Bridge.Withdrawer claim loop" section + cmd/bsvm/
 	// withdrawal_wiring.go). It needs the fee-wallet signer + BSV RPC
@@ -133,4 +143,39 @@ func BuildBridgeMonitor(
 	// available alongside the BridgeMonitor.
 
 	return monitor, scriptHash, nil
+}
+
+// seedBridgeUTXO parses the [bridge].bridge_utxo_* fields and seeds the
+// monitor's live snapshot. Empty txid/balance leaves the snapshot nil
+// so the wiring layer can log a clear "no bridge UTXO yet" hint and
+// run the claim loop idle. Malformed hex / oversized vout is a hard
+// error — silently dropping it would leave the snapshot in a confusing
+// half-configured state.
+func seedBridgeUTXO(monitor *bridge.BridgeMonitor, cfg BridgeSection, scriptHash []byte) error {
+	txidHex := strings.TrimPrefix(strings.TrimSpace(cfg.BridgeUTXOTxIDHex), "0x")
+	if txidHex == "" {
+		// No seed configured; the monitor's snapshot stays nil.
+		return nil
+	}
+	if len(txidHex) != 64 {
+		return fmt.Errorf("bridge_utxo_txid_hex must be 32 bytes (64 hex chars), got %d", len(txidHex))
+	}
+	raw, err := hex.DecodeString(txidHex)
+	if err != nil {
+		return fmt.Errorf("bridge_utxo_txid_hex: %w", err)
+	}
+	monitor.SetBridgeUTXO(&bridge.BridgeUTXO{
+		TxID:             types.BytesToHash(raw),
+		Vout:             cfg.BridgeUTXOVout,
+		Balance:          cfg.BridgeUTXOBalanceSat,
+		LastClaimedNonce: cfg.BridgeUTXOLastClaimedNonce,
+		Script:           append([]byte(nil), scriptHash...),
+	})
+	slog.Info("bridge: seeded live UTXO snapshot from operator config",
+		"txid", types.BytesToHash(raw).BSVString(),
+		"vout", cfg.BridgeUTXOVout,
+		"balance_sat", cfg.BridgeUTXOBalanceSat,
+		"last_claimed_nonce", cfg.BridgeUTXOLastClaimedNonce,
+	)
+	return nil
 }
