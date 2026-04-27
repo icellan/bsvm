@@ -33,8 +33,51 @@ type NodeConfig struct {
 	Governance GovernanceSection `toml:"governance"`
 	Indexer    IndexerSection    `toml:"indexer"`
 	BEEF       BEEFSection       `toml:"beef"`
+	EVM        EVMSection        `toml:"evm"`
 	LogLevel   string            `toml:"log_level"`
 	LogFormat  string            `toml:"log_format"`
+}
+
+// EVMSection pins the EVM hardfork the node executes under. Both the
+// Go EVM (pkg/vm) and the SP1 guest's revm currently target Cancun;
+// this knob exists to make the active fork explicit in operator config
+// and to fail fast at startup if a future binary is asked to run a
+// fork it doesn't yet implement. The default is "cancun".
+//
+// Validation is enforced by ValidateFork at config-load time. Adding a
+// future fork (e.g. Prague) requires updating the supported set here
+// AND wiring the matching jump-table activation in pkg/vm.
+type EVMSection struct {
+	// Fork is the EVM hardfork rule set the node runs under. Only
+	// "cancun" is supported in v1. The Rust SP1 guest pins
+	// SpecId::CANCUN; the Go EVM defaults DefaultL2Config to
+	// CancunTime=0 (active from genesis). Mismatches between this
+	// config knob and the binary's compiled fork are a startup
+	// error.
+	Fork string `toml:"fork"`
+}
+
+// supportedEVMForks lists the EVM hardfork names the binary implements.
+// The Rust guest in prover/guest/src/main.rs pins SpecId::CANCUN; the
+// Go EVM's DefaultL2Config activates Cancun from genesis. EOF (Fusaka)
+// is explicitly excluded per spec 01.
+var supportedEVMForks = map[string]bool{
+	"cancun": true,
+}
+
+// ValidateFork confirms the configured EVM fork is one this binary
+// implements. Returns nil for empty (default) so older configs without
+// the [evm] block continue to load. Any non-empty unsupported value is
+// a hard error — better to fail at startup than to silently run on
+// the wrong rule set.
+func (e EVMSection) ValidateFork() error {
+	if e.Fork == "" {
+		return nil
+	}
+	if !supportedEVMForks[strings.ToLower(e.Fork)] {
+		return fmt.Errorf("unsupported [evm].fork %q: only \"cancun\" is supported in this binary", e.Fork)
+	}
+	return nil
 }
 
 // BEEFSection configures the spec-17 BEEF gossip + ARC callback HTTP
@@ -403,6 +446,14 @@ func DefaultNodeConfig() *NodeConfig {
 			AnchorDepth:                    6,
 			ValidatedCacheSize:             4096,
 		},
+		EVM: EVMSection{
+			// Cancun is the active fork in v1 — both the Go EVM
+			// (pkg/vm.DefaultL2Config) and the SP1 guest's revm
+			// (prover/guest/src/main.rs) execute Cancun rules.
+			// Document the active fork in operator config so future
+			// fork bumps are visible.
+			Fork: "cancun",
+		},
 		// Governance defaults to zero value (Mode "", no keys, threshold 0)
 		// which is treated as "none" -- fully trustless, no governance keys.
 	}
@@ -419,6 +470,12 @@ func LoadNodeConfig(path string) (*NodeConfig, error) {
 	cfg := DefaultNodeConfig()
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
+	}
+	// Validate the [evm].fork knob early so an unsupported value (e.g.
+	// "prague" against a Cancun-only binary) fails before any state is
+	// touched.
+	if err := cfg.EVM.ValidateFork(); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }

@@ -399,6 +399,55 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 }
 
+func TestEVMSection_DefaultsToCancun(t *testing.T) {
+	cfg := DefaultNodeConfig()
+	if cfg.EVM.Fork != "cancun" {
+		t.Errorf("EVM.Fork default = %q, want %q", cfg.EVM.Fork, "cancun")
+	}
+	if err := cfg.EVM.ValidateFork(); err != nil {
+		t.Errorf("ValidateFork on default = %v, want nil", err)
+	}
+}
+
+func TestEVMSection_ValidateFork(t *testing.T) {
+	tests := []struct {
+		fork    string
+		wantErr bool
+	}{
+		{"", false},
+		{"cancun", false},
+		{"CANCUN", false},
+		{"Cancun", false},
+		{"prague", true},
+		{"shanghai", true},
+		{"unknown", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.fork, func(t *testing.T) {
+			s := EVMSection{Fork: tt.fork}
+			err := s.ValidateFork()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateFork(%q) err = %v, wantErr %v", tt.fork, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadNodeConfig_RejectsUnsupportedFork(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "bad-fork.toml")
+	content := `
+[evm]
+fork = "prague"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadNodeConfig(cfgPath); err == nil {
+		t.Fatal("expected LoadNodeConfig to reject unsupported [evm].fork, got nil")
+	}
+}
+
 func TestBSVSection(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
