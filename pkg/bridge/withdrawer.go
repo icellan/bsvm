@@ -221,6 +221,17 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		// Locate the covenant-advance BSV tx containing this withdrawal.
 		advanceTx, err := w.advanceFinder.FindCovenantAdvanceForBlock(wd.L2BlockNum)
 		if err != nil {
+			// "Not yet anchored" is the documented retry-later signal:
+			// the L2 block exists but its covenant advance has not been
+			// broadcast / persisted to ChainDB yet. We log + stop the
+			// pass without surfacing as fatal so the loop tries again on
+			// the next tick. Any other finder error is fatal-for-this-
+			// pass (loop-level handler logs + retries).
+			if errors.Is(err, ErrAdvanceNotYetAnchored) {
+				slog.Info("withdrawal claim deferred: advance not yet anchored",
+					"nonce", wd.Nonce, "block", wd.L2BlockNum)
+				break
+			}
 			return fmt.Errorf("cannot find covenant advance for block %d: %w", wd.L2BlockNum, err)
 		}
 

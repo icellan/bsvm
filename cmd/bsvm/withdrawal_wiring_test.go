@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,20 +137,93 @@ func TestArcBroadcaster_RejectsMalformedRawTx(t *testing.T) {
 	}
 }
 
-// TestDeferredAdvanceFinder always returns the sentinel error. This
-// pins the "claims deferred" behaviour: until anchor records are
-// persisted by the daemon, every claim attempt must skip cleanly via
-// this sentinel rather than broadcast a tx the bridge covenant would
-// reject.
-func TestDeferredAdvanceFinder(t *testing.T) {
-	f := &deferredAdvanceFinder{}
-	tx, err := f.FindCovenantAdvanceForBlock(42)
+// TestChainDBAdvanceFinder_NotYetAnchored asserts the production
+// finder surfaces bridge.ErrAdvanceNotYetAnchored when the L2 block
+// has no AnchorRecord persisted yet. The Withdrawer treats that as a
+// "retry later" condition rather than a hard failure.
+func TestChainDBAdvanceFinder_NotYetAnchored(t *testing.T) {
+	database := db.NewMemoryDB()
+	defer database.Close()
+	if _, err := block.InitGenesis(database, &block.Genesis{
+		Config:   vm.DefaultL2Config(31337),
+		GasLimit: block.DefaultGasLimit,
+		Alloc:    map[types.Address]block.GenesisAccount{},
+	}); err != nil {
+		t.Fatalf("InitGenesis: %v", err)
+	}
+	chainDB := block.NewChainDB(database)
+
+	finder := bridge.NewChainDBAdvanceFinder(
+		&chainDBReaderAdapter{db: chainDB},
+		&bsvTxFetcherAdapter{provider: &stubProvider{}},
+	)
+	tx, err := finder.FindCovenantAdvanceForBlock(42)
 	if tx != nil {
 		t.Errorf("tx = %v, want nil", tx)
 	}
-	if !errors.Is(err, ErrAdvanceLookupUnimplemented) {
-		t.Errorf("err = %v, want %v", err, ErrAdvanceLookupUnimplemented)
+	if !errors.Is(err, bridge.ErrAdvanceNotYetAnchored) {
+		t.Errorf("err = %v, want ErrAdvanceNotYetAnchored", err)
 	}
+}
+
+// TestChainDBAdvanceFinder_HappyPath writes an AnchorRecord and a
+// matching BSV transaction snapshot via a fake fetcher, then confirms
+// the finder returns the expected outputs.
+func TestChainDBAdvanceFinder_HappyPath(t *testing.T) {
+	database := db.NewMemoryDB()
+	defer database.Close()
+	if _, err := block.InitGenesis(database, &block.Genesis{
+		Config:   vm.DefaultL2Config(31337),
+		GasLimit: block.DefaultGasLimit,
+		Alloc:    map[types.Address]block.GenesisAccount{},
+	}); err != nil {
+		t.Fatalf("InitGenesis: %v", err)
+	}
+	chainDB := block.NewChainDB(database)
+
+	bsvTx := types.HexToHash("0x" + "ab" + strings.Repeat("00", 31))
+	if err := chainDB.WriteAnchorRecord(&block.AnchorRecord{
+		L2BlockNum: 7,
+		BSVTxID:    bsvTx,
+		Confirmed:  true,
+	}); err != nil {
+		t.Fatalf("WriteAnchorRecord: %v", err)
+	}
+
+	wantScript := []byte{0x76, 0xa9, 0x14, 0xff}
+	fetcher := &fakeFetcher{
+		out: &bridge.BSVTransaction{
+			TxID:    bsvTx,
+			Outputs: []bridge.BSVOutput{{Script: wantScript, Value: 12345}},
+		},
+	}
+	finder := bridge.NewChainDBAdvanceFinder(
+		&chainDBReaderAdapter{db: chainDB},
+		fetcher,
+	)
+	tx, err := finder.FindCovenantAdvanceForBlock(7)
+	if err != nil {
+		t.Fatalf("FindCovenantAdvanceForBlock: %v", err)
+	}
+	if tx == nil {
+		t.Fatal("tx is nil")
+	}
+	if fetcher.lastTxID != bsvTx {
+		t.Errorf("fetcher saw txid=%s, want %s", fetcher.lastTxID.BSVString(), bsvTx.BSVString())
+	}
+	if len(tx.Outputs) != 1 || string(tx.Outputs[0].Script) != string(wantScript) {
+		t.Errorf("outputs=%v, want one with script=%x", tx.Outputs, wantScript)
+	}
+}
+
+type fakeFetcher struct {
+	out      *bridge.BSVTransaction
+	lastTxID types.Hash
+}
+
+func (f *fakeFetcher) FetchBSVTx(txid types.Hash) (*bridge.BSVTransaction, error) {
+	f.lastTxID = txid
+	return f.out, nil
 }
 
 // TestLocalSignerAdapter_NilSigner ensures the adapter rejects calls
