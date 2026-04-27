@@ -61,6 +61,7 @@ use revm::{
     state::AccountInfo,
     ExecuteEvm, MainBuilder,
 };
+use revm::database::AccountState;
 use revm_primitives::{TxKind, KECCAK_EMPTY};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -199,6 +200,55 @@ pub struct HostOutput {
     /// looked up under the supplied keys).
     #[serde(default)]
     pub debug_accounts: Vec<DebugAccount>,
+    /// Full post-execution account snapshot from revm's CacheDB,
+    /// sorted ascending by address. Drives the canonical Ethereum MPT
+    /// root comparison on the Go side: `pkg/prover.BuildPostStateRoot`
+    /// rebuilds a fresh `pkg/state.StateDB` from this list, calls
+    /// `Commit(true)`, and asserts the resulting root matches the Go
+    /// EVM's own `IntermediateRoot(true)` byte-for-byte.
+    ///
+    /// Field shape mirrors `pkg/prover.RevmPostAccount` exactly. JSON
+    /// tags are pinned: `address`, `nonce`, `balance`, `code_hash`,
+    /// `code`, `storage` (and per-slot `key`/`value`). Drift here
+    /// breaks the comparator silently — bumps require a parallel bump
+    /// in `revm_comparator.go`.
+    ///
+    /// Storage slots are sorted ascending by key (32-byte big-endian).
+    /// Accounts in `AccountState::NotExisting` are excluded; the Go
+    /// side's MPT treats absent accounts as nonexistent, so including
+    /// them here would produce a divergent root.
+    #[serde(default)]
+    pub accounts: Vec<AccountSnapshot>,
+}
+
+/// One row of `HostOutput::accounts`. Field tags match the Go side's
+/// `RevmPostAccount` (see `pkg/prover/revm_comparator.go`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSnapshot {
+    /// 0x-prefixed 20-byte hex.
+    pub address: String,
+    pub nonce: u64,
+    /// 0x-prefixed 32-byte big-endian hex.
+    pub balance: String,
+    /// 0x-prefixed 32-byte hex (`KECCAK_EMPTY` for code-less accounts).
+    pub code_hash: String,
+    /// 0x-prefixed full bytecode hex (empty string for code-less
+    /// accounts). The Go side uses this to seed `SetCode` so the
+    /// canonical MPT account encoding matches byte-for-byte.
+    #[serde(default)]
+    pub code: String,
+    /// Storage slots, sorted ascending by 32-byte big-endian key.
+    #[serde(default)]
+    pub storage: Vec<StorageSlotSnapshot>,
+}
+
+/// One storage slot in an `AccountSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSlotSnapshot {
+    /// 0x-prefixed 32-byte big-endian hex.
+    pub key: String,
+    /// 0x-prefixed 32-byte big-endian hex.
+    pub value: String,
 }
 
 /// One row of `HostOutput::debug_accounts`. All fields are 0x-prefixed
@@ -412,6 +462,8 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
         &input.digest_storage_keys,
     )?;
 
+    let accounts = build_account_snapshots(&db);
+
     Ok(HostOutput {
         post_state_digest: format!("0x{}", hex::encode(post_state_digest)),
         receipts_hash: format!("0x{}", hex::encode(receipts_hash)),
@@ -423,7 +475,84 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
         post_state_account_count: db.cache.accounts.len(),
         error: None,
         debug_accounts,
+        accounts,
     })
+}
+
+/// Build the full post-execution account snapshot for the canonical
+/// MPT-root comparison. Walks `db.cache.accounts`, skipping accounts
+/// in `AccountState::NotExisting`, and emits one `AccountSnapshot`
+/// per surviving account in address-ascending order.
+///
+/// Storage slots are sorted ascending by 32-byte big-endian key. Code
+/// is fetched from `db.cache.contracts[code_hash]` when the account
+/// info doesn't carry it inline (post-commit accounts may have only
+/// the hash). Code-less accounts emit an empty `code` field; the Go
+/// side maps that to `KECCAK_EMPTY`.
+fn build_account_snapshots(db: &CacheDB<EmptyDB>) -> Vec<AccountSnapshot> {
+    let mut sorted: BTreeMap<Address, &revm::database::DbAccount> = BTreeMap::new();
+    for (addr, acct) in db.cache.accounts.iter() {
+        if matches!(acct.account_state, AccountState::NotExisting) {
+            continue;
+        }
+        sorted.insert(*addr, acct);
+    }
+
+    let mut out = Vec::with_capacity(sorted.len());
+    for (addr, acct) in sorted.iter() {
+        let info = &acct.info;
+
+        // Resolve bytecode. Prefer the inline `info.code` (set at
+        // insert / commit time); fall back to `db.cache.contracts`
+        // keyed by code_hash; finally fall back to empty.
+        let code_bytes: Vec<u8> = match info.code.as_ref() {
+            Some(bc) if !bc.is_empty() => bc.original_bytes().to_vec(),
+            _ => {
+                if info.code_hash != KECCAK_EMPTY {
+                    db.cache
+                        .contracts
+                        .get(&info.code_hash)
+                        .map(|bc| bc.original_bytes().to_vec())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+
+        // Sort storage slots by 32-byte big-endian key.
+        let mut sorted_slots: BTreeMap<U256, U256> = BTreeMap::new();
+        for (k, v) in acct.storage.iter() {
+            // Skip slots that are zero — geth's MPT does not store
+            // zero-valued slots, and including them here would
+            // diverge from the Go side's `IntermediateRoot`.
+            if v.is_zero() {
+                continue;
+            }
+            sorted_slots.insert(*k, *v);
+        }
+        let storage: Vec<StorageSlotSnapshot> = sorted_slots
+            .iter()
+            .map(|(k, v)| StorageSlotSnapshot {
+                key: format!("0x{}", hex::encode(k.to_be_bytes::<32>())),
+                value: format!("0x{}", hex::encode(v.to_be_bytes::<32>())),
+            })
+            .collect();
+
+        out.push(AccountSnapshot {
+            address: format!("0x{}", hex::encode(addr.as_slice())),
+            nonce: info.nonce,
+            balance: format!("0x{}", hex::encode(info.balance.to_be_bytes::<32>())),
+            code_hash: format!("0x{}", hex::encode(info.code_hash.as_slice())),
+            code: if code_bytes.is_empty() {
+                String::new()
+            } else {
+                format!("0x{}", hex::encode(&code_bytes))
+            },
+            storage,
+        });
+    }
+    out
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -825,6 +954,52 @@ mod tests {
         };
         let err = run_batch(&input).unwrap_err();
         assert!(err.contains("chain_id"), "err: {err}");
+    }
+
+    #[test]
+    fn host_output_accounts_round_trips_json() {
+        // Pin the JSON wire shape the Go side reads — drift here
+        // breaks the canonical-MPT-root comparator silently.
+        let snap = AccountSnapshot {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            nonce: 7,
+            balance:
+                "0x0000000000000000000000000000000000000000000000000000000000000064".to_string(),
+            code_hash:
+                "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470".to_string(),
+            code: String::new(),
+            storage: vec![StorageSlotSnapshot {
+                key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+                value: "0x00000000000000000000000000000000000000000000000000000000000000aa"
+                    .to_string(),
+            }],
+        };
+        let out = HostOutput {
+            post_state_digest: "0x".to_string(),
+            receipts_hash: "0x".to_string(),
+            batch_data_hash: "0x".to_string(),
+            logs_bloom: "0x".to_string(),
+            gas_used: 1,
+            per_tx_gas: vec![1],
+            per_tx_success: vec![true],
+            post_state_account_count: 1,
+            error: None,
+            debug_accounts: Vec::new(),
+            accounts: vec![snap.clone()],
+        };
+        let s = serde_json::to_string(&out).expect("serialize");
+        // The new field must appear in the JSON envelope and use the
+        // exact tag the Go side expects.
+        assert!(s.contains("\"accounts\""), "missing accounts field: {}", s);
+        assert!(s.contains("\"code_hash\""));
+        assert!(s.contains("\"storage\""));
+        let back: HostOutput = serde_json::from_str(&s).expect("round-trip");
+        assert_eq!(back.accounts.len(), 1);
+        assert_eq!(back.accounts[0].address, snap.address);
+        assert_eq!(back.accounts[0].nonce, snap.nonce);
+        assert_eq!(back.accounts[0].storage.len(), 1);
+        assert_eq!(back.accounts[0].storage[0].key, snap.storage[0].key);
     }
 
     #[test]
