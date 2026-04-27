@@ -1,0 +1,44 @@
+[package]
+name = "bsvm-host-revm"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side revm comparator for the dual-EVM equivalence harness. Closes the TODO(equivalence) gap in pkg/prover/equivalence_test.go by running batches through revm directly (no SP1) and emitting a JSON envelope the Go test asserts byte-for-byte equality against."
+license = "Apache-2.0 OR MIT"
+
+[lib]
+name = "bsvm_host_revm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsvm-host-revm"
+path = "src/main.rs"
+
+[dependencies]
+# revm: the Rust EVM truth. Pinned to the same minor as the SP1 guest
+# (prover/guest/Cargo.toml) so the comparator runs the same opcode
+# semantics as the production prover. We DO NOT pull in sp1-zkvm — the
+# whole point of host-revm is to run revm directly with no proving
+# infrastructure attached.
+revm = { version = "31.0.2", default-features = false, features = ["serde"] }
+revm-primitives = { version = "21.0.2", default-features = false, features = ["serde"] }
+
+# alloy-primitives: shared address / U256 / B256 types. Matches the
+# guest version. The `k256` feature pulls in the upstream k256 crate so
+# `Signature::recover_address_from_prehash` is available — host-revm
+# never runs inside SP1, so no SP1 patch is needed.
+alloy-primitives = { version = "1.5.2", default-features = false, features = ["rlp", "serde", "k256"] }
+alloy-rlp = { version = "0.3.12", default-features = false }
+
+# Hashing primitives.
+sha2 = "0.10"
+sha3 = "0.10"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[dev-dependencies]
+# Used by tx.rs unit tests (copied verbatim from prover/guest/src/tx.rs)
+# to build signed test transactions.
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+hex-literal = "0.4"
