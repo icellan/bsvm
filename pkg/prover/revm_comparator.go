@@ -3,41 +3,47 @@ package prover
 // Dual-EVM equivalence comparator — Go side.
 //
 // This file is the Go counterpart to `prover/host-revm` (the Rust
-// post-state exporter). It does three things:
+// post-state exporter). It serves a single purpose now that the Rust
+// binary emits both the structural digest *and* a full account map:
 //
-//  1. Defines the JSON wire shape that BOTH sides agree on. The Rust
-//     side mirrors these in `prover/host-revm/src/lib.rs::ComparatorOutput`;
-//     drift between the two breaks the comparator silently, so the
-//     fields here are kept thin and version-pinned. Bumping a wire
-//     field here requires a parallel bump in lib.rs.
+//   Re-derive the canonical Ethereum MPT root from the Rust side's
+//   post-state map (`BuildPostStateRoot`). The implementation opens
+//   a fresh `pkg/state.StateDB` rooted at types.Hash{}, walks the
+//   accounts, applies nonce / balance / code / each non-zero storage
+//   slot, and calls `Commit(true)` — exactly the path `pkg/state`
+//   uses to derive its own post-execution root from genesis. If both
+//   EVMs are equivalent over the supplied account set, the two roots
+//   match byte-for-byte.
 //
-//  2. Runs the Rust comparator binary as a subprocess (`runHostRevm`)
-//     when the operator has set BSVM_HOST_REVM_BINARY. The default
-//     CI build of host-revm is schema-only (no revm) so the binary
-//     emits an empty post-state; `RevmPostState.IsEmpty()` lets the
-//     test harness skip the canonical-root comparison without flagging
-//     it as a failure.
+// Wire-format alignment:
 //
-//  3. Re-derives the canonical Ethereum MPT root from the Rust side's
-//     post-state map (`BuildPostStateRoot`). The implementation opens
-//     a fresh `pkg/state.StateDB` rooted at types.Hash{}, walks the
-//     accounts, applies nonce / balance / code / each storage slot,
-//     and calls `Commit` — exactly the path the Go EVM uses internally
-//     to derive its own post-state root. If both EVMs are equivalent,
-//     the two roots match byte-for-byte. This closes Z's open follow-
-//     up #3: structural-digest-only comparison is upgraded to canonical
-//     MPT-root comparison.
+//   `RevmPostState` and `RevmPostAccount` mirror the JSON tags emitted
+//   by `prover/host-revm/src/lib.rs::HostOutput::accounts` (the
+//   `AccountSnapshot` / `StorageSlotSnapshot` types). Drift between
+//   the two sides breaks the comparator silently — bumps require a
+//   parallel bump in lib.rs. The harness invokes the binary directly
+//   via `runHostRevm` (in equivalence_test.go) and unmarshals into
+//   `hostRevmOutput`; that struct embeds the same shape and feeds
+//   `BuildPostStateRoot` after each fixture.
+//
+// History:
+//
+//   - The original DD scaffold (round-4) defined a parallel
+//     `runHostRevmComparator` + `RevmComparatorInput` envelope on the
+//     assumption a separate "comparator" binary would emit a richer
+//     post-state. That binary never landed; instead Z's host-revm
+//     was extended in-place to emit `accounts: Vec<AccountSnapshot>`,
+//     so the parallel envelope was redundant and got removed. The
+//     harness uses `runHostRevm` (in equivalence_test.go) for the
+//     subprocess hop and `BuildPostStateRoot` here for the MPT
+//     reconstruction.
 
 import (
-	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/big"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -55,65 +61,24 @@ import (
 // keeps CI green on machines that haven't built the Rust binary.
 const RevmComparatorBinaryEnv = "BSVM_HOST_REVM_BINARY"
 
-// RevmComparatorInput is the JSON envelope passed on stdin to the
-// host-revm binary. It mirrors `ComparatorInput` in
-// `prover/host-revm/src/lib.rs` field-for-field. Bumping a field here
-// requires a matching bump in lib.rs.
-type RevmComparatorInput struct {
-	PreStateRoot string                 `json:"pre_state_root"`
-	Accounts     []RevmInputAccount     `json:"accounts"`
-	Transactions []RevmInputTransaction `json:"transactions"`
-	BlockContext RevmInputBlockContext  `json:"block_context"`
-	ChainID      uint64                 `json:"chain_id"`
-}
-
-// RevmInputAccount is the wire form of one pre-state account.
-type RevmInputAccount struct {
-	Address      string                 `json:"address"`
-	Nonce        uint64                 `json:"nonce"`
-	Balance      string                 `json:"balance"`
-	CodeHash     string                 `json:"code_hash"`
-	StorageRoot  string                 `json:"storage_root,omitempty"`
-	Code         string                 `json:"code,omitempty"`
-	StorageSlots []RevmInputStorageSlot `json:"storage_slots,omitempty"`
-	AccountProof []string               `json:"account_proof,omitempty"`
-}
-
-// RevmInputStorageSlot is the wire form of one pre-state storage slot.
-type RevmInputStorageSlot struct {
-	Key   string   `json:"key"`
-	Value string   `json:"value"`
-	Proof []string `json:"proof,omitempty"`
-}
-
-// RevmInputTransaction carries the canonical RLP-encoded transaction
-// the Rust side decodes via alloy_consensus.
-type RevmInputTransaction struct {
-	RawBytes string `json:"raw_bytes"`
-}
-
-// RevmInputBlockContext is the wire form of the block-level params.
-type RevmInputBlockContext struct {
-	Number     uint64 `json:"number"`
-	Timestamp  uint64 `json:"timestamp"`
-	Coinbase   string `json:"coinbase"`
-	GasLimit   uint64 `json:"gas_limit"`
-	BaseFee    uint64 `json:"base_fee"`
-	PrevRandao string `json:"prev_randao,omitempty"`
-}
-
-// RevmPostState is the JSON envelope the host-revm binary writes to
-// stdout. It mirrors `ComparatorOutput` in
-// `prover/host-revm/src/lib.rs` field-for-field.
+// RevmPostState is the post-execution account map exported by the
+// host-revm binary. It mirrors the `accounts` slice on
+// `prover/host-revm/src/lib.rs::HostOutput` — the structural digest
+// + receipts hash + per-tx gas live elsewhere on the same envelope and
+// are read directly by the harness.
+//
+// `BuildPostStateRoot` consumes a `RevmPostState` whose `Accounts`
+// list comes from JSON-unmarshalling the Rust binary's output. The
+// other fields on this struct are reserved for future cross-checks;
+// the canonical-root path uses `Accounts` only.
 type RevmPostState struct {
-	PreStateRoot     string            `json:"pre_state_root"`
-	Accounts         []RevmPostAccount `json:"accounts"`
-	Receipts         []RevmPostReceipt `json:"receipts"`
-	GasUsed          uint64            `json:"gas_used"`
-	StructuralDigest string            `json:"structural_digest"`
+	Accounts []RevmPostAccount `json:"accounts"`
 }
 
 // RevmPostAccount is one account in the post-state export.
+//
+// JSON tags mirror `prover/host-revm/src/lib.rs::AccountSnapshot`
+// exactly. Drift between the two breaks the comparator silently.
 type RevmPostAccount struct {
 	Address  string                `json:"address"`
 	Nonce    uint64                `json:"nonce"`
@@ -129,83 +94,31 @@ type RevmPostStorageSlot struct {
 	Value string `json:"value"`
 }
 
-// RevmPostReceipt is one tx receipt in the post-state export.
-type RevmPostReceipt struct {
-	Status  uint8  `json:"status"`
-	GasUsed uint64 `json:"gas_used"`
-}
-
-// IsEmpty reports whether the host-revm binary produced a stub envelope
-// (schema-only build) rather than a real post-state. The schema-only
-// build emits an empty `Accounts` list and zero `GasUsed` for any input;
-// the canonical-root comparison is a no-op in that case.
+// IsEmpty reports whether the post-state export has no account
+// entries. The harness uses this as a quick gate before calling
+// `BuildPostStateRoot`: an empty list means the Rust binary skipped
+// snapshot emission (e.g. an envelope-shape error path) and the MPT
+// root comparison should be deferred rather than treated as success.
 func (r *RevmPostState) IsEmpty() bool {
-	return r != nil && len(r.Accounts) == 0 && r.GasUsed == 0 && len(r.Receipts) == 0
-}
-
-// runHostRevmComparator invokes the prover/host-revm binary as a
-// subprocess, feeding it `input` on stdin and parsing the stdout JSON
-// as a RevmPostState. If the binary is unavailable or
-// BSVM_HOST_REVM_BINARY is unset, returns (nil, nil) — callers treat
-// that as "skip the canonical-root comparison" and proceed.
-//
-// NOTE (post-merge of DD round-4): the on-main host-revm binary
-// (Z's implementation) emits HostOutput, not RevmPostState. Driving
-// the canonical-MPT-root comparison via this helper requires either
-// a wire-format upgrade on the Rust side (full account map export)
-// or a parallel binary that emits RevmPostState. Until then this
-// helper sits next to BuildPostStateRoot as a typed scaffold for the
-// follow-up.
-//
-// The legacy test-side helper that drives Z's HostOutput shape lives
-// in equivalence_test.go as `runHostRevm`; this function name is
-// distinct to avoid a redeclaration collision.
-//
-// Errors returned reflect ACTUAL failures (binary returned non-zero,
-// stdout was malformed) — not the unset-env case.
-func runHostRevmComparator(ctx context.Context, binaryPath string, input *RevmComparatorInput) (*RevmPostState, error) {
-	if binaryPath == "" {
-		return nil, nil
-	}
-	if input == nil {
-		return nil, fmt.Errorf("runHostRevm: input is nil")
-	}
-	payload, err := json.Marshal(input)
-	if err != nil {
-		return nil, fmt.Errorf("marshal RevmComparatorInput: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, binaryPath)
-	cmd.Stdin = bytes.NewReader(payload)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("host-revm binary failed: %w; stderr: %s",
-			err, strings.TrimSpace(stderr.String()))
-	}
-
-	var out RevmPostState
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		return nil, fmt.Errorf("parse host-revm stdout JSON: %w; stdout: %s",
-			err, stdout.String())
-	}
-	return &out, nil
+	return r == nil || len(r.Accounts) == 0
 }
 
 // BuildPostStateRoot re-derives the canonical Ethereum MPT root from
 // the Rust comparator's post-state map. It opens a fresh StateDB
 // against an empty database, applies each account and storage slot
-// from `post`, and calls Commit — the same path `pkg/state.StateDB`
-// uses to compute its own post-execution root.
-//
-// `extra` provides a SHA256-based structural digest of the same
-// post-state for fast pre-flight comparison; account-set divergences
-// surface there before the (more expensive) trie build runs.
+// from `post`, and calls `Commit(true)` — the same path
+// `pkg/state.StateDB` uses to compute its own post-execution root.
 //
 // The returned hash is the MPT root over the supplied accounts; the
-// caller compares it byte-for-byte to the Go EVM's own postStateRoot.
-func BuildPostStateRoot(post *RevmPostState) (root types.Hash, digest types.Hash, err error) {
+// caller compares it byte-for-byte to the Go EVM's own postStateRoot
+// derived via `IntermediateRoot(true)` after `ProcessBatch`.
+//
+// `extra` lets the caller seed accounts that were present in genesis
+// but never touched by the batch (so they don't appear in revm's
+// post-state cache). Without this the MPT roots would diverge for
+// any batch that doesn't touch every genesis account: the Go EVM's
+// trie holds them, the comparator's reconstruction wouldn't.
+func BuildPostStateRoot(post *RevmPostState, extra []RevmPostAccount) (root types.Hash, digest types.Hash, err error) {
 	if post == nil {
 		return types.Hash{}, types.Hash{}, fmt.Errorf("BuildPostStateRoot: nil post-state")
 	}
@@ -216,42 +129,51 @@ func BuildPostStateRoot(post *RevmPostState) (root types.Hash, digest types.Hash
 		return types.Hash{}, types.Hash{}, fmt.Errorf("open fresh StateDB: %w", err)
 	}
 
-	for i, a := range post.Accounts {
-		addr, err := parseAddressHex(a.Address)
-		if err != nil {
-			return types.Hash{}, types.Hash{}, fmt.Errorf("account[%d] address: %w", i, err)
-		}
-		balance, err := parseUint256Hex(a.Balance)
-		if err != nil {
-			return types.Hash{}, types.Hash{}, fmt.Errorf("account[%d] balance: %w", i, err)
-		}
-		code, err := parseHexBytes(a.Code)
-		if err != nil {
-			return types.Hash{}, types.Hash{}, fmt.Errorf("account[%d] code: %w", i, err)
-		}
+	apply := func(prefix string, accounts []RevmPostAccount) error {
+		for i, a := range accounts {
+			addr, err := parseAddressHex(a.Address)
+			if err != nil {
+				return fmt.Errorf("%s[%d] address: %w", prefix, i, err)
+			}
+			balance, err := parseUint256Hex(a.Balance)
+			if err != nil {
+				return fmt.Errorf("%s[%d] balance: %w", prefix, i, err)
+			}
+			code, err := parseHexBytes(a.Code)
+			if err != nil {
+				return fmt.Errorf("%s[%d] code: %w", prefix, i, err)
+			}
 
-		// The order matters: CreateAccount first so the account exists,
-		// then balance/nonce/code, then storage. Empty accounts are
-		// handled by EIP-161 in Commit(deleteEmptyObjects=true).
-		if !sdb.Exist(addr) {
-			sdb.CreateAccount(addr)
-		}
-		sdb.SetBalance(addr, balance)
-		sdb.SetNonce(addr, a.Nonce, tracing.NonceChangeUnspecified)
-		if len(code) > 0 {
-			sdb.SetCode(addr, code, tracing.CodeChangeUnspecified)
-		}
-		for j, slot := range a.Storage {
-			key, err := parseHashHex(slot.Key)
-			if err != nil {
-				return types.Hash{}, types.Hash{}, fmt.Errorf("account[%d] storage[%d] key: %w", i, j, err)
+			// CreateAccount first so the account exists, then
+			// balance/nonce/code, then storage. Empty accounts are
+			// handled by EIP-161 in Commit(deleteEmptyObjects=true).
+			if !sdb.Exist(addr) {
+				sdb.CreateAccount(addr)
 			}
-			value, err := parseHashHex(slot.Value)
-			if err != nil {
-				return types.Hash{}, types.Hash{}, fmt.Errorf("account[%d] storage[%d] value: %w", i, j, err)
+			sdb.SetBalance(addr, balance)
+			sdb.SetNonce(addr, a.Nonce, tracing.NonceChangeUnspecified)
+			if len(code) > 0 {
+				sdb.SetCode(addr, code, tracing.CodeChangeUnspecified)
 			}
-			sdb.SetState(addr, key, value)
+			for j, slot := range a.Storage {
+				key, err := parseHashHex(slot.Key)
+				if err != nil {
+					return fmt.Errorf("%s[%d] storage[%d] key: %w", prefix, i, j, err)
+				}
+				value, err := parseHashHex(slot.Value)
+				if err != nil {
+					return fmt.Errorf("%s[%d] storage[%d] value: %w", prefix, i, j, err)
+				}
+				sdb.SetState(addr, key, value)
+			}
 		}
+		return nil
+	}
+	if err := apply("account", post.Accounts); err != nil {
+		return types.Hash{}, types.Hash{}, err
+	}
+	if err := apply("extra", extra); err != nil {
+		return types.Hash{}, types.Hash{}, err
 	}
 
 	root, err = sdb.Commit(true)
@@ -264,8 +186,9 @@ func BuildPostStateRoot(post *RevmPostState) (root types.Hash, digest types.Hash
 
 // StructuralDigest computes a SHA256 over a canonical encoding of the
 // post-state account map. It mirrors the Rust side's
-// `bsvm_host_revm::structural_digest` byte-for-byte; drift here breaks
-// the cheap pre-flight check.
+// `bsvm_host_revm::compute_post_state_digest` shape (sans the
+// digest_addresses / digest_storage_keys filtering — this helper
+// hashes the full account list verbatim).
 //
 // Encoding (per account, in input order):
 //
@@ -273,8 +196,7 @@ func BuildPostStateRoot(post *RevmPostState) (root types.Hash, digest types.Hash
 //	|| u32-BE storage-count || (key[32] || value[32])* in input order
 //
 // Callers should pass `accounts` already sorted by address ascending
-// (the host-revm binary does this). Drift in sort order surfaces as a
-// digest mismatch.
+// (the host-revm binary does this).
 func StructuralDigest(accounts []RevmPostAccount) types.Hash {
 	h := sha256.New()
 	var u64buf [8]byte
