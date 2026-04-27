@@ -64,6 +64,7 @@ fn main() -> ExitCode {
                 post_state_account_count: 0,
                 error: Some(msg),
                 debug_accounts: Vec::new(),
+                accounts: Vec::new(),
             };
             let s = serde_json::to_string(&stub).unwrap();
             let mut stdout = io::stdout().lock();
