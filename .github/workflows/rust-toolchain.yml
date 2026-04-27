@@ -1,9 +1,4 @@
-# DRAFT — pinned-nightly toolchain CI for prover/guest
-#
-# This file is intentionally suffixed `.draft` so GitHub Actions does
-# NOT pick it up. To activate:
-#   git mv .github/workflows/rust-toolchain.yml.draft \
-#          .github/workflows/rust-toolchain.yml
+# Pinned-nightly toolchain CI for prover/guest.
 #
 # See docs/decisions/U-toolchain-pin-strategy.md for the full
 # rationale. Summary: prover/guest is pinned to a specific Rust
@@ -45,6 +40,11 @@ on:
     paths:
       - "prover/guest/**"
       - ".github/workflows/rust-toolchain.yml"
+  # Weekly probe — keeps the weekly-health-check job alive (its
+  # `if: github.event_name == 'schedule'` guard depends on this).
+  # Monday 06:17 UTC, off-peak.
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch: {}
 
 concurrency:
