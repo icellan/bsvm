@@ -13,42 +13,77 @@ trusted-setup requirements.
 
 | Mode | Name | On-chain check | Trusted setup | Status |
 |------|------|----------------|---------------|--------|
-| 1 | `VerifyFRI` (trust-minimized FRI bridge) | **None.** Covenant binds state roots, batch hash, chain id via public-value slots and emits the batch OP_RETURN. The SP1 FRI proof is NOT verified on-chain. Off-chain nodes verify and trigger governance freeze on an invalid advance. | No | **Testnet / experimental.** Mainnet-blocked by `PrepareGenesis` guardrail. |
+| 1 | `VerifyFRI` (on-chain SP1 STARK verifier) | **Full SP1 v6.0.2 STARK verification on-chain via `runar.VerifySP1FRI`** — KoalaBear field arithmetic, Poseidon2 KoalaBear Merkle openings, colinearity folds, final-poly Horner check, Fiat-Shamir transcript replay against the pinned `SP1VerifyingKeyHash`. | No (hash-based STARK). | **Mainnet-eligible** under VK pinning policy. ~849 KB locking script for the evm-guest preset. |
 | 2 | `VerifyGroth16` | Full BN254 multi-pairing of an SP1-wrapped ~256-byte Groth16 proof. | Yes (BN254 CRS from SP1). | Mainnet-eligible under VK pinning policy. |
 | 3 | `VerifyGroth16WA` | Witness-assisted BN254 pairing; VK baked into the locking script at compile time, witness supplied at spend. | Yes (BN254 CRS from SP1). | Mainnet-eligible under VK pinning policy. Smallest on-chain footprint. |
 
-The canonical production target is Mode 3 (Groth16-WA): ~688 KB script,
-BN254 pairing on-chain, full SP1 proof check. Mode 2 is a reference
-generic-Groth16 verifier. Mode 1 is the FRI bridge — used today as a
-trust-minimized commitment path, reserved for upgrade to a full on-chain
-FRI verifier (Gate 0a Full).
+All three modes verify their proof on-chain. They differ in the proof
+system (STARK vs. SNARK-wrapped STARK) and the trusted-setup
+requirements, not in whether the on-chain covenant trusts the prover.
+
+The canonical production targets are: Mode 3 (Groth16-WA, ~688 KB
+script, smallest footprint, requires BN254 trusted setup) for shards
+that accept the SNARK trust assumption; Mode 1 (`VerifyFRI`,
+~849 KB script, no trusted setup) for shards that prefer hash-based
+soundness. Mode 2 is a reference generic-Groth16 verifier with the VK
+passed at spend time rather than baked in.
 
 ### Mode 1 security model
 
-Mode 1 is the **trust-minimized FRI bridge**. The covenant does NOT
-verify the SP1 FRI proof. A malicious prover can advance the state with
-an invalid proof; the only recourse is governance freeze. Concretely:
+Mode 1 is the **on-chain SP1 STARK verifier**. The compiled covenant
+invokes `runar.VerifySP1FRI(proofBlob, publicValues, SP1VerifyingKeyHash)`
+on every `AdvanceState` call. The verifier replays the full SP1 v6.0.2
+FRI argument inside Bitcoin Script:
 
-1. Every shard node re-executes the batch locally and verifies the SP1
-   proof off-chain (SP1 v6.0.2 host-side `verify()`).
-2. On detecting an invalid advance, any honest node broadcasts a freeze
-   signature to the governance key holders, who then submit
-   `FreezeSingleKey` / `FreezeMultiSig*` to halt the shard.
-3. Recovery is via governance `Upgrade*` to a patched covenant script.
+1. Absorbs the proof blob, public-values blob, and the pinned SP1
+   verifying-key hash into a Fiat-Shamir transcript (Poseidon2 over
+   KoalaBear, matching SP1's hardcoded `KoalaBearPoseidon2`
+   configuration).
+2. Verifies every FRI Merkle authentication path against the pinned
+   transcript challenges, using Poseidon2 KoalaBear Merkle openings
+   (Rúnar implements Poseidon2 + KoalaBear Ext4 directly in Bitcoin
+   Script — there is no host-side SHA-256 transcoding step).
+3. Checks colinearity / folding equations across all FRI rounds in
+   the KoalaBear extension field (degree-4 over KoalaBear).
+4. Checks the final polynomial via Horner evaluation.
+5. Fails `OP_VERIFY` on any mismatch, which means a malicious prover
+   cannot advance the covenant without a valid proof — BSV miners
+   reject the spending transaction at script-eval time.
 
-Mode 1 is NOT mainnet-eligible. `PrepareGenesis` rejects
-`Mainnet=true && Verification=VerifyFRI` with a clear error. The
-guardrail is lifted when Gate 0a Full lands with a real on-chain FRI
-verifier.
+This is a complete validity proof, identical in security guarantee to
+SP1's host-side `verify()`. A forged proof is rejected on-chain.
+There is no off-chain freeze backstop required for soundness — the
+freeze path remains as a governance safety net (configurable per
+shard at genesis), but the trustless `GovernanceNone` mode is also
+mainnet-eligible because the proof is verified on-chain.
 
-### Future: Gate 0a Full
+`PrepareGenesis` accepts `Mainnet=true && Verification=VerifyFRI` so
+long as the F06 VK trust policy is satisfied
+(`VKTrustPolicy=VKTrustPolicyMainnet`, identical to Modes 2 and 3).
+See `pkg/covenant/genesis.go` for the live guardrail set.
 
-A full on-chain FRI verifier using the Gate 0a primitives
-(KoalaBear field arithmetic, Ext4, SHA-256 Merkle paths, proof-of-work,
-colinearity checks) is tracked as Gate 0a Full in specs 09 and 13.
-When it lands, Mode 1 upgrades from a bridge to a fully self-verifying
-rollup and the mainnet guardrail is lifted. No work is scheduled
-against Gate 0a Full at the time of writing.
+**Reference**:
+- Live covenant: `pkg/covenant/contracts/rollup_fri.runar.go` — line
+  121 carries the `runar.Assert(runar.VerifySP1FRI(...))` call.
+  Mirrored on the freeze/unfreeze/upgrade governance paths that
+  re-enter `AdvanceState`.
+- Codegen: `runar/compilers/go/codegen/sp1_fri.go` —
+  `EmitFullSP1FriVerifierBody` emits the inline FRI verifier body
+  during contract compile, so the verifier is part of the locking
+  script (not an external precompile).
+- Commit `6bf7751 feat(covenant): Mode 1 verifies SP1 STARK on-chain
+  (Gate 0a Full)` — the commit that landed the on-chain verifier and
+  retired the trust-minimized-bridge model.
+
+### History: Gate 0a Full landed
+
+Earlier drafts of this spec described Mode 1 as a "trust-minimized FRI
+bridge" with no on-chain proof check, gated behind a future Gate 0a
+Full milestone. **That milestone has shipped** (commit `6bf7751`).
+Mode 1 today is a fully self-verifying rollup with on-chain SP1
+STARK verification, mainnet-eligible under VK pinning. The spec
+sections below describe the live verifier; they do not describe a
+future design target.
 
 ---
 
@@ -142,7 +177,7 @@ Key SP1 source files for documenting the layout:
 
 These parameters are extracted from SP1 v6.0.2 source and confirmed
 via Gate 0b proof inspection. They are compile-time constants in the
-future on-chain FRI verifier (Gate 0a Full).
+on-chain FRI verifier (`runar.VerifySP1FRI`, see commit `6bf7751`).
 
 ```
 Field:              KoalaBear (p = 2^31 - 2^24 + 1 = 2,130,706,433)
@@ -161,23 +196,24 @@ Proof of work bits: 16
 Security level:     ~116 bits conjectured
 ```
 
-**On-chain hashing vs proof-internal hashing**. SP1 v6 uses Poseidon2
-over KoalaBear for FRI Merkle commitments and Fiat-Shamir challenges
-inside the proof. The on-chain verifier (Gate 0a Full) operates on the
-proof at the boundary and re-hashes Merkle authentication paths using
-**SHA-256** (via BSV's native `OP_HASH256` / `OP_SHA256` opcodes). The
-SP1 host bridge transcodes each proof-internal Poseidon2 Merkle path
-into a SHA-256 Merkle path before submission — this is the same
-transcoding pattern Gate 0a validated in the primitive test vectors.
-Poseidon2 is NOT implemented in Bitcoin Script; all on-chain Merkle
-verification uses SHA-256, matching the Gate 0a measured primitives.
+**On-chain hashing**. SP1 v6 uses Poseidon2 over KoalaBear for FRI
+Merkle commitments and Fiat-Shamir challenges inside the proof.
+**Rúnar implements Poseidon2 + KoalaBear arithmetic + Ext4 +
+colinearity directly in Bitcoin Script**, so the on-chain Mode 1
+verifier (`runar.VerifySP1FRI`) replays the SP1 FRI argument
+natively — there is no host-side Merkle transcoding step. The proof
+bytes the prover submits in the unlocking script are the same proof
+bytes SP1's host-side `verify()` consumes.
 
-BSV's native `OP_HASH256` / `OP_SHA256` is used for:
+BSV's native `OP_HASH256` / `OP_SHA256` is used for BSVM-specific
+bindings, *not* for STARK verification:
 
-- STARK verifier Merkle path hashing (Gate 0a Full, when it lands).
+- BSVM data bindings: `batchDataHash`, `hashOutputs` reconstruction,
+  bridge withdrawal Merkle trees, continuation-hash check.
 - Mode 2 / Mode 3 BN254 Groth16 bindings (SP1 `committedValuesDigest`).
-- BSVM-specific bindings: `batchDataHash`, `hashOutputs`, bridge
-  withdrawal Merkle trees.
+
+Poseidon2 KoalaBear (in-script) is used for the Mode 1 SP1 STARK
+verifier itself.
 
 ---
 
@@ -932,34 +968,40 @@ The covenant extracts these values at the fixed offsets shown above. Any change 
 
 ## Component 3: STARK Verifier in BSV Covenant (Rúnar)
 
-**Hash function boundary: Poseidon2 inside the proof, SHA-256 on-chain.**
-SP1 v6 uses Poseidon2 over KoalaBear for FRI Merkle commitments and
-Fiat-Shamir challenges inside the STARK proof. On-chain, the Gate 0a
-Full FRI verifier uses BSV's native `OP_HASH256` / `OP_SHA256` for
-Merkle path hashing. The SP1 host bridge re-serialises each
-Poseidon2-Merkle authentication path into a SHA-256-Merkle path before
-submission. Poseidon2 is NOT implemented in Bitcoin Script — Gate 0a
-primitive validation confirmed the SHA-256-only path is sufficient.
+**Hash function: Poseidon2 over KoalaBear in-script.** SP1 v6 uses
+Poseidon2 over KoalaBear for FRI Merkle commitments and Fiat-Shamir
+challenges. Rúnar implements Poseidon2 + KoalaBear arithmetic + Ext4
++ colinearity directly in Bitcoin Script, so the on-chain Mode 1
+verifier (`runar.VerifySP1FRI`) replays the SP1 FRI argument natively
+on the wire-format proof bytes. There is no Merkle transcoding step.
 
-The Mode 1 covenant as deployed today performs NO on-chain STARK
-verification (trust-minimized FRI bridge, see "Verification modes"
-above). The on-chain FRI verifier design below is retained for Gate 0a
-Full and does not describe what the compiled `rollup_fri.runar.go`
-carries.
+The Mode 1 covenant `pkg/covenant/contracts/rollup_fri.runar.go`
+performs **full on-chain SP1 STARK verification** on every advance.
+Line 121 carries `runar.Assert(runar.VerifySP1FRI(proofBlob,
+publicValues, c.SP1VerifyingKeyHash))`. The verifier is emitted
+inline by the Rúnar Go compiler (see `runar/compilers/go/codegen/
+sp1_fri.go::EmitFullSP1FriVerifierBody`), producing a ~849 KB
+locking script for the evm-guest preset. Commit `6bf7751` landed
+this verifier; earlier descriptions of Mode 1 as a "trust-minimized
+FRI bridge" are superseded.
 
-The future on-chain verifier script will require:
+The on-chain verifier script requires:
 
-- SHA-256 hashing (for FRI Merkle authentication paths, via
-  `OP_HASH256` / `OP_SHA256`)
+- Poseidon2 over KoalaBear (FRI Merkle commitments, Fiat-Shamir
+  challenge derivation)
 - Field arithmetic (additions, multiplications, inversions over
-  KoalaBear)
-- Extension-field arithmetic (degree-4 over KoalaBear, x^4 - 3)
-- Polynomial evaluation checks (colinearity)
-- Proof-of-work check (SHA-256 difficulty target on a transcript
-  digest)
+  KoalaBear, `p = 2^31 - 2^24 + 1 = 2,130,706,433`)
+- Extension-field arithmetic (degree-4 over KoalaBear, `x^4 - 3`
+  irreducible)
+- Polynomial evaluation checks (colinearity, final-poly Horner check)
+- Proof-of-work check (KoalaBear/Poseidon2 transcript challenge
+  difficulty target)
+- BSV-native SHA-256 (`OP_HASH256` / `OP_SHA256`) for the BSVM data
+  bindings (`batchDataHash`, `hashOutputs`), NOT for STARK Merkle
+  paths.
 
-No elliptic curve operations are required for STARK verification —
-this is purely hash-based and arithmetic-based.
+No elliptic curve operations are required for Mode 1 — this is
+purely hash-based and arithmetic-based.
 
 ### SP1 Proof Format
 
@@ -967,11 +1009,12 @@ SP1 proofs have a well-defined structure (confirmed via Gate 0b):
 
 ```
 SP1 STARK Proof (compressed, v6.0.2):
-  - FRI commitments: Poseidon2-KoalaBear Merkle roots inside the proof,
-    transcoded to SHA-256 Merkle roots at the host bridge. Each on-chain
-    commitment is 32 bytes.
+  - FRI commitments: Poseidon2-KoalaBear Merkle roots. The on-chain
+    Mode 1 verifier consumes these natively; no transcoding step is
+    performed at the host bridge. Each commitment is 32 bytes
+    (8 KoalaBear field elements).
   - FRI query responses: 124 queries × ~19 layers × field elements with
-    transcoded SHA-256 Merkle authentication paths.
+    Poseidon2 KoalaBear Merkle authentication paths.
   - Public values: committed outputs from the guest program.
   - Auxiliary data: permutation challenges, opening values.
   - Proof-of-work witness: KoalaBear field element.
@@ -1380,12 +1423,11 @@ All operations are:
   width=16, rate=8, capacity=8, sbox degree=3, 8 external rounds,
   20 internal rounds. This is an algebraic hash — it operates
   entirely on KoalaBear field elements using multiplications and
-  additions. No bitwise operations. Poseidon2 lives inside the proof
-  only — on-chain, Merkle paths are transcoded to SHA-256 by the SP1
-  host bridge (see "On-chain hashing vs proof-internal hashing"
-  above). Gate 0a Full may still need Poseidon2 simulation for
-  Fiat-Shamir transcript challenge re-derivation, compiled via the
-  Rúnar Go compiler's KoalaBear field primitives.
+  additions. **Poseidon2 is implemented in Bitcoin Script** by the
+  Rúnar Go compiler, so the on-chain Mode 1 verifier replays the
+  SP1 FRI argument on the wire-format proof bytes (no host-side
+  transcoding). See `runar.VerifySP1FRI` in spec 13 and
+  `runar/compilers/go/codegen/sp1_fri.go`.
 - KoalaBear field arithmetic (p = 2^31 - 2^24 + 1) for FRI folding
   checks, polynomial evaluation, and DEEP-ALI composition. Uses BSV
   arithmetic opcodes (OP_ADD, OP_MUL, OP_MOD).
@@ -1892,11 +1934,13 @@ The governance configuration determines the shard's trust assumptions
 beyond the cryptographic guarantees of the STARK proof system:
 
 **GovernanceNone**: Fully trustless. The shard's security depends
-entirely on STARK soundness, compiler correctness, and the EVM
-implementations. No party can freeze, upgrade, or intervene. If the
-FRI verifier has a bug, the shard is permanently compromised. This is
-the long-term target once the codebase is battle-tested and formally
-verified. Recommended only for shards with mature, audited covenants.
+entirely on STARK / Groth16 soundness, compiler correctness, and the
+EVM implementations. No party can freeze, upgrade, or intervene. If
+the on-chain verifier has a bug, the shard is permanently compromised.
+Safe to deploy under any of the three verification modes today —
+Mode 1 / 2 / 3 all verify their proof on-chain, so there is no
+backstop the freeze path is recovering from. Recommended for shards
+with mature, audited covenants.
 
 **GovernanceSingleKey**: Maximum flexibility, maximum trust. A single
 operator can freeze the shard (pausing all state transitions), upgrade

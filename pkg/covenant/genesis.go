@@ -29,10 +29,12 @@ type GenesisConfig struct {
 	// Tests use Gate0Fixture or AllowUnpinned.
 	VKTrustPolicy VKTrustPolicy
 	// Mainnet flags the shard as mainnet-bound. When true, PrepareGenesis
-	// enforces VKTrustPolicy == VKTrustPolicyMainnet AND rejects
-	// Verification == VerifyFRI (Mode 1 has no on-chain proof check and
-	// is not mainnet-eligible until Gate 0a Full lands). Mode 2 and Mode 3
-	// WA are mainnet-eligible under the pinning policy.
+	// enforces VKTrustPolicy == VKTrustPolicyMainnet for every mode that
+	// performs on-chain proof verification — i.e. all of Mode 1
+	// (VerifyFRI, on-chain SP1 STARK via runar.VerifySP1FRI; Gate 0a Full
+	// shipped in commit 6bf7751), Mode 2 (VerifyGroth16), and Mode 3
+	// (VerifyGroth16WA). VerifyDevKey is rejected outright on mainnet
+	// because it has no on-chain proof check.
 	Mainnet      bool
 	CovenantSats uint64 // Default: DefaultCovenantSats (10000)
 }
