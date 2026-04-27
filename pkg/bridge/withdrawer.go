@@ -326,6 +326,7 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			RefOpReturn:     refOpReturn,
 			CSVDelay:        csvDelay,
 			Signer:          w.signer,
+			FeeSatPerByte:   w.config.ClaimFeeSatPerByte,
 		}
 
 		claimTx, err := BuildWithdrawalClaimTx(claim)
@@ -595,6 +596,15 @@ type WithdrawalClaim struct {
 	// script is left empty (the broadcasted tx is unsigned — only
 	// useful for tests inspecting tx structure).
 	Signer BSVSigner
+
+	// FeeSatPerByte sets the BSV miner fee rate, in satoshis per
+	// claim-tx byte. The fee is subtracted from the bridge UTXO change
+	// output (Output 0) — the user receives the full SatoshiAmount.
+	// Zero disables fee subtraction (test/hermetic builds only).
+	// Default in BuildWithdrawalClaimTx is 1 sat/byte when this field
+	// is left zero AND the build is being executed under production
+	// settings (operator-supplied via bridge config).
+	FeeSatPerByte int64
 }
 
 // WithdrawalClaimTx holds the result of building a withdrawal claim transaction.
@@ -628,9 +638,18 @@ func CSVDelayForAmount(satoshis uint64) uint32 {
 // The transaction structure:
 //
 //	Input 0: Bridge covenant UTXO (unlock script supplied by Signer)
-//	Output 0: New bridge covenant UTXO (balance reduced)
-//	Output 1: CSV-locked payment to user's BSV address
+//	Output 0: New bridge covenant UTXO (balance reduced + fee absorbed)
+//	Output 1: CSV-locked payment to user's BSV address (full amount)
 //	Output 2: OP_RETURN withdrawal receipt
+//
+// Fee policy: the BSV miner fee is computed as
+// FeeSatPerByte * len(serialized signed tx) and subtracted from
+// Output 0 (the bridge UTXO change). The user always receives the
+// full SatoshiAmount on Output 1; the bridge balance absorbs the fee.
+// Spec 07 § "Claim transaction structure" describes a separate
+// fee-funding input; the single-input simplification used here is
+// documented in S-withdrawal-and-rollback (Item 3) and tracked as a
+// follow-up. FeeSatPerByte=0 disables subtraction (test only).
 //
 // When claim.Signer is non-nil the unlock script for input 0 is built
 // by serialising the unsigned tx, asking the signer to produce the
@@ -713,6 +732,22 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 			return nil, fmt.Errorf("decode unlock script: %w", err)
 		}
 		tx.inputs[0].script = unlock
+	}
+
+	// Subtract the BSV miner fee from the bridge change output (Output
+	// 0). Fee = serialized-tx size * FeeSatPerByte. We compute against
+	// the post-signing size so the rate is honoured exactly; patching
+	// the output value doesn't change tx layout (it's a fixed-width
+	// uint64), so the size stays stable across the patch.
+	if claim.FeeSatPerByte > 0 {
+		serialized := tx.serialize()
+		fee := uint64(claim.FeeSatPerByte) * uint64(len(serialized))
+		if fee > newBalance {
+			return nil, fmt.Errorf("claim fee %d exceeds bridge change %d (rate=%d sat/byte, size=%d)",
+				fee, newBalance, claim.FeeSatPerByte, len(serialized))
+		}
+		newBalance -= fee
+		tx.outputs[0].value = newBalance
 	}
 
 	rawTx := tx.serialize()

@@ -727,3 +727,90 @@ func buildOpReturnWithRoot(root types.Hash) []byte {
 	script = append(script, payload...)
 	return script
 }
+
+// ---------------------------------------------------------------------------
+// Fee-policy tests
+// ---------------------------------------------------------------------------
+
+// TestBuildWithdrawalClaimTx_FeeSubtraction confirms the BSV miner fee
+// is taken from the bridge change output (Output 0) at the configured
+// rate, while Output 1 (user payment) keeps the full withdrawal amount.
+func TestBuildWithdrawalClaimTx_FeeSubtraction(t *testing.T) {
+	addr := make([]byte, 20)
+	addr[0] = 0xfe
+	addr[1] = 0xed
+
+	const rate = 5
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa, 0xbb}),
+		BridgeVout:    0,
+		BridgeSats:    10_000_000_000,
+		BridgeScript:  []byte{0x76, 0xa9, 0x14},
+		BSVAddress:    addr,
+		SatoshiAmount: 1_000_000_000,
+		Nonce:         1,
+		CSVDelay:      6,
+		FeeSatPerByte: rate,
+	}
+	res, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	expectedFee := uint64(rate) * uint64(len(res.RawTx))
+	expectedChange := claim.BridgeSats - claim.SatoshiAmount - expectedFee
+	if res.NewBalance != expectedChange {
+		t.Errorf("NewBalance = %d, want %d (size=%d, fee=%d)",
+			res.NewBalance, expectedChange, len(res.RawTx), expectedFee)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_ZeroFeeSkipsSubtraction confirms a zero
+// FeeSatPerByte preserves the full bridge change. This is the
+// hermetic-test path; production sets a positive rate via config.
+func TestBuildWithdrawalClaimTx_ZeroFeeSkipsSubtraction(t *testing.T) {
+	addr := make([]byte, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000_000_000,
+		BridgeScript:  []byte{0x76},
+		BSVAddress:    addr,
+		SatoshiAmount: 1_000_000,
+		FeeSatPerByte: 0,
+	}
+	res, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	if res.NewBalance != claim.BridgeSats-claim.SatoshiAmount {
+		t.Errorf("NewBalance = %d, want %d (zero fee should leave change untouched)",
+			res.NewBalance, claim.BridgeSats-claim.SatoshiAmount)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_FeeExceedsChange rejects a build whose fee
+// would underflow the bridge change. Otherwise the bridge UTXO would
+// become negative — the BSV mempool would reject the tx and the claim
+// would be permanently stuck.
+func TestBuildWithdrawalClaimTx_FeeExceedsChange(t *testing.T) {
+	addr := make([]byte, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000,
+		BridgeScript:  []byte{0x76},
+		BSVAddress:    addr,
+		SatoshiAmount: 999, // change = 1 sat, 1000 sat/byte will overflow
+		FeeSatPerByte: 1000,
+	}
+	_, err := BuildWithdrawalClaimTx(claim)
+	if err == nil {
+		t.Fatal("expected error: fee exceeds bridge change")
+	}
+}
+
+// TestDefaultWithdrawalConfigFeeRate pins the documented default rate
+// so accidental drops (set to 0) surface as test failures.
+func TestDefaultWithdrawalConfigFeeRate(t *testing.T) {
+	if got := DefaultWithdrawalConfig().ClaimFeeSatPerByte; got != 1 {
+		t.Errorf("DefaultWithdrawalConfig.ClaimFeeSatPerByte = %d, want 1", got)
+	}
+}

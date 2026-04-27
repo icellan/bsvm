@@ -78,6 +78,10 @@ type withdrawalWireOpts struct {
 	// PollInterval is how often ProcessFinalizedWithdrawals runs.
 	// Defaults to 30s when zero.
 	PollInterval time.Duration
+	// ClaimFeeSatPerByte overrides the WithdrawalConfig default
+	// (1 sat/byte). Zero leaves the default in place. Operators set
+	// this from [bridge].claim_fee_sat_per_byte.
+	ClaimFeeSatPerByte int64
 }
 
 // startWithdrawerFunc is returned by WireWithdrawer. The caller invokes
@@ -171,6 +175,9 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 	}
 
 	cfg := bridge.DefaultWithdrawalConfig()
+	if opts.ClaimFeeSatPerByte > 0 {
+		cfg.ClaimFeeSatPerByte = opts.ClaimFeeSatPerByte
+	}
 	w := bridge.NewWithdrawer(broadcaster, bridgeUTXO, scanner, finder, cfg).
 		WithSigner(signer).
 		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor)
