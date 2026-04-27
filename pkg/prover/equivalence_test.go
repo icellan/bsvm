@@ -507,6 +507,11 @@ type hostRevmOutput struct {
 	PostStateAccountCount int                 `json:"post_state_account_count"`
 	Error                 *string             `json:"error,omitempty"`
 	DebugAccounts         []hostRevmDebugAcct `json:"debug_accounts,omitempty"`
+	// Accounts is the full post-execution account snapshot — drives
+	// the canonical Ethereum MPT-root comparison via
+	// `BuildPostStateRoot`. The JSON tags on `RevmPostAccount` mirror
+	// host-revm's `AccountSnapshot` exactly.
+	Accounts []RevmPostAccount `json:"accounts,omitempty"`
 }
 
 type hostRevmDebugAcct struct {
@@ -902,6 +907,62 @@ func runRealRevmCase(t *testing.T, binary string, fx equivalenceFixture) {
 			fx.name, out.BatchDataHash, wantBatchDataHash.Hex())
 	}
 
+	// ── Cross-check: canonical Ethereum MPT post-state root ────────────
+	// The structural digest below is a fast pre-flight signal; the
+	// MPT root is the real correctness oracle (CLAUDE.md: "Both EVMs
+	// MUST pass ethereum/tests and produce identical state roots for
+	// identical inputs").
+	//
+	// `BuildPostStateRoot` opens a fresh `pkg/state.StateDB` rooted
+	// at the empty hash, applies every account from the host-revm
+	// snapshot, calls `Commit(true)`, and returns the resulting MPT
+	// root. We compare byte-for-byte against the Go EVM's own
+	// `IntermediateRoot(true)` from `ProcessBatch`.
+	if len(out.Accounts) == 0 {
+		t.Fatalf("%s: host-revm emitted zero accounts in post-state — "+
+			"comparator must populate HostOutput.accounts", fx.name)
+	}
+	revmPost := &RevmPostState{Accounts: out.Accounts}
+	// The Go-side genesis includes the bridge predeploy at
+	// `types.BridgeContractAddress` (see pkg/block/genesis.go and
+	// pkg/bridge/predeploy.go). revm never sees this account because
+	// the harness only passes the sender in `accounts`, so the
+	// comparator's MPT reconstruction must seed it explicitly via
+	// `extra`. Without this the MPT roots diverge for every fixture
+	// — Go's trie holds 4 entries (sender, coinbase, recipient,
+	// bridge predeploy), revm's reconstruction would only hold 3.
+	bridgeCode := bridgePredeployCode()
+	bridgeCodeHash := crypto.Keccak256Hash(bridgeCode)
+	bridgeExtra := []RevmPostAccount{
+		{
+			Address:  strings.ToLower(types.BridgeContractAddress.Hex()),
+			Nonce:    0,
+			Balance:  "0x" + strings.Repeat("00", 32),
+			CodeHash: "0x" + hex.EncodeToString(bridgeCodeHash[:]),
+			Code:     "0x" + hex.EncodeToString(bridgeCode),
+			// pkg/bridge.DeployBridgePredeploy SetState's three slots
+			// to zero at genesis. Geth's MPT does not store zero-
+			// valued slots, so they don't appear in the trie and we
+			// don't need to seed them here.
+		},
+	}
+	revmRoot, _, err := BuildPostStateRoot(revmPost, bridgeExtra)
+	if err != nil {
+		t.Fatalf("%s: BuildPostStateRoot: %v", fx.name, err)
+	}
+	goPostStateRoot := l2Block.StateRoot()
+	if revmRoot != goPostStateRoot {
+		var diag strings.Builder
+		fmt.Fprintf(&diag, "%s: canonical MPT root mismatch:\n  revm = %s\n  goEVM= %s\n",
+			fx.name, revmRoot.Hex(), goPostStateRoot.Hex())
+		fmt.Fprintf(&diag, "  revm post-state account dump (%d accounts):\n", len(out.Accounts))
+		for _, a := range out.Accounts {
+			fmt.Fprintf(&diag, "    %s nonce=%d balance=%s code_hash=%s storage=%d slots\n",
+				a.Address, a.Nonce, a.Balance, a.CodeHash, len(a.Storage))
+		}
+		t.Errorf("%s", diag.String())
+	}
+
 	// ── Cross-check: structural post-state digest ──────────────────────
 	gotDigest, err := decodeHexHash(out.PostStateDigest)
 	if err != nil {
@@ -935,6 +996,28 @@ func runRealRevmCase(t *testing.T, binary string, fx equivalenceFixture) {
 			}
 		}
 		t.Errorf("%s", diag.String())
+	}
+}
+
+// bridgePredeployCode returns the EVM bytecode for the L2 bridge
+// predeploy. Mirrors pkg/bridge.bridgeContractCode (unexported there);
+// duplicated here so the harness can seed the predeploy account into
+// the revm post-state reconstruction without taking a build-time
+// dependency on pkg/bridge.
+//
+// # PUSH1 0x01 PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN
+//
+// Drift between this constant and pkg/bridge will surface as a
+// canonical-MPT-root mismatch: the per-account dump emits the
+// codehashes side-by-side and the harness fails loudly.
+func bridgePredeployCode() []byte {
+	return []byte{
+		0x60, 0x01, // PUSH1 0x01
+		0x60, 0x00, // PUSH1 0x00
+		0x52,       // MSTORE
+		0x60, 0x20, // PUSH1 0x20
+		0x60, 0x00, // PUSH1 0x00
+		0xf3, // RETURN
 	}
 }
 
@@ -984,24 +1067,33 @@ func TestDualEVMEquivalence_RealRevmHarness(t *testing.T) {
 	for _, fx := range equivalenceFixtures {
 		fx := fx
 		t.Run(fx.name, func(t *testing.T) {
-			// BlobTx is intentionally skipped under the real-revm
-			// comparator: pkg/block/state_transition.go's
-			// TransactionToMessage does not yet surface
-			// BlobHashes / BlobGasFeeCap into the Go EVM, so the
-			// Go side does NOT charge blob-gas while revm does.
-			// That's a 8192-wei sender-balance divergence
-			// (BLOB_GAS_PER_BLOB * BlobFeeCap) and is a Go-side
-			// pkg/block bug, not a comparator bug. The existing
-			// TestDualEVMEquivalence_BlobTxSenderRecovery already
-			// pins the recovery + encoding contract for blob txs;
-			// once the Go path wires BlobHashes through to the EVM
-			// message, drop this skip.
+			// BlobTx is still partially blocked. Commit 1831db5
+			// surfaced BlobHashes / BlobGasFeeCap onto the EVM
+			// message, which got the BLOBHASH opcode wired up.
+			// What's still missing on the Go side is the blob-gas
+			// fee deduction itself: pkg/block does not charge
+			// BLOB_GAS_PER_BLOB * blob_gas_price from the sender
+			// balance the way revm (and geth) do. The harness
+			// surfaces this as a sender-balance divergence of
+			// exactly 0x2000 wei (8192 = BLOB_GAS_PER_BLOB *
+			// MIN_BLOB_GASPRICE for one blob with excess=0; the
+			// fixture's BlobFeeCap=1_000_000 sets the cap, not
+			// the actual charge), so the post-state digest and
+			// canonical MPT root both diverge.
+			//
+			// This is a pkg/block state-transition gap, not a
+			// comparator bug — the comparator correctly reports
+			// the divergence. Fix is non-trivial: add blob-gas
+			// fee accounting to ApplyTransaction, mirroring
+			// revm's intrinsic_blob_gas + sender debit. Leaving
+			// the skip in place until that work lands; sender
+			// recovery + envelope encoding are still pinned by
+			// TestDualEVMEquivalence_BlobTxSenderRecovery.
 			if fx.name == "BlobTx" {
-				t.Skip("BlobTx full-execution comparison blocked on Go-side " +
-					"TransactionToMessage not surfacing BlobHashes/BlobGasFeeCap " +
-					"(see pkg/block/state_transition.go); " +
-					"sender recovery + envelope encoding are pinned by " +
-					"TestDualEVMEquivalence_BlobTxSenderRecovery")
+				t.Skip("BlobTx full-execution comparison blocked on " +
+					"pkg/block not charging blob-gas (sender balance " +
+					"diverges by BLOB_GAS_PER_BLOB * MIN_BLOB_GASPRICE; " +
+					"see file-level comment)")
 			}
 			runRealRevmCase(t, binary, fx)
 		})
