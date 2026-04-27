@@ -608,8 +608,14 @@ func cmdRun(ctx *cli.Context) error {
 	if role == "follower" {
 		slog.Info("node role=follower — skipping BSV broadcast wiring; syncing via P2P only")
 	}
+	// broadcastWiring captures the fee-signer + provider once
+	// wireBSVBroadcast has run so the bridge.Withdrawer wiring below
+	// can reuse them without re-deriving the fee-wallet key. Stays
+	// nil on follower / mock-mode paths; WireWithdrawer logs a clear
+	// WARN and skips when nil.
+	var broadcastWiring *bsvBroadcastResult
 	if role != "follower" && (proveMode == "execute" || proveMode == "prove") && len(nodeCfg.BSV.EffectiveNodeURLs()) > 0 {
-		if err := wireBSVBroadcast(ctx.Context, bsvWireOpts{
+		res, err := wireBSVBroadcast(ctx.Context, bsvWireOpts{
 			NodeCfg:     nodeCfg,
 			ShardCfg:    boot.LegacyShardConfig,
 			DerivedBoot: boot,
@@ -620,9 +626,11 @@ func cmdRun(ctx *cli.Context) error {
 			OverlayNode: overlayNode,
 			CovenantMgr: covenantMgr,
 			Provider:    bsvProvider,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("BSV broadcast wiring failed: %w", err)
 		}
+		broadcastWiring = res
 	}
 
 	// 5.6: BEEF-driven bridge monitor is constructed below
@@ -900,6 +908,28 @@ func cmdRun(ctx *cli.Context) error {
 			}
 		}()
 	}
+
+	// 8.2 Bridge.Withdrawer claim loop. Walks the L2 chain for
+	// finalized WithdrawalInitiated events, builds Merkle proofs
+	// against the SP1-committed withdrawalRoot, signs with the fee-
+	// wallet key, and broadcasts BSV claim transactions. Skips with a
+	// clear WARN when any required dependency is missing (no bridge
+	// deployed for this shard / follower role / mock-mode boot) so
+	// the daemon stays bootable in all configurations. See
+	// cmd/bsvm/withdrawal_wiring.go for the dependency matrix.
+	wireOpts := withdrawalWireOpts{
+		OverlayNode:   overlayNode,
+		ChainDB:       boot.ChainDB,
+		BridgeMonitor: bridgeMonitor,
+		BridgeScript:  bridgeScriptHash,
+	}
+	if broadcastWiring != nil {
+		wireOpts.Provider = broadcastWiring.Provider
+		wireOpts.FeeAddress = broadcastWiring.FeeAddress
+		wireOpts.FeeSigner = broadcastWiring.FeeSigner
+	}
+	startWithdrawer := WireWithdrawer(wireOpts)
+	startWithdrawer(bgCtx)
 
 	if txIndexer != nil {
 		// The overlay's event feed is strongly typed over overlay.NewHeadEvent,
