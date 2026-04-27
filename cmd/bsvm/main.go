@@ -918,10 +918,11 @@ func cmdRun(ctx *cli.Context) error {
 	// the daemon stays bootable in all configurations. See
 	// cmd/bsvm/withdrawal_wiring.go for the dependency matrix.
 	wireOpts := withdrawalWireOpts{
-		OverlayNode:   overlayNode,
-		ChainDB:       boot.ChainDB,
-		BridgeMonitor: bridgeMonitor,
-		BridgeScript:  bridgeScriptHash,
+		OverlayNode:        overlayNode,
+		ChainDB:            boot.ChainDB,
+		BridgeMonitor:      bridgeMonitor,
+		BridgeScript:       bridgeScriptHash,
+		ClaimFeeSatPerByte: nodeCfg.Bridge.ClaimFeeSatPerByte,
 	}
 	if broadcastWiring != nil {
 		wireOpts.Provider = broadcastWiring.Provider

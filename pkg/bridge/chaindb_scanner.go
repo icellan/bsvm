@@ -3,12 +3,95 @@ package bridge
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// ErrAdvanceNotYetAnchored signals that the L2 block whose advance is
+// being requested has not yet been broadcast / persisted to ChainDB.
+// The Withdrawer treats this as a "retry later" condition and queues
+// the claim for the next pass instead of dropping it.
+var ErrAdvanceNotYetAnchored = errors.New("bridge: covenant advance for L2 block not yet anchored")
+
+// AnchorReader reads AnchorRecord-style entries from the chain database.
+// Implementations are typically a thin adapter over *block.ChainDB.
+// Defined in pkg/bridge so the package's CovenantAdvanceFinder seam can
+// be wired to ChainDB without taking a dependency on pkg/block (which
+// already imports pkg/bridge).
+type AnchorReader interface {
+	// ReadAnchor returns the BSV txid that anchored L2 block blockNum on
+	// chain, plus a confirmed flag. Returns hasRecord=false when no
+	// AnchorRecord has been persisted yet for that block — the finder
+	// translates that into ErrAdvanceNotYetAnchored so the Withdrawer
+	// retries on the next pass instead of giving up.
+	ReadAnchor(blockNum uint64) (txid types.Hash, confirmed bool, hasRecord bool)
+}
+
+// BSVTxFetcher fetches a BSV transaction by txid and projects it onto
+// the minimal *BSVTransaction shape the bridge package consumes
+// (extractRefsFromAdvanceTx walks Outputs only). Implementations live
+// in cmd/bsvm where the BSV-node provider is in scope.
+type BSVTxFetcher interface {
+	// FetchBSVTx returns a BSVTransaction with at least its Outputs
+	// populated. The bridge package uses only Outputs; TxID + BlockHeight
+	// are nice-to-haves but not required by the claim-tx builder.
+	FetchBSVTx(txid types.Hash) (*BSVTransaction, error)
+}
+
+// ChainDBAdvanceFinder is the production CovenantAdvanceFinder. It
+// looks up the L2 block's anchor record in ChainDB, fetches the BSV
+// advance transaction via the configured BSVTxFetcher, and returns the
+// projected *BSVTransaction the Withdrawer's claim builder expects.
+//
+// Returned errors:
+//
+//   - ErrAdvanceNotYetAnchored when the block's advance has not yet been
+//     written to ChainDB (still in flight or never broadcast). The
+//     Withdrawer queues the claim for retry.
+//   - Any underlying fetcher error is wrapped with context.
+type ChainDBAdvanceFinder struct {
+	anchors AnchorReader
+	fetcher BSVTxFetcher
+}
+
+// NewChainDBAdvanceFinder constructs the production finder. Both
+// arguments must be non-nil.
+func NewChainDBAdvanceFinder(anchors AnchorReader, fetcher BSVTxFetcher) *ChainDBAdvanceFinder {
+	return &ChainDBAdvanceFinder{anchors: anchors, fetcher: fetcher}
+}
+
+// FindCovenantAdvanceForBlock implements CovenantAdvanceFinder. Returns
+// ErrAdvanceNotYetAnchored when the block has no AnchorRecord yet, so
+// the Withdrawer can distinguish "retry later" from a permanent error.
+func (f *ChainDBAdvanceFinder) FindCovenantAdvanceForBlock(l2BlockNum uint64) (*BSVTransaction, error) {
+	if f == nil || f.anchors == nil || f.fetcher == nil {
+		return nil, errors.New("bridge: finder not fully configured")
+	}
+	txid, confirmed, ok := f.anchors.ReadAnchor(l2BlockNum)
+	if !ok {
+		return nil, fmt.Errorf("%w: l2_block=%d", ErrAdvanceNotYetAnchored, l2BlockNum)
+	}
+	tx, err := f.fetcher.FetchBSVTx(txid)
+	if err != nil {
+		return nil, fmt.Errorf("fetch advance tx %s: %w", txid.BSVString(), err)
+	}
+	if tx == nil {
+		return nil, fmt.Errorf("advance tx %s not found", txid.BSVString())
+	}
+	if !confirmed {
+		// Not fatal — the bridge covenant verifies inclusion on chain
+		// regardless. We log so operators can correlate "claim built
+		// against unconfirmed anchor" with downstream broadcaster
+		// errors if the BSV mempool rejects it.
+		slog.Debug("withdrawal finder: anchor not yet marked confirmed",
+			"block", l2BlockNum, "bsvTx", txid.BSVString())
+	}
+	return tx, nil
+}
 
 // withdrawalInitiatedTopic mirrors the topic-0 hash emitted by
 // pkg/block.ApplyWithdrawTx for the canonical

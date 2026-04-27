@@ -600,6 +600,25 @@ func (n *OverlayNode) processBatchInternal(
 				if w := n.confirmationWatcher; w != nil {
 					w.Track(l2Block.NumberU64(), result.TxID)
 				}
+				// Persist the L2-block -> BSV-advance-tx mapping so the
+				// bridge.Withdrawer can find the cross-covenant references
+				// (refOutputScript / refOpReturn / withdrawalRoot) when it
+				// builds a withdrawal claim. BSVBlockHeight is left at 0
+				// here because the broadcast hasn't been mined yet; the
+				// confirmation watcher (and operator-driven backfills) can
+				// upgrade Confirmed=true + the height once it has been.
+				anchor := &block.AnchorRecord{
+					L2BlockNum: l2Block.NumberU64(),
+					BSVTxID:    result.TxID,
+					Confirmed:  false,
+				}
+				if anchorErr := n.chainDB.WriteAnchorRecord(anchor); anchorErr != nil {
+					slog.Warn("anchor record persist failed",
+						"block", l2Block.NumberU64(),
+						"bsvTx", result.TxID.BSVString(),
+						"error", anchorErr,
+					)
+				}
 			}
 		}
 	}

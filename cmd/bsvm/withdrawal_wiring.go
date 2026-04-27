@@ -28,6 +28,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -77,6 +78,10 @@ type withdrawalWireOpts struct {
 	// PollInterval is how often ProcessFinalizedWithdrawals runs.
 	// Defaults to 30s when zero.
 	PollInterval time.Duration
+	// ClaimFeeSatPerByte overrides the WithdrawalConfig default
+	// (1 sat/byte). Zero leaves the default in place. Operators set
+	// this from [bridge].claim_fee_sat_per_byte.
+	ClaimFeeSatPerByte int64
 }
 
 // startWithdrawerFunc is returned by WireWithdrawer. The caller invokes
@@ -124,28 +129,45 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 		return noop
 	}
 
-	scanner := bridge.NewChainDBWithdrawalScanner(
-		&chainDBReaderAdapter{db: opts.ChainDB},
-		opts.OverlayNode,
-	)
+	chainAdapter := &chainDBReaderAdapter{db: opts.ChainDB}
+	scanner := bridge.NewChainDBWithdrawalScanner(chainAdapter, opts.OverlayNode)
 
 	if len(opts.BridgeScript) == 0 {
 		slog.Warn("withdrawal processor disabled: bridge covenant script not configured")
 		return noop
 	}
-	// Placeholder UTXO. The real bridge-UTXO tracker (monitor-driven)
-	// is a separate piece of work; wiring the Withdrawer with this
-	// stub keeps the loop running so production deployments observe
-	// "no claimable balance" rather than "no withdrawer at all".
-	bridgeUTXO := &bridge.BridgeUTXO{
-		TxID:             types.Hash{},
-		Vout:             0,
-		Balance:          0,
-		LastClaimedNonce: 0,
-		Script:           append([]byte(nil), opts.BridgeScript...),
+	// Live bridge UTXO snapshot is owned by the BridgeMonitor (set at
+	// daemon boot from operator config + advance/deposit deltas applied
+	// in-flight). The Withdrawer mutates the snapshot after each claim
+	// (UpdateAfterWithdrawal); for now we hand it the monitor's pointer
+	// directly so post-claim mutations are observable via
+	// CurrentBridgeUTXO. When the monitor has no snapshot yet (operator
+	// hasn't seeded the L1 bridge state) we fall through to a zero-
+	// balance stub so the loop runs idle until the snapshot is set.
+	bridgeUTXO := opts.BridgeMonitor.CurrentBridgeUTXO()
+	if bridgeUTXO == nil {
+		slog.Info("withdrawal processor: no live bridge UTXO from monitor, starting with zero-balance stub",
+			"hint", "call BridgeMonitor.SetBridgeUTXO from boot wiring once L1 bridge UTXO is known")
+		bridgeUTXO = &bridge.BridgeUTXO{
+			TxID:             types.Hash{},
+			Vout:             0,
+			Balance:          0,
+			LastClaimedNonce: 0,
+			Script:           append([]byte(nil), opts.BridgeScript...),
+		}
+	} else {
+		// Ensure the script field is populated even if the monitor's
+		// snapshot was seeded without one (the operator might have only
+		// supplied (txid, vout, balance) at boot).
+		if len(bridgeUTXO.Script) == 0 {
+			bridgeUTXO.Script = append([]byte(nil), opts.BridgeScript...)
+		}
 	}
 
-	finder := &deferredAdvanceFinder{}
+	finder := bridge.NewChainDBAdvanceFinder(
+		chainAdapter,
+		&bsvTxFetcherAdapter{provider: opts.Provider},
+	)
 	broadcaster := &arcBroadcaster{provider: opts.Provider}
 	signer := &localSignerAdapter{
 		signer:  opts.FeeSigner,
@@ -153,8 +175,12 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 	}
 
 	cfg := bridge.DefaultWithdrawalConfig()
+	if opts.ClaimFeeSatPerByte > 0 {
+		cfg.ClaimFeeSatPerByte = opts.ClaimFeeSatPerByte
+	}
 	w := bridge.NewWithdrawer(broadcaster, bridgeUTXO, scanner, finder, cfg).
-		WithSigner(signer)
+		WithSigner(signer).
+		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor)
 
 	pollInterval := opts.PollInterval
 	if pollInterval <= 0 {
@@ -195,6 +221,17 @@ func (a *chainDBReaderAdapter) HeaderByNumber(number uint64) *bridge.ChainHeader
 // ReceiptsByBlock returns the stored receipts for the given block.
 func (a *chainDBReaderAdapter) ReceiptsByBlock(hash types.Hash, number uint64) []*types.Receipt {
 	return a.db.ReadReceipts(hash, number)
+}
+
+// ReadAnchor implements bridge.AnchorReader. Returns hasRecord=false
+// when no AnchorRecord has been written yet for blockNum so the
+// finder can surface bridge.ErrAdvanceNotYetAnchored to the Withdrawer.
+func (a *chainDBReaderAdapter) ReadAnchor(blockNum uint64) (types.Hash, bool, bool) {
+	rec := a.db.ReadAnchorRecord(blockNum)
+	if rec == nil {
+		return types.Hash{}, false, false
+	}
+	return rec.BSVTxID, rec.Confirmed, true
 }
 
 // arcBroadcaster wraps a BSVProviderClient as a bridge.BSVBroadcaster.
@@ -245,26 +282,45 @@ func (a *localSignerAdapter) SignInput(rawTxHex string, inputIndex int, prevScri
 	return a.signer.Sign(rawTxHex, inputIndex, prevScriptHex, int64(prevSatoshis), nil)
 }
 
-// ErrAdvanceLookupUnimplemented signals that the daemon has not yet
-// indexed BSV advance transactions by L2 block number. Until the
-// AnchorRecord persistence path is wired (see pkg/block/anchor.go and
-// the discussion in spec 07 Phase 3), the Withdrawer's claim path
-// cannot find the cross-covenant references it needs and skips
-// claiming entirely. This is intentional fail-safe behaviour: the
-// alternative (broadcasting a tx with empty refOutputScript /
-// refOpReturn) would be rejected by the bridge covenant on-chain.
-var ErrAdvanceLookupUnimplemented = errors.New(
-	"bridge.CovenantAdvanceFinder: AnchorRecord index not wired yet — see pkg/block/anchor.go for the storage seam",
-)
+// bsvTxFetcherAdapter satisfies bridge.BSVTxFetcher by translating the
+// runar.TransactionData returned from the BSV-node provider into the
+// minimal *bridge.BSVTransaction shape the claim builder consumes
+// (Outputs only). The provider is the same MultiRPCProvider that
+// covenant advances broadcast through, so any failover policy applied
+// there is inherited transparently.
+type bsvTxFetcherAdapter struct {
+	provider BSVProviderClient
+}
 
-// deferredAdvanceFinder logs once per L2 block and returns a sentinel
-// error so the Withdrawer skips the claim cleanly. Once AnchorRecord
-// persistence lands this is replaced with a real
-// chaindb.ReadAnchorRecord-based finder.
-type deferredAdvanceFinder struct{}
-
-// FindCovenantAdvanceForBlock reports the missing-index error.
-func (f *deferredAdvanceFinder) FindCovenantAdvanceForBlock(l2BlockNum uint64) (*bridge.BSVTransaction, error) {
-	slog.Debug("withdrawal claim deferred: no advance-tx index", "block", l2BlockNum)
-	return nil, ErrAdvanceLookupUnimplemented
+// FetchBSVTx looks up txid via runar.Provider.GetTransaction and maps
+// each TxOutput onto bridge.BSVOutput. The provider returns hex-encoded
+// scripts (matching the verbose getrawtransaction shape); we decode to
+// raw bytes here so the bridge package never has to do it.
+func (a *bsvTxFetcherAdapter) FetchBSVTx(txid types.Hash) (*bridge.BSVTransaction, error) {
+	if a.provider == nil {
+		return nil, errors.New("bsv provider not configured")
+	}
+	td, err := a.provider.GetTransaction(txid.BSVString())
+	if err != nil {
+		return nil, fmt.Errorf("provider.GetTransaction: %w", err)
+	}
+	if td == nil {
+		return nil, errors.New("provider returned nil tx")
+	}
+	outs := make([]bridge.BSVOutput, 0, len(td.Outputs))
+	for i, o := range td.Outputs {
+		script, decErr := hex.DecodeString(o.Script)
+		if decErr != nil {
+			return nil, fmt.Errorf("decode output %d script: %w", i, decErr)
+		}
+		val := uint64(0)
+		if o.Satoshis > 0 {
+			val = uint64(o.Satoshis)
+		}
+		outs = append(outs, bridge.BSVOutput{Script: script, Value: val})
+	}
+	return &bridge.BSVTransaction{
+		TxID:    txid,
+		Outputs: outs,
+	}, nil
 }

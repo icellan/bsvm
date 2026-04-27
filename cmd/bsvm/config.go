@@ -368,6 +368,29 @@ type BridgeSection struct {
 	// consumer falls through to the pre-Item-3 fail-closed path:
 	// envelopes are stored but no L2 credit is applied.
 	BridgeScriptHex string `toml:"bridge_script_hex"`
+
+	// BridgeUTXOTxIDHex / BridgeUTXOVout / BridgeUTXOBalanceSat seed the
+	// live bridge UTXO snapshot the BridgeMonitor exposes via
+	// CurrentBridgeUTXO. Operators set these once at boot from the most
+	// recent on-chain bridge UTXO; subsequent advances + claim broadcasts
+	// roll the snapshot forward in memory. When empty the snapshot stays
+	// nil and the withdrawal-claim loop runs idle.
+	BridgeUTXOTxIDHex    string `toml:"bridge_utxo_txid_hex"`
+	BridgeUTXOVout       uint32 `toml:"bridge_utxo_vout"`
+	BridgeUTXOBalanceSat uint64 `toml:"bridge_utxo_balance_sat"`
+	// BridgeUTXOLastClaimedNonce mirrors the bridge covenant's
+	// lastClaimedNonce slot. New deployments leave it 0; recovery boots
+	// (after a node DB wipe) set it to the highest already-claimed nonce
+	// so the Withdrawer doesn't re-attempt completed claims.
+	BridgeUTXOLastClaimedNonce uint64 `toml:"bridge_utxo_last_claimed_nonce"`
+
+	// ClaimFeeSatPerByte is the BSV miner fee rate applied to withdrawal
+	// claim transactions. The fee is subtracted from the bridge UTXO's
+	// change output (Output 0) so the user receives the full
+	// withdrawal amount. Defaults to 1 sat/byte. Set to 0 to disable
+	// fee subtraction (only useful for hermetic tests where the BSV
+	// miner-fee path is irrelevant).
+	ClaimFeeSatPerByte int64 `toml:"claim_fee_sat_per_byte"`
 }
 
 // DatabaseSection holds database configuration.

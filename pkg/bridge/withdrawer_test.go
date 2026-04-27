@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -726,4 +727,246 @@ func buildOpReturnWithRoot(root types.Hash) []byte {
 	script = append(script, lenBuf...)
 	script = append(script, payload...)
 	return script
+}
+
+// ---------------------------------------------------------------------------
+// Fee-policy tests
+// ---------------------------------------------------------------------------
+
+// TestBuildWithdrawalClaimTx_FeeSubtraction confirms the BSV miner fee
+// is taken from the bridge change output (Output 0) at the configured
+// rate, while Output 1 (user payment) keeps the full withdrawal amount.
+func TestBuildWithdrawalClaimTx_FeeSubtraction(t *testing.T) {
+	addr := make([]byte, 20)
+	addr[0] = 0xfe
+	addr[1] = 0xed
+
+	const rate = 5
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa, 0xbb}),
+		BridgeVout:    0,
+		BridgeSats:    10_000_000_000,
+		BridgeScript:  []byte{0x76, 0xa9, 0x14},
+		BSVAddress:    addr,
+		SatoshiAmount: 1_000_000_000,
+		Nonce:         1,
+		CSVDelay:      6,
+		FeeSatPerByte: rate,
+	}
+	res, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	expectedFee := uint64(rate) * uint64(len(res.RawTx))
+	expectedChange := claim.BridgeSats - claim.SatoshiAmount - expectedFee
+	if res.NewBalance != expectedChange {
+		t.Errorf("NewBalance = %d, want %d (size=%d, fee=%d)",
+			res.NewBalance, expectedChange, len(res.RawTx), expectedFee)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_ZeroFeeSkipsSubtraction confirms a zero
+// FeeSatPerByte preserves the full bridge change. This is the
+// hermetic-test path; production sets a positive rate via config.
+func TestBuildWithdrawalClaimTx_ZeroFeeSkipsSubtraction(t *testing.T) {
+	addr := make([]byte, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000_000_000,
+		BridgeScript:  []byte{0x76},
+		BSVAddress:    addr,
+		SatoshiAmount: 1_000_000,
+		FeeSatPerByte: 0,
+	}
+	res, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	if res.NewBalance != claim.BridgeSats-claim.SatoshiAmount {
+		t.Errorf("NewBalance = %d, want %d (zero fee should leave change untouched)",
+			res.NewBalance, claim.BridgeSats-claim.SatoshiAmount)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_FeeExceedsChange rejects a build whose fee
+// would underflow the bridge change. Otherwise the bridge UTXO would
+// become negative — the BSV mempool would reject the tx and the claim
+// would be permanently stuck.
+func TestBuildWithdrawalClaimTx_FeeExceedsChange(t *testing.T) {
+	addr := make([]byte, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.BytesToHash([]byte{0xaa}),
+		BridgeSats:    1_000,
+		BridgeScript:  []byte{0x76},
+		BSVAddress:    addr,
+		SatoshiAmount: 999, // change = 1 sat, 1000 sat/byte will overflow
+		FeeSatPerByte: 1000,
+	}
+	_, err := BuildWithdrawalClaimTx(claim)
+	if err == nil {
+		t.Fatal("expected error: fee exceeds bridge change")
+	}
+}
+
+// TestDefaultWithdrawalConfigFeeRate pins the documented default rate
+// so accidental drops (set to 0) surface as test failures.
+func TestDefaultWithdrawalConfigFeeRate(t *testing.T) {
+	if got := DefaultWithdrawalConfig().ClaimFeeSatPerByte; got != 1 {
+		t.Errorf("DefaultWithdrawalConfig.ClaimFeeSatPerByte = %d, want 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast retry classification tests
+// ---------------------------------------------------------------------------
+
+// TestClassifyBroadcastError covers the matrix of error patterns the
+// classifier handles. Permanent classifications mean the Withdrawer
+// drops the claim; transient means retry next pass.
+func TestClassifyBroadcastError(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        error
+		wantSentinel error
+	}{
+		// HTTP-coded errors (ARC + RPC).
+		{"arc 400", errors.New("arc: broadcast status 400: invalid script"), ErrBroadcastPermanent},
+		{"arc 422", errors.New("arc: broadcast status 422: double-spend"), ErrBroadcastPermanent},
+		{"arc 408", errors.New("arc: broadcast status 408: request timeout"), ErrBroadcastTransient},
+		{"arc 429", errors.New("arc: broadcast status 429: rate limited"), ErrBroadcastTransient},
+		{"arc 500", errors.New("arc: broadcast status 500: server error"), ErrBroadcastTransient},
+		{"arc 503", errors.New("arc: broadcast status 503: temporarily unavailable"), ErrBroadcastTransient},
+
+		// String-pattern matched permanent rejections.
+		{"rpc reject", errors.New("bsvclient: sendrawtransaction: 26: txn-mempool-conflict"), ErrBroadcastPermanent},
+		{"invalid signature", errors.New("scriptsig invalid signature"), ErrBroadcastPermanent},
+		{"covenant rejected", errors.New("covenant verify-failed: bad witness"), ErrBroadcastPermanent},
+		{"double spend", errors.New("double-spend detected"), ErrBroadcastPermanent},
+
+		// Network / unknown errors -> transient.
+		{"connection refused", errors.New("dial tcp: connection refused"), ErrBroadcastTransient},
+		{"deadline exceeded", context.DeadlineExceeded, ErrBroadcastTransient},
+		{"context cancelled", context.Canceled, ErrBroadcastTransient},
+		{"unknown blob", errors.New("something nondescript happened"), ErrBroadcastTransient},
+
+		// Nil passes through.
+		{"nil error", nil, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyBroadcastError(tc.input)
+			if tc.wantSentinel == nil {
+				if got != nil {
+					t.Errorf("got %v, want nil", got)
+				}
+				return
+			}
+			if !errors.Is(got, tc.wantSentinel) {
+				t.Errorf("got %v, want sentinel %v", got, tc.wantSentinel)
+			}
+		})
+	}
+}
+
+// fakeBroadcaster is a configurable BSVBroadcaster for the retry-policy
+// tests. Each call advances the call counter and returns the next
+// scripted error (or success).
+type fakeBroadcaster struct {
+	scripted    []error
+	calls       int
+	successTxID types.Hash
+}
+
+func (f *fakeBroadcaster) Broadcast(_ []byte) (types.Hash, error) {
+	defer func() { f.calls++ }()
+	if f.calls < len(f.scripted) {
+		err := f.scripted[f.calls]
+		if err == nil {
+			return f.successTxID, nil
+		}
+		return types.Hash{}, err
+	}
+	return f.successTxID, nil
+}
+
+// TestBroadcastRetry_PermanentDropsImmediately confirms that a
+// permanent classification on attempt 1 short-circuits all retries —
+// the Withdrawer must NOT keep slamming the broadcaster with a
+// definitively-rejected claim.
+func TestBroadcastRetry_PermanentDropsImmediately(t *testing.T) {
+	bc := &fakeBroadcaster{
+		scripted: []error{
+			errors.New("arc: broadcast status 422: double-spend"),
+		},
+	}
+	w := &Withdrawer{
+		bsvBroadcaster:    bc,
+		broadcastRetries:  5,
+		broadcastBackoffs: []time.Duration{0, 0, 0, 0, 0},
+	}
+	_, err := w.broadcastWithRetry([]byte{0xff}, 1)
+	if !errors.Is(err, ErrBroadcastPermanent) {
+		t.Errorf("err = %v, want ErrBroadcastPermanent", err)
+	}
+	if bc.calls != 1 {
+		t.Errorf("calls = %d, want 1 (permanent must not retry)", bc.calls)
+	}
+}
+
+// TestBroadcastRetry_TransientRetriesThenSucceeds confirms transient
+// failures are retried up to the budget, and a success on attempt N
+// returns cleanly.
+func TestBroadcastRetry_TransientRetriesThenSucceeds(t *testing.T) {
+	wantTxID := types.BytesToHash([]byte{0xab, 0xcd})
+	bc := &fakeBroadcaster{
+		scripted: []error{
+			errors.New("arc: broadcast status 503: bad gateway"),
+			errors.New("dial tcp: connection refused"),
+			nil, // succeed on attempt 3
+		},
+		successTxID: wantTxID,
+	}
+	w := &Withdrawer{
+		bsvBroadcaster:    bc,
+		broadcastRetries:  5,
+		broadcastBackoffs: []time.Duration{0, 0, 0, 0, 0},
+	}
+	got, err := w.broadcastWithRetry([]byte{0xff}, 1)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != wantTxID {
+		t.Errorf("txid = %s, want %s", got.BSVString(), wantTxID.BSVString())
+	}
+	if bc.calls != 3 {
+		t.Errorf("calls = %d, want 3", bc.calls)
+	}
+}
+
+// TestBroadcastRetry_TransientExhaustsBudget confirms that all
+// transient attempts get used and then return a transient-sentinel
+// error so the caller's outer loop retries on the next pass.
+func TestBroadcastRetry_TransientExhaustsBudget(t *testing.T) {
+	bc := &fakeBroadcaster{
+		scripted: []error{
+			errors.New("arc: broadcast status 503: bad gateway"),
+			errors.New("arc: broadcast status 503: bad gateway"),
+			errors.New("arc: broadcast status 503: bad gateway"),
+		},
+	}
+	w := &Withdrawer{
+		bsvBroadcaster:    bc,
+		broadcastRetries:  3,
+		broadcastBackoffs: []time.Duration{0, 0, 0},
+	}
+	_, err := w.broadcastWithRetry([]byte{0xff}, 1)
+	if err == nil {
+		t.Fatal("expected error after exhaustion")
+	}
+	if errors.Is(err, ErrBroadcastPermanent) {
+		t.Errorf("err = %v, classified as permanent (should be transient-after-exhaust)", err)
+	}
+	if bc.calls != 3 {
+		t.Errorf("calls = %d, want 3 (full budget)", bc.calls)
+	}
 }

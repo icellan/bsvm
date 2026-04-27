@@ -80,7 +80,9 @@ type ReorgRollbackCallback func(bsvCommonAncestorHeight uint64)
 
 // BridgeMonitor watches the BSV blockchain for deposits to the bridge
 // covenant and submits corresponding system transactions to the L2
-// overlay node.
+// overlay node. It also exposes the live BridgeUTXO snapshot so the
+// withdrawal-claim path can read a non-stale (txid, vout, balance) tuple
+// without scanning chaintracks itself.
 type BridgeMonitor struct {
 	config            Config
 	bsvClient         BSVClient
@@ -92,6 +94,7 @@ type BridgeMonitor struct {
 	pendingDeposits   []*Deposit
 	lastHorizon       uint64
 	reorgRollbackCB   ReorgRollbackCallback
+	bridgeUTXO        *BridgeUTXO
 	mu                sync.Mutex
 }
 
@@ -134,6 +137,80 @@ func (m *BridgeMonitor) LocalShardID() uint32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.localShardID
+}
+
+// SetBridgeUTXO seeds (or replaces) the live bridge-covenant UTXO
+// snapshot the monitor exposes via CurrentBridgeUTXO. The withdrawal
+// claim flow asks the monitor for this snapshot once per pass and
+// trusts it as the source of truth — covenant advances must call
+// ApplyBridgeAdvance afterwards so the snapshot stays in sync.
+//
+// The argument is defensively copied so callers can mutate their own
+// copy without observing partial updates here. Pass nil to clear the
+// snapshot (the next CurrentBridgeUTXO returns nil and the wiring
+// short-circuits the claim loop).
+func (m *BridgeMonitor) SetBridgeUTXO(u *BridgeUTXO) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u == nil {
+		m.bridgeUTXO = nil
+		return
+	}
+	cp := *u
+	if u.Script != nil {
+		cp.Script = append([]byte(nil), u.Script...)
+	}
+	m.bridgeUTXO = &cp
+}
+
+// CurrentBridgeUTXO returns a defensive copy of the latest bridge UTXO
+// snapshot, or nil if SetBridgeUTXO has not been called. Returning a
+// copy keeps the Withdrawer free to mutate the result (e.g. after a
+// successful claim) without racing the monitor's own bookkeeping.
+func (m *BridgeMonitor) CurrentBridgeUTXO() *BridgeUTXO {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.bridgeUTXO == nil {
+		return nil
+	}
+	cp := *m.bridgeUTXO
+	if m.bridgeUTXO.Script != nil {
+		cp.Script = append([]byte(nil), m.bridgeUTXO.Script...)
+	}
+	return &cp
+}
+
+// ApplyBridgeAdvance updates the tracked bridge UTXO after a covenant
+// advance has been broadcast: a successful advance always rolls the
+// bridge covenant UTXO forward to a new (txid, vout) at the same
+// balance (advance is just a state transition, not a deposit/spend).
+// Use ApplyBridgeDeposit / BridgeUTXO.UpdateAfterWithdrawal to mutate
+// the balance.
+//
+// Safe to call concurrently with CurrentBridgeUTXO. A no-op when no
+// snapshot has been seeded — the daemon must seed via SetBridgeUTXO
+// from operator config first.
+func (m *BridgeMonitor) ApplyBridgeAdvance(newTxID types.Hash, newVout uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.bridgeUTXO == nil {
+		return
+	}
+	m.bridgeUTXO.TxID = newTxID
+	m.bridgeUTXO.Vout = newVout
+}
+
+// ApplyBridgeDeposit credits the bridge UTXO balance by amount (for
+// example when a deposit is included). Returns the post-credit
+// balance. No-op (returns 0) when no snapshot has been seeded.
+func (m *BridgeMonitor) ApplyBridgeDeposit(amountSat uint64) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.bridgeUTXO == nil {
+		return 0
+	}
+	m.bridgeUTXO.Balance += amountSat
+	return m.bridgeUTXO.Balance
 }
 
 // SetReorgRollbackCallback registers a callback that fires after every

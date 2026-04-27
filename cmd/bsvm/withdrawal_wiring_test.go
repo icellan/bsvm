@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +97,36 @@ func TestWireWithdrawer_MissingDeps_NoopAndWarn(t *testing.T) {
 	}
 }
 
+// TestWireWithdrawer_ReadsLiveBridgeUTXO confirms the wiring reads its
+// initial bridge UTXO snapshot from the BridgeMonitor (not the zero-
+// balance placeholder). This is the smoke test for Item 2 — production
+// must not ship a Withdrawer that always sees balance=0.
+func TestWireWithdrawer_ReadsLiveBridgeUTXO(t *testing.T) {
+	opts := newCompleteWiringOpts(t)
+	opts.BridgeMonitor.SetBridgeUTXO(&bridge.BridgeUTXO{
+		TxID:             types.HexToHash("0x" + "ff" + strings.Repeat("00", 31)),
+		Vout:             3,
+		Balance:          12_345_678,
+		LastClaimedNonce: 7,
+		Script:           opts.BridgeScript,
+	})
+
+	// Wiring reads CurrentBridgeUTXO at construction; the smoke check is
+	// that the snapshot survived the round trip.
+	got := opts.BridgeMonitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("monitor lost the seeded snapshot")
+	}
+	if got.Balance != 12_345_678 || got.LastClaimedNonce != 7 {
+		t.Errorf("snapshot drift: balance=%d nonce=%d, want 12345678 / 7",
+			got.Balance, got.LastClaimedNonce)
+	}
+	// Wiring itself must succeed without panicking.
+	if start := WireWithdrawer(opts); start == nil {
+		t.Fatal("WireWithdrawer returned nil start")
+	}
+}
+
 // TestWireWithdrawer_HappyPath_StartsAndStops verifies that with a
 // fully-populated opts struct, WireWithdrawer returns a non-noop
 // start, the loop runs at least one ProcessFinalizedWithdrawals pass
@@ -136,20 +167,93 @@ func TestArcBroadcaster_RejectsMalformedRawTx(t *testing.T) {
 	}
 }
 
-// TestDeferredAdvanceFinder always returns the sentinel error. This
-// pins the "claims deferred" behaviour: until anchor records are
-// persisted by the daemon, every claim attempt must skip cleanly via
-// this sentinel rather than broadcast a tx the bridge covenant would
-// reject.
-func TestDeferredAdvanceFinder(t *testing.T) {
-	f := &deferredAdvanceFinder{}
-	tx, err := f.FindCovenantAdvanceForBlock(42)
+// TestChainDBAdvanceFinder_NotYetAnchored asserts the production
+// finder surfaces bridge.ErrAdvanceNotYetAnchored when the L2 block
+// has no AnchorRecord persisted yet. The Withdrawer treats that as a
+// "retry later" condition rather than a hard failure.
+func TestChainDBAdvanceFinder_NotYetAnchored(t *testing.T) {
+	database := db.NewMemoryDB()
+	defer database.Close()
+	if _, err := block.InitGenesis(database, &block.Genesis{
+		Config:   vm.DefaultL2Config(31337),
+		GasLimit: block.DefaultGasLimit,
+		Alloc:    map[types.Address]block.GenesisAccount{},
+	}); err != nil {
+		t.Fatalf("InitGenesis: %v", err)
+	}
+	chainDB := block.NewChainDB(database)
+
+	finder := bridge.NewChainDBAdvanceFinder(
+		&chainDBReaderAdapter{db: chainDB},
+		&bsvTxFetcherAdapter{provider: &stubProvider{}},
+	)
+	tx, err := finder.FindCovenantAdvanceForBlock(42)
 	if tx != nil {
 		t.Errorf("tx = %v, want nil", tx)
 	}
-	if !errors.Is(err, ErrAdvanceLookupUnimplemented) {
-		t.Errorf("err = %v, want %v", err, ErrAdvanceLookupUnimplemented)
+	if !errors.Is(err, bridge.ErrAdvanceNotYetAnchored) {
+		t.Errorf("err = %v, want ErrAdvanceNotYetAnchored", err)
 	}
+}
+
+// TestChainDBAdvanceFinder_HappyPath writes an AnchorRecord and a
+// matching BSV transaction snapshot via a fake fetcher, then confirms
+// the finder returns the expected outputs.
+func TestChainDBAdvanceFinder_HappyPath(t *testing.T) {
+	database := db.NewMemoryDB()
+	defer database.Close()
+	if _, err := block.InitGenesis(database, &block.Genesis{
+		Config:   vm.DefaultL2Config(31337),
+		GasLimit: block.DefaultGasLimit,
+		Alloc:    map[types.Address]block.GenesisAccount{},
+	}); err != nil {
+		t.Fatalf("InitGenesis: %v", err)
+	}
+	chainDB := block.NewChainDB(database)
+
+	bsvTx := types.HexToHash("0x" + "ab" + strings.Repeat("00", 31))
+	if err := chainDB.WriteAnchorRecord(&block.AnchorRecord{
+		L2BlockNum: 7,
+		BSVTxID:    bsvTx,
+		Confirmed:  true,
+	}); err != nil {
+		t.Fatalf("WriteAnchorRecord: %v", err)
+	}
+
+	wantScript := []byte{0x76, 0xa9, 0x14, 0xff}
+	fetcher := &fakeFetcher{
+		out: &bridge.BSVTransaction{
+			TxID:    bsvTx,
+			Outputs: []bridge.BSVOutput{{Script: wantScript, Value: 12345}},
+		},
+	}
+	finder := bridge.NewChainDBAdvanceFinder(
+		&chainDBReaderAdapter{db: chainDB},
+		fetcher,
+	)
+	tx, err := finder.FindCovenantAdvanceForBlock(7)
+	if err != nil {
+		t.Fatalf("FindCovenantAdvanceForBlock: %v", err)
+	}
+	if tx == nil {
+		t.Fatal("tx is nil")
+	}
+	if fetcher.lastTxID != bsvTx {
+		t.Errorf("fetcher saw txid=%s, want %s", fetcher.lastTxID.BSVString(), bsvTx.BSVString())
+	}
+	if len(tx.Outputs) != 1 || string(tx.Outputs[0].Script) != string(wantScript) {
+		t.Errorf("outputs=%v, want one with script=%x", tx.Outputs, wantScript)
+	}
+}
+
+type fakeFetcher struct {
+	out      *bridge.BSVTransaction
+	lastTxID types.Hash
+}
+
+func (f *fakeFetcher) FetchBSVTx(txid types.Hash) (*bridge.BSVTransaction, error) {
+	f.lastTxID = txid
+	return f.out, nil
 }
 
 // TestLocalSignerAdapter_NilSigner ensures the adapter rejects calls

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/icellan/bsvm/pkg/types"
@@ -80,6 +81,31 @@ type BSVBroadcaster interface {
 	Broadcast(rawTx []byte) (types.Hash, error)
 }
 
+// BridgeUTXOProvider is an optional seam the Withdrawer consults at
+// the start of every ProcessFinalizedWithdrawals pass. When set, the
+// returned snapshot replaces the Withdrawer's working bridgeUTXO so
+// the next pass sees fresh balance / outpoint data without restarting
+// the loop. Returning nil leaves the existing snapshot in place — the
+// Withdrawer continues with whatever it had after the last claim.
+type BridgeUTXOProvider interface {
+	CurrentBridgeUTXO() *BridgeUTXO
+}
+
+// BridgeUTXOSink is an optional hook the Withdrawer fires after every
+// successful claim. The argument is the post-claim bridge UTXO state
+// (new TxID, new balance, new lastClaimedNonce). Daemon wiring uses it
+// to push the mutation back to the BridgeMonitor's snapshot so other
+// readers see the latest state.
+type BridgeUTXOSink interface {
+	SetBridgeUTXO(*BridgeUTXO)
+}
+
+// BridgeUTXOSinkFunc adapts a plain function to BridgeUTXOSink.
+type BridgeUTXOSinkFunc func(*BridgeUTXO)
+
+// SetBridgeUTXO implements BridgeUTXOSink.
+func (f BridgeUTXOSinkFunc) SetBridgeUTXO(u *BridgeUTXO) { f(u) }
+
 // BSVSigner signs an input of a partial BSV transaction. The interface
 // matches pkg/covenant.PrivateKey so the production wiring can pass
 // the FeeWallet's underlying key directly without an adapter — the
@@ -117,6 +143,12 @@ type Withdrawer struct {
 	// advances use, scaled to fit a per-block claim deadline.
 	broadcastRetries  int
 	broadcastBackoffs []time.Duration
+	// utxoProvider, when set, supplies a fresh bridge UTXO snapshot at
+	// the start of every ProcessFinalizedWithdrawals pass. utxoSink, when
+	// set, receives the post-claim snapshot after every successful claim.
+	// Both are nil-safe; tests that don't need them leave them unset.
+	utxoProvider BridgeUTXOProvider
+	utxoSink     BridgeUTXOSink
 }
 
 // NewWithdrawer creates a new Withdrawer with the given dependencies.
@@ -151,6 +183,15 @@ func NewWithdrawer(
 // claim is abandoned (no partial broadcast).
 func (w *Withdrawer) WithSigner(s BSVSigner) *Withdrawer {
 	w.signer = s
+	return w
+}
+
+// WithBridgeUTXOTracker wires both ends of the live-snapshot seam at
+// once: provider is consulted at the start of every pass, sink is
+// notified after every successful claim. Either or both may be nil.
+func (w *Withdrawer) WithBridgeUTXOTracker(provider BridgeUTXOProvider, sink BridgeUTXOSink) *Withdrawer {
+	w.utxoProvider = provider
+	w.utxoSink = sink
 	return w
 }
 
@@ -197,6 +238,20 @@ func (w *Withdrawer) SetBroadcastRetryPolicy(attempts int, backoffs []time.Durat
 //     wallet key.
 //  5. Broadcasting via ARC, retrying on transient failure.
 func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
+	// Refresh the working bridge UTXO from the live tracker if one is
+	// wired. The provider returns a fresh defensive copy; we replace
+	// the Withdrawer's pointer so downstream mutations
+	// (UpdateAfterWithdrawal) stay confined to this pass and surface
+	// back to the tracker via the sink hook.
+	if w.utxoProvider != nil {
+		if fresh := w.utxoProvider.CurrentBridgeUTXO(); fresh != nil {
+			w.bridgeUTXO = fresh
+		}
+	}
+	if w.bridgeUTXO == nil {
+		return fmt.Errorf("withdrawer: no bridge UTXO snapshot available")
+	}
+
 	nextNonce := w.bridgeUTXO.LastClaimedNonce + 1
 	pendingWithdrawals, err := w.scanner.ScanPendingWithdrawals(nextNonce)
 	if err != nil {
@@ -221,6 +276,17 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		// Locate the covenant-advance BSV tx containing this withdrawal.
 		advanceTx, err := w.advanceFinder.FindCovenantAdvanceForBlock(wd.L2BlockNum)
 		if err != nil {
+			// "Not yet anchored" is the documented retry-later signal:
+			// the L2 block exists but its covenant advance has not been
+			// broadcast / persisted to ChainDB yet. We log + stop the
+			// pass without surfacing as fatal so the loop tries again on
+			// the next tick. Any other finder error is fatal-for-this-
+			// pass (loop-level handler logs + retries).
+			if errors.Is(err, ErrAdvanceNotYetAnchored) {
+				slog.Info("withdrawal claim deferred: advance not yet anchored",
+					"nonce", wd.Nonce, "block", wd.L2BlockNum)
+				break
+			}
 			return fmt.Errorf("cannot find covenant advance for block %d: %w", wd.L2BlockNum, err)
 		}
 
@@ -261,6 +327,7 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			RefOpReturn:     refOpReturn,
 			CSVDelay:        csvDelay,
 			Signer:          w.signer,
+			FeeSatPerByte:   w.config.ClaimFeeSatPerByte,
 		}
 
 		claimTx, err := BuildWithdrawalClaimTx(claim)
@@ -268,9 +335,26 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			return fmt.Errorf("claim tx build failed for nonce %d: %w", wd.Nonce, err)
 		}
 
-		// Broadcast with retry/backoff.
+		// Broadcast with retry/backoff. broadcastWithRetry already
+		// distinguishes transient vs permanent errors and logs each
+		// case at the appropriate level. For us:
+		//
+		//   - permanent: stop the whole pass (the bridge covenant
+		//     enforces sequential nonces, so a stuck claim blocks every
+		//     subsequent claim). The loop wrapper will retry on the
+		//     next tick — this gives the operator a window to fix the
+		//     root cause (top up the bridge, deploy a covenant patch,
+		//     etc.) before the daemon retries.
+		//   - transient (after retry exhaustion): same — leave the
+		//     claim in the queue for the next pass.
 		txid, err := w.broadcastWithRetry(claimTx.RawTx, wd.Nonce)
 		if err != nil {
+			if errors.Is(err, ErrBroadcastPermanent) {
+				slog.Error("withdrawal claim dropped: permanent broadcast failure",
+					"nonce", wd.Nonce, "block", wd.L2BlockNum,
+					"amount_sat", wd.AmountSatoshis, "error", err)
+				return fmt.Errorf("claim broadcast permanently failed for nonce %d: %w", wd.Nonce, err)
+			}
 			return fmt.Errorf("claim broadcast failed for nonce %d: %w", wd.Nonce, err)
 		}
 
@@ -282,6 +366,17 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 
 		// Update bridge UTXO tracking.
 		w.bridgeUTXO.UpdateAfterWithdrawal(txid, wd.AmountSatoshis, wd.Nonce)
+
+		// Push the post-claim snapshot back to the live tracker so other
+		// readers (e.g. operator UI, next loop iteration) see the latest
+		// state.
+		if w.utxoSink != nil {
+			snap := *w.bridgeUTXO
+			if w.bridgeUTXO.Script != nil {
+				snap.Script = append([]byte(nil), w.bridgeUTXO.Script...)
+			}
+			w.utxoSink.SetBridgeUTXO(&snap)
+		}
 	}
 
 	return nil
@@ -328,11 +423,109 @@ func (w *Withdrawer) buildMerkleProof(wd *PendingWithdrawal, expectedRoot types.
 	return proof, idx, nil
 }
 
+// ErrBroadcastPermanent wraps a permanent broadcast failure (covenant
+// rejection, malformed tx, double-spend, etc). The caller drops the
+// claim instead of retrying. errors.Is recognises this sentinel so
+// callers can branch on it cleanly.
+var ErrBroadcastPermanent = errors.New("withdrawal broadcast permanently failed")
+
+// ErrBroadcastTransient wraps a transient broadcast failure (mempool
+// full, RPC timeout, 5xx, network error). The Withdrawer's loop retries
+// the same claim on the next pass.
+var ErrBroadcastTransient = errors.New("withdrawal broadcast transient failure")
+
+// classifyBroadcastError partitions a broadcaster-returned error into
+// transient (retry) vs permanent (drop). Decision rules:
+//
+//   - HTTP 4xx (excluding 408 + 429): permanent. ARC reports invalid /
+//     malformed / double-spend / covenant-rejected with these codes.
+//   - HTTP 5xx, 408 (timeout), 429 (rate limit): transient.
+//   - network-level (i/o timeout, connection refused, EOF): transient.
+//   - context-cancelled: transient (caller cancelled, retry next pass).
+//   - everything else (unparseable error message): treat as transient
+//     by default — better to retry an unknown failure than drop a
+//     potentially-valid claim.
+//
+// The classifier is intentionally string-based: ARC and BSV-node RPC
+// errors arrive as opaque error strings, and ARC's structured response
+// is wrapped via fmt.Errorf("arc: broadcast status %d: %s", ...).
+// A future ARC SDK with a typed error type would let this logic
+// swap to errors.As; until then string matching is the pragmatic
+// surface area.
+func classifyBroadcastError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	// Context cancellation is transient — the caller will start a new
+	// pass once the context is fresh.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ErrBroadcastTransient, err)
+	}
+	// HTTP status detection. ARC errors land as "arc: broadcast status 4XX: ..."
+	// or "arc: status 4XX: ...". We extract the first 3-digit run that
+	// looks like a status code.
+	if status := extractHTTPStatus(msg); status > 0 {
+		switch {
+		case status == 408 || status == 429: // timeout / rate-limited
+			return fmt.Errorf("%w: http %d: %v", ErrBroadcastTransient, status, err)
+		case status >= 500: // server error
+			return fmt.Errorf("%w: http %d: %v", ErrBroadcastTransient, status, err)
+		case status >= 400: // client error -> permanent
+			return fmt.Errorf("%w: http %d: %v", ErrBroadcastPermanent, status, err)
+		}
+	}
+	// Pattern-match common permanent BSV-node rejections.
+	low := strings.ToLower(msg)
+	for _, kw := range []string{
+		"reject", "invalid", "double-spend", "double spend",
+		"missing inputs", "bad-txns", "non-canonical", "txn-mempool-conflict",
+		"covenant", "verify-failed", "signature", "scriptsig",
+	} {
+		if strings.Contains(low, kw) {
+			return fmt.Errorf("%w: %v", ErrBroadcastPermanent, err)
+		}
+	}
+	// Default: transient. Network blips, unknown errors, undocumented
+	// node behaviour all fall here.
+	return fmt.Errorf("%w: %v", ErrBroadcastTransient, err)
+}
+
+// extractHTTPStatus pulls the first plausible HTTP status code from a
+// free-form error message. Returns 0 if no 3xx/4xx/5xx integer is
+// present. Only inspects digit runs after the substring "status" to
+// avoid false-positives on satoshi amounts / nonces in the message.
+func extractHTTPStatus(msg string) int {
+	const marker = "status "
+	idx := strings.Index(strings.ToLower(msg), marker)
+	if idx < 0 {
+		return 0
+	}
+	rest := msg[idx+len(marker):]
+	// Read up to 3 digits.
+	var n int
+	for i := 0; i < 3 && i < len(rest); i++ {
+		c := rest[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n >= 100 && n < 600 {
+		return n
+	}
+	return 0
+}
+
 // broadcastWithRetry submits the raw tx through the broadcaster,
 // retrying transient failures per the configured policy. On a
-// successful broadcast (any attempt) the resulting txid is returned;
-// on exhaustion the last error is wrapped with attempt counts so the
-// caller can surface it to operators.
+// successful broadcast (any attempt) the resulting txid is returned.
+// On a permanent classification the loop exits immediately with the
+// permanent error wrapped — the caller drops the claim instead of
+// retrying. On exhaustion of the transient retry budget the last
+// error is wrapped with attempt counts so the caller can surface it
+// to operators (caller treats this as transient and retries on the
+// next pass).
 func (w *Withdrawer) broadcastWithRetry(rawTx []byte, nonce uint64) (types.Hash, error) {
 	attempts := w.broadcastRetries
 	if attempts <= 0 {
@@ -355,11 +548,17 @@ func (w *Withdrawer) broadcastWithRetry(rawTx []byte, nonce uint64) (types.Hash,
 		if err == nil {
 			return txid, nil
 		}
-		lastErr = err
-		slog.Warn("withdrawal broadcast attempt failed",
-			"nonce", nonce, "attempt", i+1, "error", err)
+		classified := classifyBroadcastError(err)
+		lastErr = classified
+		if errors.Is(classified, ErrBroadcastPermanent) {
+			slog.Error("withdrawal broadcast permanently failed, dropping claim",
+				"nonce", nonce, "attempt", i+1, "error", classified)
+			return types.Hash{}, classified
+		}
+		slog.Warn("withdrawal broadcast transient failure",
+			"nonce", nonce, "attempt", i+1, "error", classified)
 	}
-	return types.Hash{}, fmt.Errorf("after %d attempts: %w", attempts, lastErr)
+	return types.Hash{}, fmt.Errorf("after %d transient attempts: %w", attempts, lastErr)
 }
 
 // ProcessFinalizedWithdrawalsLoop runs ProcessFinalizedWithdrawals on
@@ -519,6 +718,15 @@ type WithdrawalClaim struct {
 	// script is left empty (the broadcasted tx is unsigned — only
 	// useful for tests inspecting tx structure).
 	Signer BSVSigner
+
+	// FeeSatPerByte sets the BSV miner fee rate, in satoshis per
+	// claim-tx byte. The fee is subtracted from the bridge UTXO change
+	// output (Output 0) — the user receives the full SatoshiAmount.
+	// Zero disables fee subtraction (test/hermetic builds only).
+	// Default in BuildWithdrawalClaimTx is 1 sat/byte when this field
+	// is left zero AND the build is being executed under production
+	// settings (operator-supplied via bridge config).
+	FeeSatPerByte int64
 }
 
 // WithdrawalClaimTx holds the result of building a withdrawal claim transaction.
@@ -552,9 +760,18 @@ func CSVDelayForAmount(satoshis uint64) uint32 {
 // The transaction structure:
 //
 //	Input 0: Bridge covenant UTXO (unlock script supplied by Signer)
-//	Output 0: New bridge covenant UTXO (balance reduced)
-//	Output 1: CSV-locked payment to user's BSV address
+//	Output 0: New bridge covenant UTXO (balance reduced + fee absorbed)
+//	Output 1: CSV-locked payment to user's BSV address (full amount)
 //	Output 2: OP_RETURN withdrawal receipt
+//
+// Fee policy: the BSV miner fee is computed as
+// FeeSatPerByte * len(serialized signed tx) and subtracted from
+// Output 0 (the bridge UTXO change). The user always receives the
+// full SatoshiAmount on Output 1; the bridge balance absorbs the fee.
+// Spec 07 § "Claim transaction structure" describes a separate
+// fee-funding input; the single-input simplification used here is
+// documented in S-withdrawal-and-rollback (Item 3) and tracked as a
+// follow-up. FeeSatPerByte=0 disables subtraction (test only).
 //
 // When claim.Signer is non-nil the unlock script for input 0 is built
 // by serialising the unsigned tx, asking the signer to produce the
@@ -637,6 +854,22 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 			return nil, fmt.Errorf("decode unlock script: %w", err)
 		}
 		tx.inputs[0].script = unlock
+	}
+
+	// Subtract the BSV miner fee from the bridge change output (Output
+	// 0). Fee = serialized-tx size * FeeSatPerByte. We compute against
+	// the post-signing size so the rate is honoured exactly; patching
+	// the output value doesn't change tx layout (it's a fixed-width
+	// uint64), so the size stays stable across the patch.
+	if claim.FeeSatPerByte > 0 {
+		serialized := tx.serialize()
+		fee := uint64(claim.FeeSatPerByte) * uint64(len(serialized))
+		if fee > newBalance {
+			return nil, fmt.Errorf("claim fee %d exceeds bridge change %d (rate=%d sat/byte, size=%d)",
+				fee, newBalance, claim.FeeSatPerByte, len(serialized))
+		}
+		newBalance -= fee
+		tx.outputs[0].value = newBalance
 	}
 
 	rawTx := tx.serialize()

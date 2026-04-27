@@ -40,6 +40,15 @@ type WithdrawalConfig struct {
 
 	// Tiers defines confirmation requirements by withdrawal amount.
 	Tiers []WithdrawalTier
+
+	// ClaimFeeSatPerByte is the BSV miner fee rate applied to claim
+	// transactions. Subtracted from the bridge change output so the
+	// user receives the full withdrawal amount. Defaults to 1 sat/byte
+	// in DefaultWithdrawalConfig. Zero disables fee subtraction (test
+	// only) — production deployments must set a positive rate or the
+	// claim tx will be rejected by the BSV mempool with "min fee not
+	// met".
+	ClaimFeeSatPerByte int64
 }
 
 // WithdrawalTier defines the BSV confirmation requirement for
@@ -64,5 +73,6 @@ func DefaultWithdrawalConfig() WithdrawalConfig {
 			{MaxAmount: 10_000_000_000, Confirmations: 20},  // <= 100 BSV
 			{MaxAmount: math.MaxUint64, Confirmations: 100}, // > 100 BSV
 		},
+		ClaimFeeSatPerByte: 1,
 	}
 }
