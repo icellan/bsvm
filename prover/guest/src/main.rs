@@ -469,6 +469,19 @@ pub fn main() {
                 }
             };
             let tx_env = TxEnv {
+                // CRITICAL: tx_type MUST be set from the decoded envelope.
+                // revm's TxEnv defaults tx_type to 0 (Legacy) and prices the
+                // transaction accordingly: coinbase receives
+                // `gas_used * gas_price` rather than priority-tip-only, and
+                // the basefee is not subtracted from the sender separately.
+                // Forgetting this here mis-prices every EIP-1559 (0x02) and
+                // EIP-4844 (0x03) tx and causes a Go-vs-revm post-state-root
+                // divergence under the dual-EVM equivalence guarantee. The
+                // decoder pins the four supported tx types to their wire
+                // values: Legacy=0x00, EIP-2930=0x01, EIP-1559=0x02,
+                // EIP-4844=0x03; deposits (0x7E) are handled in the branch
+                // above and never reach this construction.
+                tx_type: decoded.tx_type,
                 caller: decoded.sender,
                 gas_limit: decoded.gas_limit,
                 gas_price: decoded.gas_price,
