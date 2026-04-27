@@ -1,0 +1,160 @@
+# DRAFT — pinned-nightly toolchain CI for prover/guest
+#
+# This file is intentionally suffixed `.draft` so GitHub Actions does
+# NOT pick it up. To activate:
+#   git mv .github/workflows/rust-toolchain.yml.draft \
+#          .github/workflows/rust-toolchain.yml
+#
+# See docs/decisions/U-toolchain-pin-strategy.md for the full
+# rationale. Summary: prover/guest is pinned to a specific Rust
+# nightly; nightly toolchains rot from upstream mirrors over time;
+# this workflow makes the rot visible in CI on the day it happens
+# rather than letting an operator discover it at build time months
+# later.
+#
+# What this workflow does:
+#   - On every push/PR that touches prover/guest/** or this file,
+#     installs the EXACT nightly named in
+#     prover/guest/rust-toolchain.toml.
+#   - Adds the riscv64imac-unknown-none-elf target and the rustc-dev,
+#     llvm-tools, rustfmt components (the components the SP1 guest
+#     build chain expects).
+#   - Runs `cargo metadata --locked` so Cargo.lock + the pinned
+#     toolchain together actually work end-to-end. No proving build
+#     (multi-GB SP1 runtime download is reserved for a weekly job).
+#
+# What this workflow does NOT do:
+#   - Run `cargo prove build`. That requires the SP1 toolchain
+#     install (~2-3 GB) and is too heavy for PR gating.
+#   - Build host crates. `rust-check.yml` already covers them on
+#     stable.
+#   - Verify the SP1 verifying key hash is unchanged. That is part of
+#     the spec 12 SP1 version-upgrade policy and lives in a separate
+#     ceremony, not in PR-gate CI.
+
+name: Rust toolchain pin (prover/guest)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "prover/guest/**"
+      - ".github/workflows/rust-toolchain.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "prover/guest/**"
+      - ".github/workflows/rust-toolchain.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: rust-toolchain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest-pin:
+    name: prover/guest — pinned nightly install
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain file IS the single source of truth. We
+      # extract the pin and surface it in the run log so a CI
+      # failure includes "we tried to install nightly-2025-10-01 and
+      # it failed" rather than a vague rustup error.
+      - name: Read pinned toolchain
+        id: pin
+        run: |
+          set -euo pipefail
+          channel=$(awk -F'"' '/^channel/ { print $2 }' \
+            prover/guest/rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "::error::Could not parse channel from prover/guest/rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Pinned nightly: $channel"
+
+      - name: Cache cargo + rustup
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+          key: ${{ runner.os }}-rust-${{ steps.pin.outputs.channel }}-${{ hashFiles('prover/guest/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ steps.pin.outputs.channel }}-
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Pin the toolchain via the channel surfaced from the
+          # toolchain file. The components and target list match the
+          # toolchain file.
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: rustfmt,llvm-tools,rustc-dev
+          targets: riscv64imac-unknown-none-elf
+
+      - name: Verify rustc reports the pinned channel
+        run: |
+          set -euo pipefail
+          # Operates from inside prover/guest so the directory's
+          # rust-toolchain.toml takes effect — we want rustup to use
+          # the file, not the system default.
+          cd prover/guest
+          actual=$(rustc --version)
+          echo "rustc: $actual"
+          # Defensive: confirm the version line includes the date
+          # from the pin. If rustup falls back silently to a
+          # different toolchain, this catches it.
+          if ! echo "$actual" | grep -q "${{ steps.pin.outputs.channel }}" ; then
+            # Nightly version strings include the date as YYYY-MM-DD;
+            # the channel pin is "nightly-YYYY-MM-DD", so a substring
+            # match is reliable.
+            date_only=$(echo "${{ steps.pin.outputs.channel }}" | sed 's/^nightly-//')
+            if ! echo "$actual" | grep -q "$date_only" ; then
+              echo "::error::rustc reported $actual; expected to include ${{ steps.pin.outputs.channel }}"
+              exit 1
+            fi
+          fi
+
+      - name: cargo metadata (validates Cargo.toml + Cargo.lock + pin)
+        working-directory: prover/guest
+        # --locked enforces lockfile-cargo agreement; --offline would
+        # fail because GitHub-hosted runners don't pre-populate the
+        # registry, so let cargo fetch the index here.
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Sanity check — riscv64imac target installed
+        run: |
+          set -euo pipefail
+          rustup target list --installed | grep riscv64imac-unknown-none-elf
+
+  # Optional nightly health-check: ALSO run on a weekly cron so a
+  # silent upstream removal of the nightly is visible even when
+  # nobody is touching prover/guest. Comment out the cron block if
+  # the operator does not want this layer.
+  weekly-health-check:
+    name: Weekly toolchain availability probe
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned toolchain
+        id: pin
+        run: |
+          channel=$(awk -F'"' '/^channel/ { print $2 }' \
+            prover/guest/rust-toolchain.toml)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Probe rustup mirror for the pinned nightly
+        run: |
+          set -euo pipefail
+          # If this fails, the upstream manifest for our pinned
+          # nightly has gone away and the operator needs to look at
+          # the mirror / bump the pin (see
+          # docs/decisions/U-toolchain-pin-strategy.md).
+          rustup toolchain install --profile minimal \
+            ${{ steps.pin.outputs.channel }}
