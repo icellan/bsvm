@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/icellan/bsvm/internal/db"
@@ -96,11 +97,41 @@ func BuildBridgeMonitor(
 		monitor.SetLocalShardID(uint32(chainID))
 	}
 
+	// L2-side rollback hook (decision S-withdrawal-and-rollback): when
+	// chaintracks reports a reorg the block-scan adapter calls
+	// monitor.RetractDepositsAbove, which now invokes this callback.
+	// The overlay node pauses the batcher and rolls back to the last
+	// finalized tip so wBSV mints from retracted deposits cannot be
+	// spent on speculative state. Operator must clear the halt via the
+	// admin API once the new BSV chain is settled.
+	if overlayNode != nil {
+		monitor.SetReorgRollbackCallback(func(bsvCommonAncestorHeight uint64) {
+			if err := overlayNode.HaltAndRollbackForReorg(bsvCommonAncestorHeight); err != nil {
+				// Halt was applied (BatcherPause runs first); the
+				// rollback may have failed. Log + carry on — operator
+				// will see the paused batcher.
+				slog.Error("HaltAndRollbackForReorg failed",
+					"bsvCommonAncestor", bsvCommonAncestorHeight,
+					"error", err,
+				)
+			}
+		})
+	}
+
 	// Replay any deposits the previous run already persisted so the
 	// in-memory dedup map is hot and re-delivered envelopes are
 	// idempotent.
 	if err := monitor.LoadProcessedDeposits(); err != nil {
 		return nil, nil, fmt.Errorf("bridge: load processed deposits: %w", err)
 	}
+
+	// TODO(S-followup): wire the bridge.Withdrawer here once the
+	// production WithdrawalScanner lands (see pkg/bridge/withdrawer.go).
+	// The signer should be the same FeeWallet PrivateKey used for
+	// covenant advances. The Withdrawer's ProcessFinalizedWithdrawalsLoop
+	// should be started in a goroutine alongside the deposit consumer
+	// so finalised withdrawals are claimed automatically against the
+	// bridge covenant.
+
 	return monitor, scriptHash, nil
 }

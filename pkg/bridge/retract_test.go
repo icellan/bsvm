@@ -109,3 +109,102 @@ func TestBridgeMonitor_RetractDepositsAbove_NoOp(t *testing.T) {
 		t.Fatalf("PendingCount = %d, want 1 (no-op)", got)
 	}
 }
+
+// TestBridgeMonitor_RetractDepositsAbove_FiresCallback verifies the L2
+// rollback hook is invoked exactly once per RetractDepositsAbove call,
+// receives the supplied minHeight, and runs after the monitor's
+// bookkeeping has been rolled back (so PendingCount inside the callback
+// reflects the post-retract state).
+func TestBridgeMonitor_RetractDepositsAbove_FiresCallback(t *testing.T) {
+	m, _ := newTestMonitor(t)
+
+	for i, h := range []uint64{100, 105, 110} {
+		var txid types.Hash
+		txid[0] = byte(i + 1)
+		dep := NewDepositWithVout(txid, uint32(i), h,
+			types.HexToAddress("0x6666666666666666666666666666666666666666"),
+			20_000,
+		)
+		m.pendingDeposits = append(m.pendingDeposits, dep)
+	}
+
+	var (
+		called      int
+		gotHeight   uint64
+		pendingSeen int
+	)
+	m.SetReorgRollbackCallback(func(bsvHeight uint64) {
+		called++
+		gotHeight = bsvHeight
+		pendingSeen = m.PendingCount()
+	})
+
+	m.RetractDepositsAbove(104)
+
+	if called != 1 {
+		t.Fatalf("callback fire count = %d, want 1", called)
+	}
+	if gotHeight != 104 {
+		t.Fatalf("callback bsvHeight = %d, want 104", gotHeight)
+	}
+	if pendingSeen != 1 {
+		t.Fatalf("callback observed PendingCount = %d, want 1 (post-retract)", pendingSeen)
+	}
+}
+
+// TestBridgeMonitor_RetractDepositsAbove_NoCallbackWithoutRegistration
+// ensures retraction works exactly as before when no callback has been
+// registered (backwards compatibility).
+func TestBridgeMonitor_RetractDepositsAbove_NoCallbackWithoutRegistration(t *testing.T) {
+	m, _ := newTestMonitor(t)
+
+	dep := NewDepositWithVout(
+		types.Hash{0xbb}, 0, 200,
+		types.HexToAddress("0x7777777777777777777777777777777777777777"),
+		25_000,
+	)
+	m.pendingDeposits = append(m.pendingDeposits, dep)
+
+	// Should not panic with a nil callback.
+	m.RetractDepositsAbove(150)
+
+	if got := m.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount = %d, want 0", got)
+	}
+}
+
+// TestBridgeMonitor_SetReorgRollbackCallback_ClearsWithNil verifies a
+// callback registered then cleared with nil no longer fires.
+func TestBridgeMonitor_SetReorgRollbackCallback_ClearsWithNil(t *testing.T) {
+	m, _ := newTestMonitor(t)
+
+	var called int
+	m.SetReorgRollbackCallback(func(uint64) { called++ })
+
+	dep := NewDepositWithVout(
+		types.Hash{0xcc}, 0, 300,
+		types.HexToAddress("0x8888888888888888888888888888888888888888"),
+		30_000,
+	)
+	m.pendingDeposits = append(m.pendingDeposits, dep)
+
+	m.RetractDepositsAbove(250)
+	if called != 1 {
+		t.Fatalf("first retract: callback fire count = %d, want 1", called)
+	}
+
+	// Clear callback.
+	m.SetReorgRollbackCallback(nil)
+
+	dep2 := NewDepositWithVout(
+		types.Hash{0xdd}, 0, 400,
+		types.HexToAddress("0x9999999999999999999999999999999999999999"),
+		40_000,
+	)
+	m.pendingDeposits = append(m.pendingDeposits, dep2)
+
+	m.RetractDepositsAbove(350)
+	if called != 1 {
+		t.Fatalf("after clear: callback fire count = %d, want 1 (unchanged)", called)
+	}
+}
