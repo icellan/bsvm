@@ -52,7 +52,10 @@ func (s *stubClient) GetUTXOs(ctx context.Context, address string) ([]UTXO, erro
 	return nil, nil
 }
 func (s *stubClient) ChainInfo(ctx context.Context) (*ChainInfo, error) { return nil, nil }
-func (s *stubClient) Ping(ctx context.Context) error                    { return nil }
+func (s *stubClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	return nil, nil
+}
+func (s *stubClient) Ping(ctx context.Context) error { return nil }
 
 func (s *stubClient) callsFor(txid [32]byte) int {
 	s.mu.Lock()

@@ -23,18 +23,18 @@
 //     monitor will re-detect any survivors when ProcessBlock runs
 //     against the new chain.
 //   - GetBlockTransactions resolves the height to a block hash via
-//     chaintracks, then calls the BSV-node RPC's `getblock <hash> 2`
-//     to project the verbose vout list into bridge.BSVTransaction.
-//     When no RPC provider is configured (operators on a deployment
-//     using only chaintracks plus WoC) this returns
-//     ErrBlockFetchUnsupported — the BEEF deposit path remains live,
-//     but the on-chain block-scan fallback is not available without
-//     an RPC node. WoC's per-tx fan-out path is left as a follow-up
-//     because every WoC GetTx burns one rate-limited API call; for a
-//     4 MB block that's multiple thousand calls and operators will
-//     routinely hit the daily quota. RPC is the realistic deployment
-//     shape for any operator who actually wants block-scan-based
-//     deposits.
+//     chaintracks, then dispatches by which upstream is wired:
+//     - RPC configured: call BSV-node's `getblock <hash> 2` and
+//       project the verbose vout list into bridge.BSVTransaction.
+//       This is the standard deployment shape (one RTT per block).
+//     - RPC absent, WoC present: fan out via WoC. Pull the txid
+//       manifest from `/block/hash/<hash>` then fetch each tx's raw
+//       bytes through the cached WoC client (which singleflight-
+//       de-dupes concurrent calls). Total fan-out is capped at
+//       wocBlockTxFanoutMax to prevent a pathologically packed block
+//       from exhausting an operator's daily WoC quota.
+//     - Neither: returns ErrBlockFetchUnsupported. The BEEF deposit
+//       path remains live but block scanning is unavailable.
 //   - GetTransaction delegates to WoC's cached client (W6-8) which
 //     transparently shares a singleflight gate so concurrent ParseDeposit
 //     ancestor lookups collapse to one RTT.
@@ -59,17 +59,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/transaction"
+
 	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/chaintracks"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/whatsonchain"
 )
 
+// WoC fan-out tunables. Exposed as package vars so the unit tests can
+// dial the worker pool down to deterministic single-threaded mode and
+// the cap down to a small number for cap-enforcement assertions.
+var (
+	// wocBlockTxFanoutWorkers caps the per-block GetTx concurrency. 8
+	// balances RTT-amortisation against burst-load on the WoC API.
+	wocBlockTxFanoutWorkers = 8
+	// wocBlockTxFanoutMax is the hard cap on per-block tx-fetches.
+	// Anything beyond this is anomalous (a normal BSV block fits
+	// comfortably under 10k txs); the surplus is logged + skipped so a
+	// pathological block can't single-handedly exhaust an operator's
+	// daily WoC quota.
+	wocBlockTxFanoutMax = 10000
+)
+
 // ErrBlockFetchUnsupported is returned by GetBlockTransactions when
-// no BSV-node RPC provider is configured and the block-fetch path has
-// no upstream to ask. Callers (the BridgeMonitor.Run loop) are
+// neither a BSV-node RPC provider NOR a WoC client is wired — there
+// is simply nowhere to ask. Callers (the BridgeMonitor.Run loop) are
 // expected to log + skip; the BEEF deposit path is unaffected.
-var ErrBlockFetchUnsupported = errors.New("bridge bsv client: getblock unsupported (no BSV-node RPC configured)")
+var ErrBlockFetchUnsupported = errors.New("bridge bsv client: getblock unsupported (no BSV-node RPC or WoC client configured)")
 
 // blockFetchTimeout caps each per-block RPC call. A verbose getblock on
 // a packed BSV block can ship multiple megabytes of JSON; 60s is
@@ -180,17 +197,38 @@ func (a *bridgeBSVClient) GetBlockHeight() (uint64, error) {
 }
 
 // GetBlockTransactions resolves height → block hash via chaintracks
-// then fetches the verbose block from the configured BSV-node RPC and
-// projects each tx's vout into bridge.BSVTransaction.
+// then fetches the block contents via one of two strategies:
 //
-// Returns ErrBlockFetchUnsupported when no RPC client is configured —
-// the BEEF path remains live but block scanning is unavailable.
+//  1. When a BSV-node JSON-RPC provider is configured (the standard
+//     deployment shape), call `getblock <hash> 2` and project each
+//     tx's vout into bridge.BSVTransaction. This is one HTTP RTT
+//     regardless of block size.
+//  2. When no RPC is wired but a WoC client is — the chaintracks-only
+//     deployment shape — fall back to the WoC fan-out path: pull the
+//     txid list from `/block/hash/<hash>` and fetch each tx's raw
+//     bytes through the cached WoC client (which de-dupes via
+//     singleflight). This burns N+1 WoC API calls per block, so we
+//     cap N at wocBlockTxFanoutMax to bound rate-limit damage on
+//     pathologically packed blocks.
+//
+// Returns ErrBlockFetchUnsupported when neither strategy is available
+// (no RPC, no WoC) — the BEEF path remains live but block scanning is
+// unavailable.
 func (a *bridgeBSVClient) GetBlockTransactions(height uint64) ([]*bridge.BSVTransaction, error) {
-	if a.rpc == nil {
-		return nil, ErrBlockFetchUnsupported
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), blockFetchTimeout)
 	defer cancel()
+	if a.rpc != nil {
+		return a.getBlockTransactionsViaRPC(ctx, height)
+	}
+	if a.woc != nil {
+		return a.getBlockTransactionsViaWoC(ctx, height)
+	}
+	return nil, ErrBlockFetchUnsupported
+}
+
+// getBlockTransactionsViaRPC is the legacy bsv-node path. Kept as a
+// helper so the dispatch in GetBlockTransactions stays readable.
+func (a *bridgeBSVClient) getBlockTransactionsViaRPC(ctx context.Context, height uint64) ([]*bridge.BSVTransaction, error) {
 	hdr, err := a.cht.HeaderByHeight(ctx, height)
 	if err != nil {
 		return nil, fmt.Errorf("bridge bsv client: header at %d: %w", height, err)
@@ -385,4 +423,166 @@ func reverseBytes(b []byte) []byte {
 		out[len(b)-1-i] = x
 	}
 	return out
+}
+
+// getBlockTransactionsViaWoC implements the chaintracks-only fallback:
+// fetch the block's txid manifest via WoC's `/block/hash/<hash>`
+// endpoint, then fan out one cached GetTx call per txid. Concurrent
+// fetches are bounded by wocBlockTxFanoutWorkers; total fetches per
+// block are capped by wocBlockTxFanoutMax.
+//
+// Per-tx output extraction reuses the go-sdk transaction parser so we
+// produce the exact same BSVTransaction shape the RPC verbose-block
+// path produces (modulo TxIndex semantics — see below). ParseDeposit
+// only inspects per-output {script, value} pairs and the txid, so
+// either path is interchangeable from the BridgeMonitor's perspective.
+func (a *bridgeBSVClient) getBlockTransactionsViaWoC(ctx context.Context, height uint64) ([]*bridge.BSVTransaction, error) {
+	hdr, err := a.cht.HeaderByHeight(ctx, height)
+	if err != nil {
+		return nil, fmt.Errorf("bridge bsv client: header at %d: %w", height, err)
+	}
+	txids, err := a.woc.GetBlockTxIDs(ctx, hdr.Hash)
+	if err != nil {
+		return nil, fmt.Errorf("bridge bsv client: GetBlockTxIDs %x: %w", hdr.Hash[:8], err)
+	}
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	if len(txids) > wocBlockTxFanoutMax {
+		a.logger.Warn("bridge block-scan: WoC fan-out cap reached, truncating",
+			"height", height,
+			"tx_count", len(txids),
+			"cap", wocBlockTxFanoutMax,
+		)
+		txids = txids[:wocBlockTxFanoutMax]
+	}
+
+	// Fan-out fetch with a bounded worker pool. We preserve block-
+	// internal tx ordering by keying results into a slice indexed by
+	// the txid's position in the manifest — workers may finish out of
+	// order but the caller's view is deterministic.
+	type fetchResult struct {
+		idx int
+		tx  *bridge.BSVTransaction
+		err error
+	}
+
+	workers := wocBlockTxFanoutWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(txids) {
+		workers = len(txids)
+	}
+
+	jobs := make(chan int, len(txids))
+	results := make(chan fetchResult, len(txids))
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if ctx.Err() != nil {
+					results <- fetchResult{idx: i, err: ctx.Err()}
+					continue
+				}
+				txid := txids[i]
+				raw, err := a.woc.GetTx(ctx, txid)
+				if err != nil {
+					if errors.Is(err, whatsonchain.ErrNotFound) {
+						// WoC reported missing — skip this tx. The
+						// block's deposit (if any) will be caught when
+						// the BEEF path runs against a live deposit.
+						results <- fetchResult{idx: i}
+						continue
+					}
+					results <- fetchResult{idx: i, err: fmt.Errorf("GetTx %x: %w", txid[:8], err)}
+					continue
+				}
+				bt, err := bsvTransactionFromRawBytes(txid, raw, height, uint(i))
+				if err != nil {
+					results <- fetchResult{idx: i, err: fmt.Errorf("parse tx %x: %w", txid[:8], err)}
+					continue
+				}
+				results <- fetchResult{idx: i, tx: bt}
+			}
+		}()
+	}
+	for i := range txids {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	out := make([]*bridge.BSVTransaction, len(txids))
+	var firstErr error
+	for r := range results {
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			a.logger.Debug("bridge block-scan: WoC fan-out tx fetch failed", "idx", r.idx, "err", r.err)
+			continue
+		}
+		out[r.idx] = r.tx
+	}
+	if firstErr != nil && allNil(out) {
+		// Every fetch failed — surface the first error so the caller
+		// can log it (vs silently returning an empty block).
+		return nil, fmt.Errorf("bridge bsv client: WoC fan-out at %d: %w", height, firstErr)
+	}
+	// Compact: drop nil holes (skipped/missing txs) but keep the
+	// surviving order. ParseDeposit doesn't care about the absolute
+	// TxIndex — it just needs the {script, value} pairs.
+	compact := out[:0]
+	for _, bt := range out {
+		if bt != nil {
+			compact = append(compact, bt)
+		}
+	}
+	return compact, nil
+}
+
+// bsvTransactionFromRawBytes parses canonical BSV tx bytes and
+// projects the outputs into a bridge.BSVTransaction. The txid passed
+// in is the WoC-supplied identifier; we trust it (the caller is the
+// cached WoC client which has already round-tripped the bytes).
+func bsvTransactionFromRawBytes(txid types.Hash, raw []byte, blockHeight uint64, txIndex uint) (*bridge.BSVTransaction, error) {
+	parsed, err := transaction.NewTransactionFromBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil {
+		return nil, errors.New("nil parsed tx")
+	}
+	bt := &bridge.BSVTransaction{
+		TxID:        txid,
+		BlockHeight: blockHeight,
+		TxIndex:     txIndex,
+		Outputs:     make([]bridge.BSVOutput, 0, len(parsed.Outputs)),
+	}
+	for _, o := range parsed.Outputs {
+		var script []byte
+		if o.LockingScript != nil {
+			script = []byte(*o.LockingScript)
+		}
+		bt.Outputs = append(bt.Outputs, bridge.BSVOutput{
+			Script: script,
+			Value:  o.Satoshis,
+		})
+	}
+	return bt, nil
+}
+
+// allNil reports whether every slot in xs is nil. Used by the fan-out
+// path to distinguish "every fetch failed" from "some succeeded".
+func allNil(xs []*bridge.BSVTransaction) bool {
+	for _, x := range xs {
+		if x != nil {
+			return false
+		}
+	}
+	return true
 }

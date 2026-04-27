@@ -59,6 +59,13 @@ type WhatsOnChainClient interface {
 	GetTx(ctx context.Context, txid [32]byte) ([]byte, error)
 	GetUTXOs(ctx context.Context, address string) ([]UTXO, error)
 	ChainInfo(ctx context.Context) (*ChainInfo, error)
+	// GetBlockTxIDs returns the txid list for a block, identified by
+	// its (BSV-internal little-endian) hash. Used by the bridge block
+	// scanner's WoC fan-out fallback when no BSV-node RPC is wired.
+	// The returned txids are in the same little-endian convention used
+	// elsewhere in BSVM (types.Hash). WoC speaks big-endian on the wire;
+	// the implementation handles the reversal.
+	GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error)
 	Ping(ctx context.Context) error
 }
 
@@ -180,6 +187,55 @@ func (c *Client) ChainInfo(ctx context.Context) (*ChainInfo, error) {
 	}
 	if w.BestHash != "" {
 		_ = decodeHashBE(w.BestHash, &out.BestHash)
+	}
+	return out, nil
+}
+
+// GetBlockTxIDs returns the list of txids in the block identified by
+// blockHash (BSVM-internal little-endian). The implementation hits
+// WoC's `/block/hash/<be-hex>` endpoint and decodes the `tx` field; WoC
+// returns txids in big-endian display hex, which we reverse before
+// surfacing so callers see the canonical little-endian byte order used
+// throughout BSVM.
+//
+// WoC paginates very-large blocks via `/block/hash/<hash>/page/<n>`,
+// but returns the full txid list inline for blocks below the page
+// threshold (typically a few thousand txs). For the bridge scanner's
+// use case — block-scan fallback when the operator runs chaintracks-
+// only — the inline list is sufficient: deposit blocks are small and
+// blocks that exceed the inline cap are bounded out at the consumer
+// side (see cmd/bsvm/bridge_bsv_client.go::wocBlockTxFanoutMax).
+func (c *Client) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	beHash := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		beHash[i] = blockHash[31-i]
+	}
+	body, err := c.get(ctx, "/block/hash/"+hex.EncodeToString(beHash))
+	if err != nil {
+		return nil, err
+	}
+	var w struct {
+		Tx []string `json:"tx"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("woc: block decode: %w", err)
+	}
+	out := make([][32]byte, 0, len(w.Tx))
+	for _, s := range w.Tx {
+		var h [32]byte
+		if err := decodeHashBE(s, &h); err != nil {
+			// One bad txid in the block payload is not worth aborting
+			// the whole fan-out; log-skip is the same posture
+			// parseVerboseBlock takes for malformed entries.
+			continue
+		}
+		// decodeHashBE writes the bytes in their on-the-wire (big-endian)
+		// order; reverse to BSVM-internal little-endian.
+		var le [32]byte
+		for i := 0; i < 32; i++ {
+			le[i] = h[31-i]
+		}
+		out = append(out, le)
 	}
 	return out, nil
 }

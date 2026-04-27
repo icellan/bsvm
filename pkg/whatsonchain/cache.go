@@ -112,6 +112,17 @@ func (c *CachedClient) GetUTXOs(ctx context.Context, address string) ([]UTXO, er
 	return c.upstream.GetUTXOs(ctx, address)
 }
 
+// GetBlockTxIDs passes through to upstream. The block→txids list is
+// content-addressed and could be cached, but the bridge scanner only
+// fetches each block's index once per height-event and a chaintracks-
+// only deployment will only fall back here on rare deposits, so the
+// LRU bookkeeping isn't worth the memory cost. The per-tx GetTx fan-
+// out IS cached (see GetTx), which is where the rate-limit pressure
+// actually lives.
+func (c *CachedClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	return c.upstream.GetBlockTxIDs(ctx, blockHash)
+}
+
 // ChainInfo is intentionally NOT cached — the tip moves with each
 // new block.
 func (c *CachedClient) ChainInfo(ctx context.Context) (*ChainInfo, error) {
