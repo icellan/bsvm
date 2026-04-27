@@ -143,6 +143,26 @@ pub struct HostInput {
     pub block_context: BlockContext,
     /// REQUIRED. The comparator does not hardcode a chain ID.
     pub chain_id: u64,
+    /// Addresses to include in `post_state_digest`, in any order.
+    /// MUST cover every account whose post-state the Go side will
+    /// hash on its end. Unknown addresses are treated as missing
+    /// accounts (zero nonce/balance, empty code, empty storage) so
+    /// both sides hash the same shape regardless of whether revm
+    /// touched them.
+    ///
+    /// When omitted, the comparator falls back to "every account in
+    /// revm's CacheDB sorted by address" — convenient for ad-hoc runs
+    /// but order-sensitive: the Go side must use the same enumeration.
+    /// The harness always sets this explicitly.
+    #[serde(default)]
+    pub digest_addresses: Vec<String>,
+    /// Per-address storage keys to include in the digest. The map is
+    /// keyed by address (lowercase hex, no 0x prefix to match the
+    /// harness wire format). Addresses absent from the map contribute
+    /// only their account fields, no storage. Slot keys are 32-byte
+    /// hex strings.
+    #[serde(default)]
+    pub digest_storage_keys: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 // ─── Wire format (output) ────────────────────────────────────────────────────
@@ -323,7 +343,11 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
     }
 
     // ── Build the post-state digest from revm's CacheDB ─────────────────
-    let post_state_digest = compute_post_state_digest(&db);
+    let post_state_digest = compute_post_state_digest(
+        &db,
+        &input.digest_addresses,
+        &input.digest_storage_keys,
+    )?;
 
     // ── Receipts hash (matches guest's rlp_encode_receipts) ─────────────
     let receipts_rlp = rlp_encode_receipts(&receipts);
@@ -370,48 +394,99 @@ struct Log {
 
 // ─── Hashing / digest helpers ────────────────────────────────────────────────
 
-/// Compute a deterministic, byte-stable digest of revm's post-state.
+/// Compute a deterministic, byte-stable digest of revm's post-state
+/// over a caller-specified set of (address, slot-keys) pairs.
 ///
-/// Layout (sha256-of-the-following):
+/// The digest format is:
 ///
-///     for each account, sorted by address ascending:
+///     for each address in `digest_addresses`, sorted ascending:
 ///         address (20 bytes)
 ///         nonce   (u64 BE)
 ///         balance (32 bytes BE)
 ///         code_hash (32 bytes)
 ///         storage_count (u32 BE)
-///         for each storage slot, sorted by key ascending:
+///         for each slot key in `digest_storage_keys[address]`,
+///           sorted ascending:
 ///             key   (32 bytes)
 ///             value (32 bytes)
 ///
+/// then sha256 of the concatenation.
+///
 /// This is NOT an Ethereum state root — that would require an MPT, and
 /// porting one into the comparator is explicitly out of scope. The Go
-/// test computes the same digest from the post-state DB on its side.
-/// Byte-for-byte equality of this digest implies every account's
-/// nonce/balance/code/storage survived the batch identically on both
-/// EVMs, which is the actual property the dual-EVM equivalence
-/// guarantee cares about.
-fn compute_post_state_digest(db: &CacheDB<EmptyDB>) -> [u8; 32] {
-    let mut sorted: BTreeMap<Address, &revm::database::DbAccount> = BTreeMap::new();
-    for (addr, acct) in db.cache.accounts.iter() {
-        sorted.insert(*addr, acct);
+/// test computes the same digest from the post-state DB on its side
+/// over the same address + slot set. Byte-for-byte equality implies
+/// every observable account/storage value survived the batch
+/// identically on both EVMs, which is the property the dual-EVM
+/// equivalence guarantee cares about.
+///
+/// Missing accounts and missing slots digest as zeros (so a slot read
+/// that returns the empty value digests the same as an absent entry).
+/// This keeps the Go and Rust sides byte-identical even when one EVM
+/// happens to materialise a slot that the other left as a default.
+///
+/// When `digest_addresses` is empty, the function falls back to
+/// "every account in revm's CacheDB plus every storage slot we know
+/// about" — useful for ad-hoc runs but the Go side has no easy way to
+/// enumerate the same set, so the production harness always supplies
+/// the address list explicitly.
+fn compute_post_state_digest(
+    db: &CacheDB<EmptyDB>,
+    digest_addresses: &[String],
+    digest_storage_keys: &BTreeMap<String, Vec<String>>,
+) -> Result<[u8; 32], String> {
+    // Address-set: explicit list when provided; otherwise the cache.
+    let addresses: BTreeMap<Address, ()> = if digest_addresses.is_empty() {
+        db.cache.accounts.keys().map(|a| (*a, ())).collect()
+    } else {
+        let mut out: BTreeMap<Address, ()> = BTreeMap::new();
+        for s in digest_addresses {
+            out.insert(parse_address(s)?, ());
+        }
+        out
+    };
+
+    // Pre-parse storage keys into U256 sorted-by-address-then-key.
+    let mut slot_keys_by_addr: BTreeMap<Address, BTreeMap<U256, ()>> = BTreeMap::new();
+    if digest_addresses.is_empty() {
+        for (addr, acct) in db.cache.accounts.iter() {
+            let entry = slot_keys_by_addr.entry(*addr).or_default();
+            for k in acct.storage.keys() {
+                entry.insert(*k, ());
+            }
+        }
+    } else {
+        for (addr_hex, keys) in digest_storage_keys.iter() {
+            let addr = parse_address(addr_hex)?;
+            let entry = slot_keys_by_addr.entry(addr).or_default();
+            for k in keys {
+                entry.insert(U256::from_be_bytes(parse_b32(k)?), ());
+            }
+        }
     }
 
     let mut hasher = Sha256::new();
-    for (addr, acct) in sorted.iter() {
-        let info = &acct.info;
+    for addr in addresses.keys() {
+        let (nonce, balance, code_hash) = match db.cache.accounts.get(addr) {
+            Some(a) => (a.info.nonce, a.info.balance, a.info.code_hash),
+            None => (0u64, U256::ZERO, KECCAK_EMPTY),
+        };
         hasher.update(addr.as_slice());
-        hasher.update(&info.nonce.to_be_bytes());
-        hasher.update(&info.balance.to_be_bytes::<32>());
-        hasher.update(info.code_hash.as_slice());
+        hasher.update(&nonce.to_be_bytes());
+        hasher.update(&balance.to_be_bytes::<32>());
+        hasher.update(code_hash.as_slice());
 
-        let mut slots: BTreeMap<U256, U256> = BTreeMap::new();
-        for (k, v) in acct.storage.iter() {
-            slots.insert(*k, *v);
-        }
+        let empty: BTreeMap<U256, ()> = BTreeMap::new();
+        let slots = slot_keys_by_addr.get(addr).unwrap_or(&empty);
         let count = slots.len() as u32;
         hasher.update(&count.to_be_bytes());
-        for (k, v) in slots.iter() {
+        for k in slots.keys() {
+            let v = db
+                .cache
+                .accounts
+                .get(addr)
+                .and_then(|a| a.storage.get(k).copied())
+                .unwrap_or(U256::ZERO);
             hasher.update(&k.to_be_bytes::<32>());
             hasher.update(&v.to_be_bytes::<32>());
         }
@@ -420,7 +495,7 @@ fn compute_post_state_digest(db: &CacheDB<EmptyDB>) -> [u8; 32] {
     let out = hasher.finalize();
     let mut buf = [0u8; 32];
     buf.copy_from_slice(&out);
-    buf
+    Ok(buf)
 }
 
 /// hash256(x) = SHA256(SHA256(x)). Matches BSV's OP_HASH256 and the
@@ -638,6 +713,8 @@ mod tests {
                 prev_randao: String::new(),
             },
             chain_id: 0,
+            digest_addresses: Vec::new(),
+            digest_storage_keys: std::collections::BTreeMap::new(),
         };
         let err = run_batch(&input).unwrap_err();
         assert!(err.contains("chain_id"), "err: {err}");
@@ -661,6 +738,8 @@ mod tests {
                 prev_randao: String::new(),
             },
             chain_id: 1337,
+            digest_addresses: Vec::new(),
+            digest_storage_keys: std::collections::BTreeMap::new(),
         };
         let out = run_batch(&input).expect("empty batch should succeed");
         assert_eq!(out.gas_used, 0);
