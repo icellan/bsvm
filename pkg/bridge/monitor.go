@@ -63,6 +63,21 @@ type depositID struct {
 	Vout uint32
 }
 
+// ReorgRollbackCallback is invoked from RetractDepositsAbove after the
+// monitor's own bookkeeping has been rolled back. The argument is the
+// minHeight passed to RetractDepositsAbove — i.e. the BSV block height
+// at the common ancestor; deposits strictly above that height have been
+// dropped. Implementers (typically the OverlayNode) translate this into
+// an L2-side response: pause the batcher, roll back to a safe L2
+// checkpoint, and require operator intervention to resume.
+//
+// The callback runs on the goroutine that called RetractDepositsAbove,
+// which is the chaintracks reorg-event pump. It MUST NOT block on
+// mutexes the monitor holds (the monitor mutex is released before the
+// callback fires) but should otherwise return promptly so the next
+// reorg event can be processed.
+type ReorgRollbackCallback func(bsvCommonAncestorHeight uint64)
+
 // BridgeMonitor watches the BSV blockchain for deposits to the bridge
 // covenant and submits corresponding system transactions to the L2
 // overlay node.
@@ -76,6 +91,7 @@ type BridgeMonitor struct {
 	processedDeposits map[depositID]bool
 	pendingDeposits   []*Deposit
 	lastHorizon       uint64
+	reorgRollbackCB   ReorgRollbackCallback
 	mu                sync.Mutex
 }
 
@@ -118,6 +134,23 @@ func (m *BridgeMonitor) LocalShardID() uint32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.localShardID
+}
+
+// SetReorgRollbackCallback registers a callback that fires after every
+// non-empty RetractDepositsAbove call. The callback is the L2-side
+// rollback hook — it lets the OverlayNode pause the batcher and roll
+// back its execution tip to a safe checkpoint when the BSV monitor
+// observes a reorg that retracted previously credited deposits.
+//
+// Pass nil to clear a previously registered callback. The callback is
+// invoked once per RetractDepositsAbove call regardless of how many
+// deposits were dropped, including zero — overlays that want to
+// distinguish "reorg observed but nothing to undo" from "deposits
+// retracted" should compare PendingCount() before / after.
+func (m *BridgeMonitor) SetReorgRollbackCallback(cb ReorgRollbackCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reorgRollbackCB = cb
 }
 
 // depositKey builds the DB key for a deposit: "d" + txid(32) + vout(4 BE).
@@ -439,13 +472,14 @@ func (m *BridgeMonitor) ValidateHorizon(horizon uint64, observedBSVTip uint64) e
 // call will re-credit any deposits that survive the reorg.
 //
 // Deposits that have already been MarkProcessed'd by the L2 inclusion
-// path are still rolled back here. The L2-side rollback (overlay
-// re-execute / Block.SafeHead retreat) is the responsibility of the
-// reorg subscriber that calls this — this method only reverses the
-// monitor's own bookkeeping.
+// path are still rolled back here. The L2-side rollback is delegated to
+// the ReorgRollbackCallback registered via SetReorgRollbackCallback —
+// the typical implementation pauses the overlay batcher and rolls back
+// the execution tip to a safe checkpoint. Without a callback this
+// method only reverses the monitor's own bookkeeping (matching the
+// pre-callback behaviour).
 func (m *BridgeMonitor) RetractDepositsAbove(minHeight uint64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Drop in-memory pending entries above the height.
 	filtered := m.pendingDeposits[:0]
@@ -459,32 +493,41 @@ func (m *BridgeMonitor) RetractDepositsAbove(minHeight uint64) {
 	m.pendingDeposits = filtered
 
 	// Drop persisted entries above the height.
-	if m.db == nil {
-		return
+	if m.db != nil {
+		const dkLen = 1 + 32 + 4
+		iter := m.db.NewIterator(depositPrefix, nil)
+		var toDelete [][]byte
+		for iter.Next() {
+			key := iter.Key()
+			if len(key) != dkLen {
+				continue
+			}
+			dep, err := decodeDeposit(iter.Value())
+			if err != nil {
+				continue
+			}
+			if dep.BSVBlockHeight > minHeight {
+				// Copy the key — iter.Key()'s slice is reused.
+				k := make([]byte, len(key))
+				copy(k, key)
+				toDelete = append(toDelete, k)
+				delete(m.processedDeposits, depositID{dep.BSVTxID, dep.Vout})
+			}
+		}
+		iter.Release()
+		for _, k := range toDelete {
+			_ = m.db.Delete(k)
+		}
 	}
-	const dkLen = 1 + 32 + 4
-	iter := m.db.NewIterator(depositPrefix, nil)
-	var toDelete [][]byte
-	for iter.Next() {
-		key := iter.Key()
-		if len(key) != dkLen {
-			continue
-		}
-		dep, err := decodeDeposit(iter.Value())
-		if err != nil {
-			continue
-		}
-		if dep.BSVBlockHeight > minHeight {
-			// Copy the key — iter.Key()'s slice is reused.
-			k := make([]byte, len(key))
-			copy(k, key)
-			toDelete = append(toDelete, k)
-			delete(m.processedDeposits, depositID{dep.BSVTxID, dep.Vout})
-		}
-	}
-	iter.Release()
-	for _, k := range toDelete {
-		_ = m.db.Delete(k)
+
+	cb := m.reorgRollbackCB
+	m.mu.Unlock()
+
+	// Fire the L2-side rollback hook outside the monitor mutex so the
+	// callback is free to acquire its own locks (typically the
+	// OverlayNode mutex) without risking deadlock.
+	if cb != nil {
+		cb(minHeight)
 	}
 }
 

@@ -52,6 +52,15 @@ type PendingWithdrawal struct {
 }
 
 // WithdrawalScanner scans L2 blocks for pending withdrawal events.
+//
+// TODO(S-followup): no production implementation exists yet. The
+// daemon-side scanner needs to (a) iterate ChainDB blocks from
+// finalizedTip back to the bridge's lastClaimedNonce, (b) extract
+// WithdrawalInitiated logs from receipts, (c) populate
+// PendingWithdrawal.BatchHashes from the prover-side withdrawal-tree
+// leaves persisted alongside each batch, and (d) filter against
+// FinalizedTip so claims only fire after BSV finality. Without it
+// `ProcessFinalizedWithdrawals` cannot be invoked from cmd/bsvm.
 type WithdrawalScanner interface {
 	// ScanPendingWithdrawals returns all unclaimed withdrawals in
 	// nonce order, starting from the first unclaimed nonce.
