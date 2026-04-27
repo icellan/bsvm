@@ -125,13 +125,12 @@ func BuildBridgeMonitor(
 		return nil, nil, fmt.Errorf("bridge: load processed deposits: %w", err)
 	}
 
-	// TODO(S-followup): wire the bridge.Withdrawer here once the
-	// production WithdrawalScanner lands (see pkg/bridge/withdrawer.go).
-	// The signer should be the same FeeWallet PrivateKey used for
-	// covenant advances. The Withdrawer's ProcessFinalizedWithdrawalsLoop
-	// should be started in a goroutine alongside the deposit consumer
-	// so finalised withdrawals are claimed automatically against the
-	// bridge covenant.
+	// The bridge.Withdrawer claim-loop is wired in main.go (see the
+	// "8.2 Bridge.Withdrawer claim loop" section + cmd/bsvm/
+	// withdrawal_wiring.go). It needs the fee-wallet signer + BSV RPC
+	// provider produced by wireBSVBroadcast, neither of which is in
+	// scope here, so the wiring lives one level up where both are
+	// available alongside the BridgeMonitor.
 
 	return monitor, scriptHash, nil
 }

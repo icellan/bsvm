@@ -52,26 +52,48 @@ type bsvWireOpts struct {
 	Provider BSVProviderClient
 }
 
+// bsvBroadcastResult captures the post-wiring artefacts callers may
+// need to drive other subsystems (currently: the bridge.Withdrawer
+// claim-tx loop, which signs with the same fee-wallet key the
+// covenant-advance path uses). All fields are non-nil on success.
+type bsvBroadcastResult struct {
+	// FeeSigner is the runar.LocalSigner over the fee-wallet
+	// PrivateKey. Suitable for SignInput-style protocols (the wallet
+	// consolidation, withdrawal claims, etc.).
+	FeeSigner *runar.LocalSigner
+	// FeeAddress is the canonical P2PKH address derived from the fee
+	// key for the active BSV network.
+	FeeAddress string
+	// Provider is the BSV-node JSON-RPC client the broadcast stack
+	// uses. Returned so downstream wiring re-uses the same instance
+	// rather than spawning a second connection pool.
+	Provider BSVProviderClient
+}
+
 // wireBSVBroadcast builds the full covenant-advance broadcast stack —
 // fee wallet, BSV JSON-RPC provider, Rúnar signer, deployed-contract
 // binding, RunarBroadcastClient — and attaches it to the overlay's
 // covenant manager. It also starts the confirmation watcher goroutine.
-func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
+//
+// On success it returns a result struct exposing the fee signer,
+// address, and provider so downstream wiring (the bridge.Withdrawer
+// loop in particular) can re-use them without re-deriving the key.
+func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResult, error) {
 	// 1. Persist/load the fee-wallet key.
 	feeKey, err := LoadOrCreateFeeWalletKey(opts.DataDir)
 	if err != nil {
-		return fmt.Errorf("fee-wallet key: %w", err)
+		return nil, fmt.Errorf("fee-wallet key: %w", err)
 	}
 	feeAddr, err := FeeWalletBSVAddress(feeKey, opts.NodeCfg.BSV.Network)
 	if err != nil {
-		return fmt.Errorf("fee-wallet address: %w", err)
+		return nil, fmt.Errorf("fee-wallet address: %w", err)
 	}
 	slog.Info("fee-wallet key loaded", "address", feeAddr)
 
 	// 2. FeeWallet backed by the shared LevelDB.
 	feeWallet := overlay.NewFeeWallet(opts.DB)
 	if err := feeWallet.LoadFromDB(); err != nil {
-		return fmt.Errorf("fee-wallet load from DB: %w", err)
+		return nil, fmt.Errorf("fee-wallet load from DB: %w", err)
 	}
 	slog.Info("fee-wallet initialized", "balance_sats", feeWallet.Balance())
 
@@ -88,10 +110,10 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 	if provider == nil {
 		p, provErr := BuildBSVProvider(opts.NodeCfg.BSV)
 		if provErr != nil {
-			return fmt.Errorf("BSV RPC provider: %w", provErr)
+			return nil, fmt.Errorf("BSV RPC provider: %w", provErr)
 		}
 		if p == nil {
-			return fmt.Errorf("BSV RPC provider: no node_url(s) configured")
+			return nil, fmt.Errorf("BSV RPC provider: no node_url(s) configured")
 		}
 		provider = p
 	}
@@ -106,7 +128,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 	feeKeyHex := hex.EncodeToString(feeKey.Serialize())
 	localSigner, err := runar.NewLocalSigner(feeKeyHex)
 	if err != nil {
-		return fmt.Errorf("runar signer: %w", err)
+		return nil, fmt.Errorf("runar signer: %w", err)
 	}
 	signerPubKey, _ := localSigner.GetPublicKey()
 	signer := runar.NewExternalSigner(
@@ -120,29 +142,29 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 	// 6. Re-derive the deployed contract via FromTxId.
 	contractSrc, constructorArgs, err := selectRollupSourceForBoot(opts)
 	if err != nil {
-		return fmt.Errorf("selecting rollup source: %w", err)
+		return nil, fmt.Errorf("selecting rollup source: %w", err)
 	}
 
 	gocompArtifact, err := gocompiler.CompileFromSource(contractSrc, gocompiler.CompileOptions{
 		ConstructorArgs: constructorArgs,
 	})
 	if err != nil {
-		return fmt.Errorf("recompiling rollup contract: %w", err)
+		return nil, fmt.Errorf("recompiling rollup contract: %w", err)
 	}
 
 	sdkArtifact, err := goCompilerToSDKArtifact(gocompArtifact)
 	if err != nil {
-		return fmt.Errorf("converting compiler artifact to SDK artifact: %w", err)
+		return nil, fmt.Errorf("converting compiler artifact to SDK artifact: %w", err)
 	}
 
 	// Strip 0x prefix — bitcoind's getrawtransaction rejects it.
 	genesisTxIDHex, genesisVout, err := genesisOutpointFromOpts(opts)
 	if err != nil {
-		return fmt.Errorf("genesis outpoint: %w", err)
+		return nil, fmt.Errorf("genesis outpoint: %w", err)
 	}
 	contract, err := runar.FromTxId(sdkArtifact, genesisTxIDHex, int(genesisVout), provider)
 	if err != nil {
-		return fmt.Errorf("loading deployed contract: %w", err)
+		return nil, fmt.Errorf("loading deployed contract: %w", err)
 	}
 	slog.Info("covenant contract bound", "txid", genesisTxIDHex, "vout", genesisVout)
 
@@ -158,7 +180,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 		Mode:          covenant.ProofModeFRI,
 	})
 	if err != nil {
-		return fmt.Errorf("broadcast client: %w", err)
+		return nil, fmt.Errorf("broadcast client: %w", err)
 	}
 	opts.CovenantMgr.SetBroadcastClient(broadcastClient)
 	slog.Info("broadcast client attached")
@@ -197,7 +219,11 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) error {
 	opts.OverlayNode.StartFeeWalletReconciler(provider, feeAddr, 30*time.Second)
 	slog.Info("fee-wallet reconciler started", "poll_interval", "30s")
 
-	return nil
+	return &bsvBroadcastResult{
+		FeeSigner:  localSigner,
+		FeeAddress: feeAddr,
+		Provider:   provider,
+	}, nil
 }
 
 // rollupSourceInputs is the minimal set of fields both the legacy
