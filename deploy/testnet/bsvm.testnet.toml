@@ -1,0 +1,256 @@
+# =============================================================================
+# bsvm.testnet.toml — BSV testnet boot config for a single BSVM L2 node
+# =============================================================================
+#
+# Status: TESTNET ONLY. This config is sized for a single operator running
+# one node against BSV testnet. It is NOT a mainnet template — endpoints
+# default to public testnet services and AcceptUnverifiedBridgeDeposits
+# is intentionally false, so set up real chaintracks/BSV-RPC creds before
+# expecting deposits to credit.
+#
+# Conventions used below:
+#
+#   # REQUIRED: <field>  — operator MUST replace the placeholder before boot
+#   # default: <value>   — what bsvm assumes if the field is omitted
+#   # optional           — safe to remove; documented for completeness
+#
+# All time values are parsed via time.ParseDuration ("30s", "5m", "1h").
+# All hex fields are unprefixed (no leading "0x") unless the schema
+# explicitly accepts it.
+# =============================================================================
+
+# REQUIRED: per-host data dir; the daemon will write chaindata, indexer,
+# fee_wallet.wif, covenant.anf.json + shard.json under here. boot-testnet.sh
+# overrides this via BSVM_DATADIR / --datadir but the file value is the
+# fallback when invoked directly (e.g. `bsvm run --config bsvm.testnet.toml`).
+datadir = "./data/testnet"
+
+# default: "" — leave empty unless you want to pin a custom genesis manifest
+# JSON path; otherwise the daemon reads the manifest off the genesis tx
+# (--genesis-txid) or from <datadir>/shard.json (legacy).
+genesis = ""
+
+log_level  = "info"   # debug | info | warn | error  (default: info)
+log_format = "json"   # text | json                  (default: text — json is easier to grep on a long-running node)
+
+# -----------------------------------------------------------------------------
+# [shard] — identifies which shard this node is joining
+# -----------------------------------------------------------------------------
+# REQUIRED for any non-genesis-txid boot. If you boot with `--genesis-txid`
+# (the Phase 8 path) the daemon fills these from the manifest in vout 1 of
+# the genesis tx and you can leave this entire section empty.
+[shard]
+chain_id              = 8453111   # REQUIRED: EVM chain ID. 8453111 is the convention used by spec-12 testnet shards. Pick something that doesn't collide with a public chain.
+genesis_covenant_txid = ""        # REQUIRED: hex BSV txid of the deploy-shard tx. Get from `bsvm deploy-shard --bsv-network testnet` output.
+genesis_covenant_vout = 0         # default: 0 — covenant lives at vout 0
+covenant_sats         = 10000     # default: 10000 — locked in the covenant UTXO; must equal what deploy-shard wrote
+
+# -----------------------------------------------------------------------------
+# [overlay] — execution + batch flush behaviour
+# -----------------------------------------------------------------------------
+[overlay]
+coinbase                = "0x0000000000000000000000000000000000000000"  # REQUIRED for execute/prove modes: address that earns the L2 coinbase fee on this node's batches. Burn address is fine for read-only followers.
+block_gas_limit         = 30000000      # default: 30000000
+batch_size              = 128           # default: 128 — txs per batch
+max_batch_flush_delay   = "2s"          # default: 2s
+min_gas_price           = "1000000000"  # default: 1 gwei (in wei, decimal)
+max_speculative_depth   = 16            # default: 16 — how many speculative blocks we hold before stalling
+
+# -----------------------------------------------------------------------------
+# [rpc] — JSON-RPC + WS surface (also hosts /bsvm/* BEEF endpoints)
+# -----------------------------------------------------------------------------
+[rpc]
+http_addr     = "0.0.0.0:8545"      # default: 0.0.0.0:8545. Bind to 127.0.0.1 if you don't want public exposure.
+ws_addr       = "0.0.0.0:8546"      # default: 0.0.0.0:8546
+cors_origins  = ["*"]               # default: ["*"]. Tighten to your dApp origin in production.
+
+# -----------------------------------------------------------------------------
+# [prover] — STARK prover backend
+# -----------------------------------------------------------------------------
+# Testnet runs typically use mode = "local" so each node generates its own
+# proof against the local SP1 toolchain. Set workers > 1 only if the host
+# has the RAM to run multiple SP1 processes (≈8 GB each).
+[prover]
+mode    = "local"   # mock | local | network  (default: mock — must override for testnet so proofs are real)
+workers = 1         # default: 1
+
+# -----------------------------------------------------------------------------
+# [network] — libp2p P2P gossip
+# -----------------------------------------------------------------------------
+[network]
+listen_addr      = "/ip4/0.0.0.0/tcp/9945"   # default
+bootstrap_peers  = [
+    # REQUIRED if this node is a follower booting via genesis-sync. Use
+    # the multiaddr printed by `bsvm peer-id <seed>` on the seed node,
+    # e.g. "/dns4/seed1.testnet.example/tcp/9945/p2p/12D3Koo...".
+    # "/dns4/seed1.testnet.example/tcp/9945/p2p/REPLACE_ME",
+]
+max_peers         = 50         # default: 50
+identity_seed_hex = ""         # optional: 64-char hex seed for deterministic peer IDs. Leave blank for random per-boot identity.
+
+# -----------------------------------------------------------------------------
+# [bsv] — BSV-node RPC + ARC + chaintracks + fee wallet
+# -----------------------------------------------------------------------------
+[bsv]
+network = "testnet"  # REQUIRED: must match the network of every endpoint below
+
+# --- BSV-node JSON-RPC (W6-11 failover wrapper) ----------------------------
+# REQUIRED for prover nodes (prove modes "execute" / "prove"). Followers
+# (BSVM_NODE_ROLE=follower) can leave both fields empty and sync via P2P.
+node_url  = ""    # default: "" — legacy single endpoint; prefer node_urls
+node_urls = [
+    # REQUIRED: at least one BSV testnet JSON-RPC endpoint. Format is
+    # "http://<rpcuser>:<rpcpass>@<host>:<port>/". Substitute your own
+    # node creds; the placeholder will not connect.
+    # "http://USER:PASS@bsv-testnet-primary.example:18332/",
+    # "http://USER:PASS@bsv-testnet-secondary.example:18332/",
+]
+node_max_consecutive_failures = 3       # default: 3
+node_cooldown                  = "30s"  # default: 30s
+
+# --- Fee wallet (testnet BSV) ----------------------------------------------
+# default: <datadir>/fee_wallet.wif — auto-created on first boot.
+# Set explicitly only if you want to share a fee wallet across nodes.
+fee_wallet_key = ""
+
+# --- Confirmations + WoC cache ---------------------------------------------
+confirmations  = 6      # default: 6 — applied to bridge-deposit minting
+woc_cache_size = 1000   # default: 1000 — LRU bound for cached WoC GetTx hits
+
+# --- ARC broadcast (W6-3 multi-endpoint fan-out) ---------------------------
+# Required when prover nodes need to broadcast advance txs. Followers
+# don't need ARC. Multiple endpoints recommended for resilience; ARC
+# providers can refuse a tx silently and a single-endpoint setup will
+# stall the prover.
+arc_url             = ""               # default: "" — legacy single endpoint; prefer [[bsv.arc_endpoint]] below
+arc_strategy        = "first_success"  # first_success | quorum  (default: first_success)
+arc_quorum          = 0                # required only when arc_strategy = "quorum"
+arc_default_timeout = "30s"            # default: 30s
+arc_callback_url    = ""               # optional: public URL ARC will POST status updates to (https://yourhost/bsvm/arc/callback). Leave empty if no public ingress.
+arc_callback_token  = ""               # optional: legacy bearer for X-CallbackToken auth; prefer BRC-104 below
+
+# REQUIRED for prove modes execute/prove on testnet: at least one ARC endpoint.
+[[bsv.arc_endpoint]]
+name          = "taal-testnet"
+url           = "https://arc-test.taal.com"   # REQUIRED: substitute with your ARC provider URL.
+auth_token    = ""                            # optional: fill with the bearer token your ARC provider issued
+timeout       = "30s"                         # default: inherits arc_default_timeout
+max_retries   = 1                             # default: 1
+retry_backoff = "100ms"                       # default: 100ms
+
+# Example second endpoint — uncomment + customise for redundancy:
+# [[bsv.arc_endpoint]]
+# name          = "gorillapool-testnet"
+# url           = "https://arc.gorillapool.io"
+# auth_token    = ""
+# timeout       = "30s"
+# max_retries   = 1
+# retry_backoff = "100ms"
+
+# --- BRC-104 mutual-auth on inbound ARC callbacks (W6-10) ------------------
+# Disabled by default — flip enabled = true and pin at least one identity
+# once your ARC provider supports BRC-104. Until then leave allow_token = true
+# so the legacy X-CallbackToken header still works.
+[bsv.arc_brc104]
+enabled         = false   # default: false
+timestamp_window = "60s"  # default: 60s
+nonce_cache_size = 8192   # default: 8192
+allow_token      = true   # default: false in spec but true here for migration grace
+
+# Example pinned identity — uncomment + paste the ARC server's identity pubkey:
+# [[bsv.arc_brc104.identity]]
+# name           = "arc-testnet"
+# public_key_hex = "02..."   # 33-byte compressed or 65-byte uncompressed secp256k1 pubkey
+
+# --- Chaintracks header oracle (W6-2 quorum) -------------------------------
+# REQUIRED on every node — without it BEEF deposit verification stays in
+# fail-closed mode (envelopes accepted but never minted on L2). Default
+# ships ONE provider; bump quorum_m + add providers for cross-checking.
+[bsv.chaintracks]
+quorum_strategy        = "hybrid"   # hybrid | m_of_n  (default: hybrid)
+quorum_m               = 1          # default: 1 — testnet single-provider OK; mainnet should be >=2
+disagreement_action    = "log"      # log | drop | halt  (default: log)
+disagreement_cooldown  = "10m"      # default: 10m
+response_timeout       = "5s"       # default: 5s
+stream_skew_window     = "750ms"    # default: 750ms
+stream_buffer_max      = 32         # default: 32
+
+[[bsv.chaintracks.providers]]
+name    = "bhs-testnet-primary"
+url     = "https://chaintracks-testnet.example/api/v1"  # REQUIRED: substitute with a real Block Headers Service URL serving testnet headers (e.g. your own deployment of github.com/bsv-blockchain/block-headers-service in testnet mode).
+api_key = ""                                            # optional: bearer auth if your BHS requires it
+weight  = 1                                             # default: 1
+timeout = "5s"                                          # default: inherits response_timeout
+enabled = true
+
+# Optional secondary — uncomment + bump quorum_m above to 2 for cross-check:
+# [[bsv.chaintracks.providers]]
+# name    = "bhs-testnet-secondary"
+# url     = "https://headers.other-testnet.example/api/v1"  # REQUIRED if uncommented
+# api_key = ""
+# weight  = 1
+# timeout = "5s"
+# enabled = true
+
+# -----------------------------------------------------------------------------
+# [bridge] — BSV → L2 deposit + L2 → BSV withdrawal parameters
+# -----------------------------------------------------------------------------
+[bridge]
+min_deposit_satoshis     = 10000   # default: 10000 (~$0.001 testnet)
+min_withdrawal_satoshis  = 10000   # default: 10000
+bsv_confirmations        = 6       # default: 6 — required L1 confs before mint
+# REQUIRED for any node that should credit deposits: the hex-encoded locking
+# script of the deployed bridge covenant on testnet. Get this from the bridge
+# deploy artifact (covenant.anf.json's `bridge_locking_script_hex`). When
+# empty the BEEF consumer falls through to fail-closed (envelope stored,
+# no L2 credit) and you'll see a "bridge monitor not wired" warning at boot.
+bridge_script_hex = ""
+
+# -----------------------------------------------------------------------------
+# [database] — chaindata storage
+# -----------------------------------------------------------------------------
+[database]
+engine   = "leveldb"  # leveldb | pebble  (default: leveldb)
+cache_mb = 256        # default: 256 — bump to 1024 for heavier shards
+
+# -----------------------------------------------------------------------------
+# [governance] — governance keys (freeze/upgrade only; cannot advance state)
+# -----------------------------------------------------------------------------
+# REQUIRED to match the genesis manifest. If the shard was deployed with
+# `--governance single_key`, paste the operator's compressed pubkey here.
+# `--governance none` (fully trustless) leaves keys empty + threshold = 0.
+[governance]
+mode      = "single_key"   # none | single_key | multisig  (default: none)
+keys      = [
+    # REQUIRED if mode != "none": one 33-byte compressed secp256k1 pubkey per
+    # operator, hex-encoded. Use the output of:
+    #   openssl rand -hex 32 | xargs -I{} bsvm peer-id {}        # peer ID only
+    #   bsvm dev derive-pubkey --wif <governance.wif>            # see deploy/testnet/README.md
+    # "0297aabbccdd...  REPLACE_ME",
+]
+threshold = 1   # default: 0; M-of-N for multisig. Single-key sets to 1.
+
+# -----------------------------------------------------------------------------
+# [indexer] — per-address tx index for the explorer
+# -----------------------------------------------------------------------------
+[indexer]
+enabled     = true   # default: true; set false to save disk if the explorer's address page isn't needed
+cache_mb    = 16     # default: 16
+max_results = 500    # default: 500 (cap is 1000)
+
+# -----------------------------------------------------------------------------
+# [beef] — spec-17 BEEF gossip + ARC callback HTTP endpoints
+# -----------------------------------------------------------------------------
+[beef]
+enabled                          = true   # default: true — must stay true for bridge deposits to enter the system
+accept_unverified_bridge_deposits = false  # default: false — KEEP FALSE on testnet too unless you're pre-flighting wiring without BEEF ancestry. Setting true allows zero-conf credit.
+max_depth                         = 32     # default: 32 — BEEF ancestor chain depth cap
+max_width                         = 10000  # default: 10000 — BEEF total ancestor count cap
+anchor_depth                      = 6      # default: 6 — minimum BSV confs on the target tx before crediting
+validated_cache_size              = 4096   # default: 4096
+
+# -----------------------------------------------------------------------------
+# [evm] — EVM hardfork pin
+# -----------------------------------------------------------------------------
+[evm]
+fork = "cancun"  # default: cancun — only "cancun" is supported in v1; future binaries may add prague
