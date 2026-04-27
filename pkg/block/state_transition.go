@@ -65,9 +65,11 @@ type Message struct {
 	Data       []byte
 	AccessList types.AccessList
 
-	// BlobHashes and BlobGasFeeCap are EIP-4844 fields. We don't process
-	// blob transactions on L2, but these are passed through to the EVM
-	// context so opcodes like BLOBHASH work in tests.
+	// BlobHashes and BlobGasFeeCap are EIP-4844 fields surfaced from
+	// type-0x03 BlobTx envelopes (see TransactionToMessage). The Go EVM
+	// uses BlobHashes to back the BLOBHASH opcode and BlobGasFeeCap to
+	// match revm's blob-gas accounting; populating these keeps the
+	// dual-EVM equivalence guarantee intact for type-3 batches.
 	BlobHashes    []types.Hash
 	BlobGasFeeCap *big.Int
 
@@ -100,6 +102,24 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		AccessList:       tx.AccessList(),
 		SkipNonceChecks:  false,
 		SkipFromEOACheck: false,
+	}
+
+	// EIP-4844 (type 0x03 BlobTx): surface BlobVersionedHashes and the
+	// max-fee-per-blob-gas onto the Message so revm and the Go EVM agree
+	// on blob-gas accounting and BLOBHASH semantics. Without this the
+	// Go side undercharges ~8192 wei per blob versus revm, breaking the
+	// dual-EVM equivalence guarantee for type-3 batches. Non-blob txs
+	// continue to leave both fields nil — the typed-tx accessors return
+	// nil there.
+	if tx.Type() == types.BlobTxType {
+		hashes := tx.BlobVersionedHashes()
+		if len(hashes) > 0 {
+			msg.BlobHashes = make([]types.Hash, len(hashes))
+			copy(msg.BlobHashes, hashes)
+		}
+		if blobCap := tx.BlobFeeCap(); blobCap != nil {
+			msg.BlobGasFeeCap = new(big.Int).Set(blobCap)
+		}
 	}
 
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
