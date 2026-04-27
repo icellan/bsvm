@@ -1,0 +1,40 @@
+[package]
+name = "bsvm-host-revm"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone post-state exporter envelope used by the dual-EVM equivalence comparator (pkg/prover/equivalence_test.go). Defines the JSON wire shape both sides of the dual-EVM agree on; ships a binary that reads the input and writes a post-state envelope. The actual revm execution is wired separately behind the `revm` feature so the schema crate builds cheaply in CI."
+
+[lib]
+name = "bsvm_host_revm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsvm-host-revm"
+path = "src/main.rs"
+
+[features]
+# Default build: schema-only. Builds in seconds, no heavy deps. The
+# binary in this mode reads stdin, validates the schema, and writes a
+# stub error envelope — useful for CI smoke-checks of the wire format.
+default = []
+# `revm` feature: pulls in revm + alloy-consensus and runs the batch
+# end-to-end. Must be built locally with
+#   cargo build --release --features revm
+# before BSVM_HOST_REVM_BINARY is set to enable the dual-EVM
+# comparator path. We do not enable this in CI yet (revm + alloy
+# is multi-minute first-build); see `pkg/prover/equivalence_test.go`
+# for how the Go test gates on the binary's availability.
+revm = ["dep:revm", "dep:revm-primitives", "dep:alloy-consensus"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+
+# Optional revm stack — version-pinned in lockstep with the SP1 guest
+# (prover/guest/Cargo.toml). Bumping these in either place WITHOUT
+# bumping in the other drifts the dual-EVM equivalence contract.
+revm = { version = "31.0.2", default-features = false, features = ["serde"], optional = true }
+revm-primitives = { version = "21.0.2", default-features = false, features = ["serde"], optional = true }
+alloy-consensus = { version = "1.5", default-features = false, optional = true }
