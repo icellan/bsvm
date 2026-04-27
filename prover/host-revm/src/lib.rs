@@ -192,6 +192,30 @@ pub struct HostOutput {
     /// Optional structured error message (set on EVM failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-address debug snapshot covering only `digest_addresses`.
+    /// Useful for diagnosing post-state-digest mismatches without
+    /// rebuilding the comparator. Each entry mirrors what the digest
+    /// actually hashed (account fields are read from revm; storage is
+    /// looked up under the supplied keys).
+    #[serde(default)]
+    pub debug_accounts: Vec<DebugAccount>,
+}
+
+/// One row of `HostOutput::debug_accounts`. All fields are 0x-prefixed
+/// hex; `nonce` is decimal so it's easy to eyeball.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugAccount {
+    pub address: String,
+    pub nonce: u64,
+    pub balance: String,
+    pub code_hash: String,
+    pub storage: Vec<DebugSlot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugSlot {
+    pub key: String,
+    pub value: String,
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
@@ -267,7 +291,15 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
         let decoded = tx::decode_and_recover(&raw, input.chain_id)
             .map_err(|e| format!("tx[{}]: signature recovery failed: {:?}", i, e))?;
 
+        // tx_type drives revm's effective_gas_price calculation:
+        // legacy/2930 take gas_price as-is; 1559+ does
+        // min(gas_price, base_fee + priority_fee). Without setting it
+        // here, the default `0` makes every typed tx behave like legacy
+        // and credits the coinbase with max_fee per gas (an obvious
+        // dual-EVM divergence). `decoded.tx_type` is the canonical
+        // type byte from the signed RLP envelope, set by tx::decode_*.
         let tx_env = TxEnv {
+            tx_type: decoded.tx_type,
             caller: decoded.sender,
             gas_limit: decoded.gas_limit,
             gas_price: decoded.gas_price,
@@ -279,7 +311,12 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
             data: Bytes::from(decoded.data.clone()),
             nonce: decoded.nonce,
             chain_id: Some(input.chain_id),
-            gas_priority_fee: if decoded.max_priority_fee > 0 {
+            gas_priority_fee: if decoded.tx_type >= 0x02 {
+                // For 1559+ txs the priority-fee field is meaningful
+                // (and 0 is a legitimate value the wire can carry).
+                // Setting Some(0) makes revm compute
+                // effective_gas_price = min(max_fee, base_fee + 0)
+                // — exactly what the spec calls for.
                 Some(decoded.max_priority_fee)
             } else {
                 None
@@ -298,6 +335,12 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
             (),
         > = Context::new(db.clone(), SpecId::CANCUN);
         ctx.block = block_env.clone();
+        // Bind the EVM's chain_id to the input envelope's value.
+        // Without this, revm defaults to chain_id=1 and rejects every
+        // EIP-155-bound tx with `Transaction(InvalidChainId)`. The SP1
+        // guest hardcodes its CHAIN_ID at compile time and sets it the
+        // same way (see prover/guest/src/main.rs::main step 4).
+        ctx.cfg.chain_id = input.chain_id;
         let mut evm = ctx.build_mainnet();
 
         match evm.transact(tx_env) {
@@ -363,6 +406,12 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
         accumulate_logs_bloom(&mut bloom, &r.logs);
     }
 
+    let debug_accounts = build_debug_accounts(
+        &db,
+        &input.digest_addresses,
+        &input.digest_storage_keys,
+    )?;
+
     Ok(HostOutput {
         post_state_digest: format!("0x{}", hex::encode(post_state_digest)),
         receipts_hash: format!("0x{}", hex::encode(receipts_hash)),
@@ -373,6 +422,7 @@ pub fn run_batch(input: &HostInput) -> Result<HostOutput, String> {
         per_tx_success,
         post_state_account_count: db.cache.accounts.len(),
         error: None,
+        debug_accounts,
     })
 }
 
@@ -496,6 +546,63 @@ fn compute_post_state_digest(
     let mut buf = [0u8; 32];
     buf.copy_from_slice(&out);
     Ok(buf)
+}
+
+/// Build the post-execution debug snapshot for the harness.
+fn build_debug_accounts(
+    db: &CacheDB<EmptyDB>,
+    digest_addresses: &[String],
+    digest_storage_keys: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<DebugAccount>, String> {
+    let mut sorted: BTreeMap<Address, ()> = BTreeMap::new();
+    if digest_addresses.is_empty() {
+        for a in db.cache.accounts.keys() {
+            sorted.insert(*a, ());
+        }
+    } else {
+        for s in digest_addresses {
+            sorted.insert(parse_address(s)?, ());
+        }
+    }
+    let mut out = Vec::with_capacity(sorted.len());
+    for addr in sorted.keys() {
+        let (nonce, balance, code_hash) = match db.cache.accounts.get(addr) {
+            Some(a) => (a.info.nonce, a.info.balance, a.info.code_hash),
+            None => (0u64, U256::ZERO, KECCAK_EMPTY),
+        };
+        let mut storage = Vec::new();
+        let lower = format!("0x{}", hex::encode(addr.as_slice()));
+        let alt_lower = lower.clone();
+        let keys = digest_storage_keys
+            .get(&lower)
+            .or_else(|| digest_storage_keys.get(&alt_lower));
+        if let Some(keys) = keys {
+            let mut sorted_keys: BTreeMap<U256, ()> = BTreeMap::new();
+            for k in keys {
+                sorted_keys.insert(U256::from_be_bytes(parse_b32(k)?), ());
+            }
+            for k in sorted_keys.keys() {
+                let v = db
+                    .cache
+                    .accounts
+                    .get(addr)
+                    .and_then(|a| a.storage.get(k).copied())
+                    .unwrap_or(U256::ZERO);
+                storage.push(DebugSlot {
+                    key: format!("0x{}", hex::encode(k.to_be_bytes::<32>())),
+                    value: format!("0x{}", hex::encode(v.to_be_bytes::<32>())),
+                });
+            }
+        }
+        out.push(DebugAccount {
+            address: format!("0x{}", hex::encode(addr.as_slice())),
+            nonce,
+            balance: format!("0x{}", hex::encode(balance.to_be_bytes::<32>())),
+            code_hash: format!("0x{}", hex::encode(code_hash.as_slice())),
+            storage,
+        });
+    }
+    Ok(out)
 }
 
 /// hash256(x) = SHA256(SHA256(x)). Matches BSV's OP_HASH256 and the
