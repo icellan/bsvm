@@ -8,10 +8,8 @@ import (
 	"math/big"
 	"strconv"
 
-	"github.com/holiman/uint256"
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/overlay"
-	"github.com/icellan/bsvm/pkg/rlp"
 	"github.com/icellan/bsvm/pkg/state"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm"
@@ -264,166 +262,24 @@ func (api *EthAPI) assertChainID(tx *types.Transaction) error {
 // wire format used by eth_sendRawTransaction. For legacy transactions this
 // is a plain RLP list. For typed (EIP-2718) transactions this is type_byte
 // followed by the RLP-encoded inner fields.
+//
+// Decoding is delegated to the canonical types.Transaction.UnmarshalBinary
+// entrypoint so the RPC layer cannot drift from the rest of the codebase.
+// EIP-4844 blob transactions (type 0x03) are rejected at the RPC boundary
+// because this shard does not accept blob-bearing wire submissions; the
+// rejection is performed before invoking the canonical decoder so the error
+// message remains stable for clients.
 func decodeRawTransaction(data []byte) (*types.Transaction, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty transaction data")
 	}
-
-	// Determine if this is a typed transaction or a legacy transaction.
-	// If the first byte is >= 0xc0, it is an RLP list (legacy transaction).
-	if data[0] >= 0xc0 {
-		return decodeLegacyRawTx(data)
+	// Reject blob (type 0x03) transactions at the RPC boundary. The
+	// canonical decoder accepts them, but this shard's submission path
+	// does not — blob sidecars are not transported here.
+	if data[0] == types.BlobTxType {
+		return nil, fmt.Errorf("unsupported transaction type: %d", types.BlobTxType)
 	}
-
-	// Typed transaction: first byte is type, rest is RLP.
-	txType := data[0]
-	body := data[1:]
-	switch txType {
-	case types.AccessListTxType:
-		return decodeAccessListRawTx(body)
-	case types.DynamicFeeTxType:
-		return decodeDynamicFeeRawTx(body)
-	default:
-		return nil, fmt.Errorf("unsupported transaction type: %d", txType)
-	}
-}
-
-// legacyRLPDecode is the RLP-decodable form of a legacy transaction.
-// It mirrors the encoding format which uses *big.Int for Value.
-type legacyRLPDecode struct {
-	Nonce    uint64
-	GasPrice *big.Int
-	Gas      uint64
-	To       *types.Address
-	Value    *big.Int
-	Data     []byte
-	V        *big.Int
-	R        *big.Int
-	S        *big.Int
-}
-
-// accessListRLPDecode is the RLP-decodable form of an EIP-2930 transaction.
-type accessListRLPDecode struct {
-	ChainID    *big.Int
-	Nonce      uint64
-	GasPrice   *big.Int
-	Gas        uint64
-	To         *types.Address
-	Value      *big.Int
-	Data       []byte
-	AccessList types.AccessList
-	V          *big.Int
-	R          *big.Int
-	S          *big.Int
-}
-
-// dynamicFeeRLPDecode is the RLP-decodable form of an EIP-1559 transaction.
-type dynamicFeeRLPDecode struct {
-	ChainID    *big.Int
-	Nonce      uint64
-	GasTipCap  *big.Int
-	GasFeeCap  *big.Int
-	Gas        uint64
-	To         *types.Address
-	Value      *big.Int
-	Data       []byte
-	AccessList types.AccessList
-	V          *big.Int
-	R          *big.Int
-	S          *big.Int
-}
-
-// orZeroBig returns v if non-nil, otherwise a fresh zero-valued *big.Int.
-//
-// RLP encodes a *big.Int with value 0 as the empty string (0x80), which the
-// decoder maps back to a nil pointer. The signer's Sender path requires
-// non-nil V/R/S — V in particular is 0 or 1 for typed (EIP-2930/EIP-1559)
-// transactions, so the wire-encoded V routinely round-trips through nil.
-// Materialise the zero explicitly so downstream consumers see a usable big
-// integer rather than a "missing signature values" error. Mirrors the
-// `orZero` helper in pkg/types/transaction.go used by Transaction.DecodeRLP.
-func orZeroBig(v *big.Int) *big.Int {
-	if v == nil {
-		return new(big.Int)
-	}
-	return v
-}
-
-// decodeLegacyRawTx decodes a legacy RLP-encoded transaction.
-func decodeLegacyRawTx(data []byte) (*types.Transaction, error) {
-	var decoded legacyRLPDecode
-	if err := rlp.DecodeBytes(data, &decoded); err != nil {
-		return nil, fmt.Errorf("legacy decode failed: %w", err)
-	}
-	value, _ := uint256.FromBig(decoded.Value)
-	if value == nil {
-		value = new(uint256.Int)
-	}
-	tx := types.NewTx(&types.LegacyTx{
-		Nonce:    decoded.Nonce,
-		GasPrice: decoded.GasPrice,
-		Gas:      decoded.Gas,
-		To:       decoded.To,
-		Value:    value,
-		Data:     decoded.Data,
-		V:        orZeroBig(decoded.V),
-		R:        orZeroBig(decoded.R),
-		S:        orZeroBig(decoded.S),
-	})
-	return tx, nil
-}
-
-// decodeAccessListRawTx decodes an EIP-2930 access list transaction.
-func decodeAccessListRawTx(data []byte) (*types.Transaction, error) {
-	var decoded accessListRLPDecode
-	if err := rlp.DecodeBytes(data, &decoded); err != nil {
-		return nil, fmt.Errorf("access list tx decode failed: %w", err)
-	}
-	value, _ := uint256.FromBig(decoded.Value)
-	if value == nil {
-		value = new(uint256.Int)
-	}
-	tx := types.NewTx(&types.AccessListTx{
-		ChainID:    decoded.ChainID,
-		Nonce:      decoded.Nonce,
-		GasPrice:   decoded.GasPrice,
-		Gas:        decoded.Gas,
-		To:         decoded.To,
-		Value:      value,
-		Data:       decoded.Data,
-		AccessList: decoded.AccessList,
-		V:          orZeroBig(decoded.V),
-		R:          orZeroBig(decoded.R),
-		S:          orZeroBig(decoded.S),
-	})
-	return tx, nil
-}
-
-// decodeDynamicFeeRawTx decodes an EIP-1559 dynamic fee transaction.
-func decodeDynamicFeeRawTx(data []byte) (*types.Transaction, error) {
-	var decoded dynamicFeeRLPDecode
-	if err := rlp.DecodeBytes(data, &decoded); err != nil {
-		return nil, fmt.Errorf("dynamic fee tx decode failed: %w", err)
-	}
-	value, _ := uint256.FromBig(decoded.Value)
-	if value == nil {
-		value = new(uint256.Int)
-	}
-	tx := types.NewTx(&types.DynamicFeeTx{
-		ChainID:    decoded.ChainID,
-		Nonce:      decoded.Nonce,
-		GasTipCap:  decoded.GasTipCap,
-		GasFeeCap:  decoded.GasFeeCap,
-		Gas:        decoded.Gas,
-		To:         decoded.To,
-		Value:      value,
-		Data:       decoded.Data,
-		AccessList: decoded.AccessList,
-		V:          orZeroBig(decoded.V),
-		R:          orZeroBig(decoded.R),
-		S:          orZeroBig(decoded.S),
-	})
-	return tx, nil
+	return types.DecodeTx(data)
 }
 
 // GetTransactionByHash returns a transaction by its hash.
@@ -1221,6 +1077,3 @@ func (api *EthAPI) CreateAccessList(args TransactionArgs, blockNrOrHash *BlockNu
 		"gasUsed":    EncodeUint64(gasUsed),
 	}, nil
 }
-
-// ensure the uint256 import is used
-var _ = uint256.NewInt
