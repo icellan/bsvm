@@ -98,6 +98,9 @@ func (n *OverlayNode) CascadeRollback(winnerEvent *CovenantAdvanceEvent) error {
 
 	// Verify the state root matches the winner's advertised post-state root.
 	if winnerBlock.StateRoot() != winnerEvent.PostStateRoot {
+		if n.counters != nil {
+			n.counters.OverlayStateRootMismatchTotal.Inc()
+		}
 		slog.Error("state root mismatch after replaying winner batch",
 			"expected", winnerEvent.PostStateRoot.Hex(),
 			"got", winnerBlock.StateRoot().Hex(),

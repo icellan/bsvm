@@ -38,6 +38,7 @@ import (
 
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/bridge"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/types"
 
@@ -88,6 +89,9 @@ type withdrawalWireOpts struct {
 	// (1 sat/byte). Zero leaves the default in place. Operators set
 	// this from [bridge].claim_fee_sat_per_byte.
 	ClaimFeeSatPerByte int64
+	// Metrics is the daemon-wide Prometheus counter set. nil falls
+	// back to a fresh no-op set inside the Withdrawer.
+	Metrics *metrics.Counters
 }
 
 // startWithdrawerFunc is returned by WireWithdrawer. The caller invokes
@@ -186,7 +190,8 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 	}
 	w := bridge.NewWithdrawer(broadcaster, bridgeUTXO, scanner, finder, cfg).
 		WithSigner(signer).
-		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor)
+		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor).
+		WithMetrics(opts.Metrics)
 
 	// Spec 07 fee-funding UTXO. Production wiring uses the same
 	// FeeWallet that funds covenant advances — its PrivateKey is the

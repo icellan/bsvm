@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/icellan/bsvm/internal/db"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/types"
 )
 
@@ -82,6 +83,10 @@ type BridgeMonitor struct {
 	reorgRollbackCB   ReorgRollbackCallback
 	bridgeUTXO        *BridgeUTXO
 	mu                sync.Mutex
+	// metrics is the daemon-wide Prometheus counter set. Always
+	// non-nil after NewBridgeMonitor (zero-arg constructor seeds it
+	// with metrics.DisabledCounters); SetMetrics replaces it.
+	metrics *metrics.Counters
 }
 
 // NewBridgeMonitor creates a new BridgeMonitor with the given
@@ -95,7 +100,22 @@ func NewBridgeMonitor(config Config, overlay OverlaySubmitter, store DepositStor
 		overlay:           overlay,
 		db:                store,
 		processedDeposits: make(map[depositID]bool),
+		metrics:           metrics.DisabledCounters(),
 	}
+}
+
+// SetMetrics swaps the bridge monitor's Counters pointer. Pass the
+// daemon's shared *metrics.Counters at boot to enable Prometheus
+// counters on the bridge subsystem; passing nil falls back to a fresh
+// no-op registry so .Inc() stays safe.
+func (m *BridgeMonitor) SetMetrics(c *metrics.Counters) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c == nil {
+		m.metrics = metrics.DisabledCounters()
+		return
+	}
+	m.metrics = c
 }
 
 // SetBridgeScriptHash sets the bridge covenant script hash used to
@@ -273,6 +293,9 @@ func (m *BridgeMonitor) PersistDeposit(deposit *Deposit) error {
 	}
 
 	m.processedDeposits[depositID{deposit.BSVTxID, deposit.Vout}] = true
+	if m.metrics != nil {
+		m.metrics.BridgeDepositsTotal.Inc()
+	}
 	return nil
 }
 
@@ -517,6 +540,9 @@ func (m *BridgeMonitor) ValidateHorizon(horizon uint64, observedBSVTip uint64) e
 // pre-callback behaviour).
 func (m *BridgeMonitor) RetractDepositsAbove(minHeight uint64) {
 	m.mu.Lock()
+	if m.metrics != nil {
+		m.metrics.BridgeRetractsTotal.Inc()
+	}
 
 	// Drop in-memory pending entries above the height.
 	filtered := m.pendingDeposits[:0]

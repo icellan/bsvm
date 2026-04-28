@@ -9,8 +9,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -435,6 +437,45 @@ func cmdRun(ctx *cli.Context) error {
 		ChainID:  chainIDStr,
 	})
 
+	// Standalone Prometheus /metrics HTTP listener. Kept separate
+	// from the JSON-RPC HTTP server so operators can firewall it
+	// independently (JSON-RPC faces wallets; /metrics faces the
+	// internal monitoring network). Disabled by setting
+	// [metrics].enabled = false.
+	var metricsServer *http.Server
+	if nodeCfg.Metrics.Enabled {
+		mmux := http.NewServeMux()
+		mmux.Handle("/metrics", metricsRegistry.HTTPHandler())
+		mmux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		listenAddr := nodeCfg.Metrics.ListenAddr
+		if listenAddr == "" {
+			listenAddr = "127.0.0.1:9100"
+		}
+		metricsServer = &http.Server{
+			Addr:              listenAddr,
+			Handler:           mmux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			slog.Info("metrics endpoint listening", "addr", listenAddr, "path", "/metrics")
+			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Warn("metrics endpoint exited unexpectedly", "error", err)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+				slog.Warn("metrics endpoint shutdown error", "error", err)
+			}
+		}()
+	} else {
+		slog.Info("metrics endpoint disabled by config; counters still wire to a no-op registry")
+	}
+
 	traceCtx, traceCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer traceCancel()
 	shutdownTracing, err := tracing.Setup(traceCtx, tracing.Config{
@@ -819,7 +860,7 @@ func cmdRun(ctx *cli.Context) error {
 	// stays in fail-closed mode — verified deposits never credit. A
 	// startup WARN (below) surfaces this so operators see why their
 	// /bsvm/bridge/deposit posts are not minting wBSV.
-	chaintracksClient, err := BuildChaintracksClient(ctx.Context, nodeCfg.BSV.Chaintracks, slog.Default())
+	chaintracksClient, err := BuildChaintracksClientWithMetrics(ctx.Context, nodeCfg.BSV.Chaintracks, slog.Default(), overlayNode.Counters())
 	if err != nil {
 		return fmt.Errorf("build chaintracks client: %w", err)
 	}
@@ -854,6 +895,10 @@ func cmdRun(ctx *cli.Context) error {
 	if bridgeMonitor == nil {
 		slog.Warn("bridge monitor not wired — [bridge].bridge_script_hex is empty, BEEF deposits will not credit L2 (fail-closed)")
 	} else {
+		// Wire the daemon's shared Counters into the bridge monitor so
+		// PersistDeposit / RetractDepositsAbove call sites land on the
+		// /metrics endpoint.
+		bridgeMonitor.SetMetrics(overlayNode.Counters())
 		slog.Info("bridge monitor wired",
 			"script_hash_bytes", len(bridgeScriptHash),
 			"local_shard_id", uint32(chainID),
@@ -975,6 +1020,7 @@ func cmdRun(ctx *cli.Context) error {
 		BridgeMonitor:      bridgeMonitor,
 		BridgeScript:       bridgeScriptHash,
 		ClaimFeeSatPerByte: nodeCfg.Bridge.ClaimFeeSatPerByte,
+		Metrics:            overlayNode.Counters(),
 	}
 	if broadcastWiring != nil {
 		wireOpts.Provider = broadcastWiring.Provider

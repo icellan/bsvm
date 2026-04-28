@@ -21,6 +21,12 @@ type ExecutionVerifier struct {
 	executor *block.BlockExecutor
 	rawDB    db.Database
 	chainDB  *block.ChainDB
+	// node is an optional back-pointer used solely to increment the
+	// daemon-wide state-root mismatch counter when re-execution
+	// disagrees with a covenant advance. nil-safe — pre-spec-15 callers
+	// that build a verifier outside an OverlayNode (tests) leave it
+	// unset and the counter increment is skipped.
+	node *OverlayNode
 }
 
 // NewExecutionVerifier creates a new ExecutionVerifier with the given
@@ -108,6 +114,9 @@ func (v *ExecutionVerifier) VerifyCovenantAdvance(advance *CovenantAdvanceEvent)
 
 	// Compare with the claimed state root from the covenant advance.
 	if computedRoot != advance.PostStateRoot {
+		if v.node != nil && v.node.counters != nil {
+			v.node.counters.OverlayStateRootMismatchTotal.Inc()
+		}
 		slog.Error("EXECUTION MISMATCH -- covenant advance has incorrect state root",
 			"block", advance.L2BlockNum,
 			"expected", advance.PostStateRoot.Hex(),
@@ -136,5 +145,7 @@ func (c *verifierChainContext) GetHeader(hash types.Hash, number uint64) *block.
 func NewExecutionVerifierFromNode(node *OverlayNode) *ExecutionVerifier {
 	chainConfig := vm.DefaultL2Config(node.config.ChainID)
 	executor := block.NewBlockExecutor(chainConfig, vm.Config{})
-	return NewExecutionVerifier(executor, node.rawDB, node.chainDB)
+	v := NewExecutionVerifier(executor, node.rawDB, node.chainDB)
+	v.node = node
+	return v
 }

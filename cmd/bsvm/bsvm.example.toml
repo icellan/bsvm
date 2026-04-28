@@ -164,6 +164,26 @@ accept_unverified_bridge_deposits = false
 # this value is changed. An unsupported fork name is a startup error.
 fork = "cancun"
 
+[metrics]
+# Standalone Prometheus /metrics HTTP listener. Kept separate from the
+# JSON-RPC HTTP server so operators can firewall it independently:
+# the JSON-RPC port faces user wallets while /metrics faces the
+# internal monitoring network.
+#
+# Set enabled = false to skip the listener entirely; subsystems still
+# wire their counters against a fresh no-op registry so .Inc() /
+# .Observe() calls remain safe but the values never reach a scrape.
+enabled = true
+# Default loopback-only so a fresh install doesn't leak metrics to the
+# public internet. Switch to "0.0.0.0:9100" once the host firewall is
+# in place to let an external Prometheus instance scrape directly.
+listen_addr = "127.0.0.1:9100"
+# Reserved for future use; the metric-name prefixes are currently
+# hard-coded in pkg/metrics. Leaving the field documented so per-
+# deployment namespaces can land later without breaking existing
+# configs.
+namespace = "bsvm"
+
 # -----------------------------------------------------------------------------
 # Worked example: BSV-node failover (W6-11)
 # -----------------------------------------------------------------------------

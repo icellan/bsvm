@@ -27,6 +27,8 @@ import (
 	"container/list"
 	"context"
 	"sync"
+
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // CacheConfig configures a CachedClient. Each cache size is the
@@ -71,6 +73,22 @@ type CachedClient struct {
 
 	blockPageCache *lruCache
 	blockPageGroup *singleflightGroup
+
+	// metrics is the daemon-wide Prometheus counter set. Always
+	// non-nil after NewCachedClient; SetMetrics replaces it.
+	metrics *metrics.Counters
+}
+
+// SetMetrics swaps the cache's Counters pointer. Pass the daemon's
+// shared *metrics.Counters at boot to enable per-layer hit / miss
+// counters; passing nil falls back to a fresh no-op registry so .Inc()
+// stays safe.
+func (c *CachedClient) SetMetrics(m *metrics.Counters) {
+	if m == nil {
+		c.metrics = metrics.DisabledCounters()
+		return
+	}
+	c.metrics = m
 }
 
 // NewCachedClient wraps upstream with the cache configured by cfg.
@@ -78,7 +96,7 @@ type CachedClient struct {
 // becomes a transparent passthrough — useful for tests that want the
 // wrapper interface without the caching behaviour.
 func NewCachedClient(upstream WhatsOnChainClient, cfg CacheConfig) *CachedClient {
-	c := &CachedClient{upstream: upstream}
+	c := &CachedClient{upstream: upstream, metrics: metrics.DisabledCounters()}
 	if cfg.TxCacheSize > 0 {
 		c.txCache = newLRU(cfg.TxCacheSize)
 		c.txGroup = newSingleflightGroup()
@@ -103,6 +121,7 @@ func (c *CachedClient) GetTx(ctx context.Context, txid [32]byte) ([]byte, error)
 	}
 	key := string(txid[:])
 	if v, ok := c.txCache.get(key); ok {
+		c.metrics.IncWoCCacheHit("tx")
 		// Defensive copy: callers may mutate the returned slice (e.g.
 		// re-encode). The cache stores the canonical immutable bytes.
 		raw := v.([]byte)
@@ -110,6 +129,7 @@ func (c *CachedClient) GetTx(ctx context.Context, txid [32]byte) ([]byte, error)
 		copy(out, raw)
 		return out, nil
 	}
+	c.metrics.IncWoCCacheMiss("tx")
 	v, err := c.txGroup.do(key, func() (any, error) {
 		// Re-check the cache under the singleflight gate: another
 		// caller may have populated it while we were queued.
@@ -166,8 +186,10 @@ func (c *CachedClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([
 	}
 	key := string(blockHash[:])
 	if v, ok := c.blockTxIDsCache.get(key); ok {
+		c.metrics.IncWoCCacheHit("block")
 		return cloneTxIDs(v.([][32]byte)), nil
 	}
+	c.metrics.IncWoCCacheMiss("block")
 	v, err := c.blockTxIDsGroup.do(key, func() (any, error) {
 		// Re-check under the singleflight gate.
 		if cached, ok := c.blockTxIDsCache.get(key); ok {
@@ -232,8 +254,10 @@ func (p *cachingPageFetcher) FetchPage(ctx context.Context, pageURI string) ([]s
 		return p.inner.FetchPage(ctx, pageURI)
 	}
 	if v, ok := c.blockPageCache.get(pageURI); ok {
+		c.metrics.IncWoCCacheHit("page")
 		return cloneStrings(v.([]string)), nil
 	}
+	c.metrics.IncWoCCacheMiss("page")
 	v, err := c.blockPageGroup.do(pageURI, func() (any, error) {
 		if cached, ok := c.blockPageCache.get(pageURI); ok {
 			return cached, nil

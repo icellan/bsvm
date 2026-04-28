@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // RemoteConfig configures a RemoteClient. URL is the BRC-64 base URL
@@ -43,6 +45,23 @@ type RemoteClient struct {
 	hubOnce sync.Once
 	hub     *streamHub
 	hubErr  error
+
+	// metrics is the daemon-wide Prometheus counter set. Always
+	// non-nil after NewRemoteClient (zero-arg constructor seeds it
+	// with metrics.DisabledCounters); SetMetrics replaces it.
+	metrics *metrics.Counters
+}
+
+// SetMetrics swaps the chaintracks client's Counters pointer. Must be
+// called BEFORE the first SubscribeReorgs to take effect on the
+// streaming hub, which lazy-constructs on the first subscription. nil
+// falls back to a fresh no-op registry so .Inc() stays safe.
+func (c *RemoteClient) SetMetrics(m *metrics.Counters) {
+	if m == nil {
+		c.metrics = metrics.DisabledCounters()
+		return
+	}
+	c.metrics = m
 }
 
 // NewRemoteClient builds a RemoteClient. cfg.URL is required.
@@ -60,8 +79,9 @@ func NewRemoteClient(cfg RemoteConfig) (*RemoteClient, error) {
 		cfg.Stream.Checkpoints = DefaultCheckpoints()
 	}
 	return &RemoteClient{
-		cfg:  cfg,
-		http: &http.Client{Timeout: cfg.Timeout},
+		cfg:     cfg,
+		http:    &http.Client{Timeout: cfg.Timeout},
+		metrics: metrics.DisabledCounters(),
 	}, nil
 }
 
@@ -237,6 +257,7 @@ func (c *RemoteClient) SubscribeReorgs(ctx context.Context) (<-chan *ReorgEvent,
 			c.hubErr = err
 			return
 		}
+		hub.metrics = c.metrics
 		// Seed the resume cursor with the current tip, best-effort.
 		seedCtx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
 		if tip, err := c.Tip(seedCtx); err == nil {

@@ -34,8 +34,38 @@ type NodeConfig struct {
 	Indexer    IndexerSection    `toml:"indexer"`
 	BEEF       BEEFSection       `toml:"beef"`
 	EVM        EVMSection        `toml:"evm"`
+	Metrics    MetricsSection    `toml:"metrics"`
 	LogLevel   string            `toml:"log_level"`
 	LogFormat  string            `toml:"log_format"`
+}
+
+// MetricsSection configures the standalone Prometheus /metrics HTTP
+// endpoint. The endpoint runs on its own listener (kept separate from
+// the JSON-RPC HTTP server) so operators can firewall it independently
+// — the JSON-RPC port faces user wallets while /metrics faces the
+// internal monitoring network.
+//
+// When Enabled is false the endpoint is skipped entirely; subsystems
+// still construct their counters against a no-op registry so .Inc() /
+// .Observe() calls remain safe but the values are never scraped.
+type MetricsSection struct {
+	// Enabled toggles the standalone /metrics listener. Defaults to
+	// true via DefaultNodeConfig — operators have to explicitly opt
+	// out, since metrics are cheap and the alternative ("we relied on
+	// slog only") is exactly the gap this section closes.
+	Enabled bool `toml:"enabled"`
+	// ListenAddr is the host:port the metrics HTTP server binds to.
+	// Default "127.0.0.1:9100" — loopback-only by default so a fresh
+	// install doesn't leak metrics to the public internet. Operators
+	// who want their monitoring host to scrape directly can override
+	// to "0.0.0.0:9100" (and arrange firewalling via the host).
+	ListenAddr string `toml:"listen_addr"`
+	// Namespace is reserved for future use; currently the metric
+	// names are hard-coded with "bsvm_" / "bsvevm_" prefixes (see
+	// pkg/metrics). Setting this in TOML is accepted but ignored —
+	// kept on the section so operators can document their intended
+	// namespace once the package supports per-deployment overrides.
+	Namespace string `toml:"namespace"`
 }
 
 // EVMSection pins the EVM hardfork the node executes under. Both the
@@ -504,6 +534,15 @@ func DefaultNodeConfig() *NodeConfig {
 			// Document the active fork in operator config so future
 			// fork bumps are visible.
 			Fork: "cancun",
+		},
+		Metrics: MetricsSection{
+			// Default-on: the operator runbook relied on slog alone
+			// before this gap was closed; turning the endpoint off
+			// requires explicit opt-out so a fresh install always has
+			// /metrics available.
+			Enabled:    true,
+			ListenAddr: "127.0.0.1:9100",
+			Namespace:  "bsvm",
 		},
 		// Governance defaults to zero value (Mode "", no keys, threshold 0)
 		// which is treated as "none" -- fully trustless, no governance keys.

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/icellan/bsvm/pkg/arc"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/types"
 )
 
@@ -215,6 +216,10 @@ type Withdrawer struct {
 	// nil keeps the legacy single-input path (fee absorbed from the
 	// bridge change). See WithFeeUTXOProvider.
 	feeUTXOProvider FeeUTXOProvider
+	// metrics is the daemon-wide Prometheus counter set. Always
+	// non-nil after NewWithdrawer (zero-arg constructor seeds it
+	// with metrics.DisabledCounters); WithMetrics replaces it.
+	metrics *metrics.Counters
 }
 
 // NewWithdrawer creates a new Withdrawer with the given dependencies.
@@ -240,7 +245,20 @@ func NewWithdrawer(
 			3 * time.Second,
 			9 * time.Second,
 		},
+		metrics: metrics.DisabledCounters(),
 	}
+}
+
+// WithMetrics registers the daemon-wide Prometheus counter set. nil
+// falls back to DisabledCounters so .Inc() stays safe. Returns the
+// receiver for fluent construction.
+func (w *Withdrawer) WithMetrics(c *metrics.Counters) *Withdrawer {
+	if c == nil {
+		w.metrics = metrics.DisabledCounters()
+	} else {
+		w.metrics = c
+	}
+	return w
 }
 
 // WithSigner registers a BSV signing key. Returns the receiver to
@@ -339,6 +357,16 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		return fmt.Errorf("failed to scan pending withdrawals: %w", err)
 	}
 
+	// Track withdrawals deferred this pass because their advance is not
+	// yet anchored / confirmed. Reset to 0 and re-count below as we
+	// encounter ErrAdvanceNotYetAnchored / ErrAdvanceNotYetConfirmed.
+	var anchorPending uint64
+	defer func() {
+		if w.metrics != nil {
+			w.metrics.AnchorPendingTotal.Set(float64(anchorPending))
+		}
+	}()
+
 	for _, wd := range pendingWithdrawals {
 		// Verify this is the next nonce in sequence.
 		if wd.Nonce != w.bridgeUTXO.LastClaimedNonce+1 {
@@ -367,11 +395,13 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			// it (spec 09 finality semantics). Any other finder error
 			// is fatal-for-this-pass (loop-level handler logs + retries).
 			if errors.Is(err, ErrAdvanceNotYetAnchored) {
+				anchorPending++
 				slog.Info("withdrawal claim deferred: advance not yet anchored",
 					"nonce", wd.Nonce, "block", wd.L2BlockNum)
 				break
 			}
 			if errors.Is(err, ErrAdvanceNotYetConfirmed) {
+				anchorPending++
 				slog.Info("withdrawal claim deferred: advance not yet confirmed on BSV",
 					"nonce", wd.Nonce, "block", wd.L2BlockNum)
 				break
@@ -480,12 +510,23 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		txid, err := w.broadcastWithRetry(claimTx.RawTx, wd.Nonce)
 		if err != nil {
 			if errors.Is(err, ErrBroadcastPermanent) {
+				if w.metrics != nil {
+					w.metrics.IncClaimBroadcast("permanent_fail")
+				}
 				slog.Error("withdrawal claim dropped: permanent broadcast failure",
 					"nonce", wd.Nonce, "block", wd.L2BlockNum,
 					"amount_sat", wd.AmountSatoshis, "error", err)
 				return fmt.Errorf("claim broadcast permanently failed for nonce %d: %w", wd.Nonce, err)
 			}
+			if w.metrics != nil {
+				w.metrics.IncClaimBroadcast("transient_fail")
+			}
 			return fmt.Errorf("claim broadcast failed for nonce %d: %w", wd.Nonce, err)
+		}
+
+		if w.metrics != nil {
+			w.metrics.IncClaimBroadcast("ok")
+			w.metrics.BridgeWithdrawalsClaimedTotal.Inc()
 		}
 
 		slog.Info("withdrawal claimed",
