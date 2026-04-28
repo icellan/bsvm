@@ -58,15 +58,19 @@ var (
 	ErrInsufficientFundsForBlobGas = errors.New("insufficient funds for blob gas")
 )
 
-// minBlobGasPrice is the EIP-4844 floor for blob_gas_price. With no on-
-// chain ExcessBlobGas tracking yet (header field deferred — see
-// pkg/block/types.go L2Header), every block effectively has zero excess
-// blob gas, so blob_gas_price collapses to MIN_BLOB_GASPRICE = 1. This
-// matches what revm computes against an SP1 fixture run on a clean
-// chain and keeps Go-EVM <-> revm balance accounting byte-identical
-// for the BlobTx case. When ExcessBlobGas tracking lands on the L2
-// header, replace this with the EIP-4844 fake_exponential schedule.
-const minBlobGasPrice uint64 = 1
+// blobGasPriceForBlock returns the EIP-4844 blob_gas_price for the block
+// currently being executed. It reads BlobBaseFee from the EVM block context
+// (which apply.go::newBlockContext seeds via CalcBlobGasPrice from the
+// header's ExcessBlobGas) and falls back to MinBlobGasPrice (= 1 wei)
+// when no context value is present — that fallback covers the older test
+// fixtures that build block contexts directly without going through
+// newBlockContext, and matches the previous compile-time constant.
+func (st *stateTransition) blobGasPriceForBlock() *big.Int {
+	if st.evm != nil && st.evm.Context.BlobBaseFee != nil {
+		return new(big.Int).Set(st.evm.Context.BlobBaseFee)
+	}
+	return new(big.Int).SetUint64(MinBlobGasPrice)
+}
 
 // Message represents an EVM message (transaction converted to execution format).
 type Message struct {
@@ -272,18 +276,19 @@ func (st *stateTransition) buyGas() error {
 // transaction's MaxFeePerBlobGas is below the prevailing blob_gas_price,
 // and ErrInsufficientFundsForBlobGas if the sender cannot cover it.
 //
-// blob_gas_price uses minBlobGasPrice (= 1) until the L2 header carries
-// ExcessBlobGas/BlobGasUsed; see the const doc-comment for the upgrade
-// path. This matches revm's behaviour on a clean chain (zero excess) and
-// keeps Go-EVM <-> revm canonical MPT roots byte-identical for the
-// dual-EVM equivalence harness.
+// blob_gas_price is the EIP-4844 fake_exponential schedule applied to the
+// header's ExcessBlobGas (see pkg/block/blobgas.go::CalcBlobGasPrice). The
+// value is plumbed through vm.BlockContext.BlobBaseFee by
+// apply.go::newBlockContext. This matches revm's behaviour on the same
+// excess-blob-gas trajectory and keeps Go-EVM <-> revm canonical MPT roots
+// byte-identical for the dual-EVM equivalence harness.
 func (st *stateTransition) buyBlobGas() error {
 	if len(st.msg.BlobHashes) == 0 {
 		// Non-blob transaction (or type-3 with no hashes — rejected upstream
 		// at decode time, but defensive).
 		return nil
 	}
-	blobGasPrice := new(big.Int).SetUint64(minBlobGasPrice)
+	blobGasPrice := st.blobGasPriceForBlock()
 	if st.msg.BlobGasFeeCap == nil || st.msg.BlobGasFeeCap.Cmp(blobGasPrice) < 0 {
 		var have *big.Int
 		if st.msg.BlobGasFeeCap != nil {

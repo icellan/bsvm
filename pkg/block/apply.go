@@ -60,6 +60,15 @@ func ApplyTransaction(
 	// Update cumulative gas used.
 	*usedGas += result.UsedGas
 
+	// EIP-4844: accumulate blob-gas used for type-3 transactions onto the
+	// header. The next block reads this via CalcExcessBlobGas to drive its
+	// own blob_gas_price; tx-level checks (buyBlobGas) consumed it via
+	// fake_exponential against the current header's ExcessBlobGas. Non-blob
+	// transactions contribute 0 (BlobGasUsedForTx returns 0 for them).
+	if tx.Type() == types.BlobTxType {
+		header.BlobGasUsed += BlobGasUsedForTx(len(tx.BlobVersionedHashes()))
+	}
+
 	// Create the receipt.
 	receipt := &types.Receipt{
 		Type:              tx.Type(),
@@ -111,6 +120,14 @@ func newBlockContext(header *L2Header, chain ChainContext, coinbase *types.Addre
 	}
 	random := DeriveRandom(randomInput, header.Number.Uint64())
 
+	// EIP-4844: derive blob_gas_price from the header's ExcessBlobGas via
+	// fake_exponential. At excess == 0 (genesis or post-empty chain) this
+	// is exactly MinBlobGasPrice = 1 wei, preserving every existing test
+	// fixture that didn't set ExcessBlobGas. As blob-heavy blocks land
+	// the price ramps up per the EIP-4844 schedule and is consumed by
+	// state_transition.buyBlobGas via st.evm.Context.BlobBaseFee.
+	blobBaseFee := CalcBlobGasPrice(header.ExcessBlobGas)
+
 	return vm.BlockContext{
 		CanTransfer: vm.CanTransfer,
 		Transfer:    vm.Transfer,
@@ -135,7 +152,7 @@ func newBlockContext(header *L2Header, chain ChainContext, coinbase *types.Addre
 		Time:        header.Timestamp,
 		Difficulty:  big.NewInt(0),
 		BaseFee:     new(big.Int).Set(baseFee),
-		BlobBaseFee: big.NewInt(1),
+		BlobBaseFee: blobBaseFee,
 		Random:      &random,
 	}
 }

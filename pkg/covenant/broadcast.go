@@ -47,6 +47,29 @@ type BroadcastClient interface {
 	Close() error
 }
 
+// TxStatus is the (confirmations, blockHeight) pair returned by
+// BroadcastClients that implement TransactionStatusSource. blockHeight
+// is the BSV block number that contains the tx, or 0 when the tx is
+// still in the mempool.
+type TxStatus struct {
+	Confirmations uint32
+	BlockHeight   uint64
+}
+
+// TransactionStatusSource is an optional capability some BroadcastClient
+// implementations expose alongside GetConfirmations. It returns both the
+// confirmation count AND the BSV block height containing the tx in a
+// single call, so callers building anchor / finality records can
+// back-fill the height without a second RPC round-trip. Clients that
+// don't implement this fall back to GetConfirmations alone (height
+// stays at zero in that case).
+type TransactionStatusSource interface {
+	// GetTransactionStatus returns confirmations and block height for a
+	// previously-broadcast txid. BlockHeight is 0 when the tx is in the
+	// mempool but not yet mined. Returns an error if the tx is unknown.
+	GetTransactionStatus(ctx context.Context, txid types.Hash) (TxStatus, error)
+}
+
 // AdvanceProof is the mode-specific proof carried in a BroadcastRequest.
 // Each implementation owns the marshaling for its own mode so that callers
 // construct the concrete type with real data and the broadcast client never

@@ -29,15 +29,17 @@ type FakeBroadcastClient struct {
 	// ErrBroadcastRejected without recording the request.
 	RejectBroadcast bool
 
-	seq    uint64
-	ledger []BroadcastRequest
-	confs  map[types.Hash]uint32
+	seq     uint64
+	ledger  []BroadcastRequest
+	confs   map[types.Hash]uint32
+	heights map[types.Hash]uint64
 }
 
 // NewFakeBroadcastClient returns a ready-to-use fake broadcast client.
 func NewFakeBroadcastClient() *FakeBroadcastClient {
 	return &FakeBroadcastClient{
-		confs: make(map[types.Hash]uint32),
+		confs:   make(map[types.Hash]uint32),
+		heights: make(map[types.Hash]uint64),
 	}
 }
 
@@ -100,6 +102,29 @@ func (f *FakeBroadcastClient) SetConfirmations(txid types.Hash, n uint32) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.confs[txid] = n
+}
+
+// SetBlockHeight sets the BSV block height for a specific txid so tests
+// can drive the ConfirmationWatcher's anchor back-fill path. Setting
+// height to 0 marks the tx as unmined (mempool) without affecting the
+// confirmation count.
+func (f *FakeBroadcastClient) SetBlockHeight(txid types.Hash, height uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heights[txid] = height
+}
+
+// GetTransactionStatus implements TransactionStatusSource. Returns the
+// stored (confirmations, blockHeight) pair for the txid, or ErrUnknownTx
+// when the txid was never broadcast through this client.
+func (f *FakeBroadcastClient) GetTransactionStatus(_ context.Context, txid types.Hash) (TxStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	confs, ok := f.confs[txid]
+	if !ok {
+		return TxStatus{}, ErrUnknownTx
+	}
+	return TxStatus{Confirmations: confs, BlockHeight: f.heights[txid]}, nil
 }
 
 // Broadcasts returns a copy of all recorded broadcast requests.

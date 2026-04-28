@@ -18,19 +18,29 @@ const MaxExtraDataSize = 32
 
 // L2Header is the header of an L2 block. It contains metadata about the block
 // including the state root, transaction root, and receipt root.
+//
+// EIP-4844 (Cancun) blob-gas tracking: BlobGasUsed and ExcessBlobGas mirror
+// geth's Cancun header layout. They are committed unconditionally — every L2
+// block carries them. ExcessBlobGas drives the per-block blob_gas_price via
+// fake_exponential (see pkg/block/blobgas.go); BlobGasUsed sums
+// `len(BlobVersionedHashes) * BlobTxBlobGasPerBlob` across the block's
+// type-3 transactions and feeds the next block's ExcessBlobGas update. On
+// genesis both are 0.
 type L2Header struct {
-	ParentHash  types.Hash    `json:"parentHash"`
-	Coinbase    types.Address `json:"miner"`
-	StateRoot   types.Hash    `json:"stateRoot"`
-	TxHash      types.Hash    `json:"transactionsRoot"`
-	ReceiptHash types.Hash    `json:"receiptsRoot"`
-	LogsBloom   types.Bloom   `json:"logsBloom"`
-	Number      *big.Int      `json:"number"`
-	GasLimit    uint64        `json:"gasLimit"`
-	GasUsed     uint64        `json:"gasUsed"`
-	Timestamp   uint64        `json:"timestamp"`
-	BaseFee     *big.Int      `json:"baseFeePerGas"`
-	Extra       []byte        `json:"extraData"`
+	ParentHash    types.Hash    `json:"parentHash"`
+	Coinbase      types.Address `json:"miner"`
+	StateRoot     types.Hash    `json:"stateRoot"`
+	TxHash        types.Hash    `json:"transactionsRoot"`
+	ReceiptHash   types.Hash    `json:"receiptsRoot"`
+	LogsBloom     types.Bloom   `json:"logsBloom"`
+	Number        *big.Int      `json:"number"`
+	GasLimit      uint64        `json:"gasLimit"`
+	GasUsed       uint64        `json:"gasUsed"`
+	Timestamp     uint64        `json:"timestamp"`
+	BaseFee       *big.Int      `json:"baseFeePerGas"`
+	Extra         []byte        `json:"extraData"`
+	BlobGasUsed   uint64        `json:"blobGasUsed"`
+	ExcessBlobGas uint64        `json:"excessBlobGas"`
 }
 
 // Hash returns the keccak256 hash of the RLP-encoded header.

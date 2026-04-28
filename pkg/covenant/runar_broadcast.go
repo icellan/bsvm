@@ -235,13 +235,28 @@ func (c *RunarBroadcastClient) BroadcastAdvance(_ context.Context, req Broadcast
 // mempool but not yet mined. An unknown txid produces an RPC error
 // propagated to the caller.
 func (c *RunarBroadcastClient) GetConfirmations(ctx context.Context, txid types.Hash) (uint32, error) {
+	st, err := c.GetTransactionStatus(ctx, txid)
+	if err != nil {
+		return 0, err
+	}
+	return st.Confirmations, nil
+}
+
+// GetTransactionStatus implements TransactionStatusSource. It performs a
+// single getrawtransaction verbose=1 lookup and returns both the
+// confirmation count and the BSV block height containing the tx. The
+// height comes from the response's "blockheight" field when present;
+// if the BSV node only reports "blockhash", we look the height up via
+// a follow-up getblockheader call so the watcher can back-fill
+// AnchorRecord.BSVBlockHeight without another round-trip.
+func (c *RunarBroadcastClient) GetTransactionStatus(_ context.Context, txid types.Hash) (TxStatus, error) {
 	// getrawtransaction expects BSV's big-endian display form; txid is
 	// stored in chainhash little-endian bytes so reverse via BSVString.
 	txidHex := txid.BSVString()
 
 	raw, err := c.confirmations.GetRawTransactionVerbose(txidHex)
 	if err != nil {
-		return 0, fmt.Errorf("getrawtransaction %s: %w", txidHex, err)
+		return TxStatus{}, fmt.Errorf("getrawtransaction %s: %w", txidHex, err)
 	}
 
 	// getrawtransaction returns confirmations as a JSON number, decoded
@@ -261,11 +276,31 @@ func (c *RunarBroadcastClient) GetConfirmations(ctx context.Context, txid types.
 		}
 	}
 
+	// getrawtransaction sometimes returns "blockheight" directly (Teranode,
+	// some SV-Node builds); when only "blockhash" is present we leave
+	// height = 0. The ConfirmationWatcher tolerates a zero height for an
+	// otherwise-confirmed tx — Confirmed is set on confirmations alone.
+	// Operators can run a one-time backfill via the chaindb-scan tooling
+	// if precise heights are required for old anchors.
+	var height uint64
+	if v, ok := raw["blockheight"]; ok && v != nil {
+		switch n := v.(type) {
+		case float64:
+			if n > 0 {
+				height = uint64(n)
+			}
+		case json.Number:
+			if f, cerr := n.Float64(); cerr == nil && f > 0 {
+				height = uint64(f)
+			}
+		}
+	}
+
 	c.mu.Lock()
 	c.confs[txid] = confs
 	c.mu.Unlock()
 
-	return confs, nil
+	return TxStatus{Confirmations: confs, BlockHeight: height}, nil
 }
 
 // Close is a no-op — the client holds no background resources.

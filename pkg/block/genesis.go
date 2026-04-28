@@ -103,18 +103,23 @@ func InitGenesis(database db.Database, genesis *Genesis) (*L2Header, error) {
 	}
 
 	// Create genesis header. Coinbase is explicitly set to the zero address
-	// for genesis. No transactions execute in the genesis block.
+	// for genesis. No transactions execute in the genesis block. EIP-4844:
+	// ExcessBlobGas and BlobGasUsed start at zero (no blob activity at
+	// genesis); subsequent blocks update them per the EIP-4844 schedule
+	// (see CalcExcessBlobGas in pkg/block/blobgas.go).
 	header := &L2Header{
-		ParentHash:  types.Hash{},
-		Coinbase:    types.Address{},
-		StateRoot:   genesisRoot,
-		TxHash:      types.EmptyRootHash,
-		ReceiptHash: types.EmptyRootHash,
-		Number:      big.NewInt(0),
-		GasLimit:    gasLimit,
-		GasUsed:     0,
-		Timestamp:   genesis.Timestamp,
-		BaseFee:     new(big.Int), // BaseFee is always 0.
+		ParentHash:    types.Hash{},
+		Coinbase:      types.Address{},
+		StateRoot:     genesisRoot,
+		TxHash:        types.EmptyRootHash,
+		ReceiptHash:   types.EmptyRootHash,
+		Number:        big.NewInt(0),
+		GasLimit:      gasLimit,
+		GasUsed:       0,
+		Timestamp:     genesis.Timestamp,
+		BaseFee:       new(big.Int), // BaseFee is always 0.
+		ExcessBlobGas: 0,
+		BlobGasUsed:   0,
 	}
 
 	// Create genesis block.
