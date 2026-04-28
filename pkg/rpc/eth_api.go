@@ -333,6 +333,22 @@ type dynamicFeeRLPDecode struct {
 	S          *big.Int
 }
 
+// orZeroBig returns v if non-nil, otherwise a fresh zero-valued *big.Int.
+//
+// RLP encodes a *big.Int with value 0 as the empty string (0x80), which the
+// decoder maps back to a nil pointer. The signer's Sender path requires
+// non-nil V/R/S — V in particular is 0 or 1 for typed (EIP-2930/EIP-1559)
+// transactions, so the wire-encoded V routinely round-trips through nil.
+// Materialise the zero explicitly so downstream consumers see a usable big
+// integer rather than a "missing signature values" error. Mirrors the
+// `orZero` helper in pkg/types/transaction.go used by Transaction.DecodeRLP.
+func orZeroBig(v *big.Int) *big.Int {
+	if v == nil {
+		return new(big.Int)
+	}
+	return v
+}
+
 // decodeLegacyRawTx decodes a legacy RLP-encoded transaction.
 func decodeLegacyRawTx(data []byte) (*types.Transaction, error) {
 	var decoded legacyRLPDecode
@@ -350,9 +366,9 @@ func decodeLegacyRawTx(data []byte) (*types.Transaction, error) {
 		To:       decoded.To,
 		Value:    value,
 		Data:     decoded.Data,
-		V:        decoded.V,
-		R:        decoded.R,
-		S:        decoded.S,
+		V:        orZeroBig(decoded.V),
+		R:        orZeroBig(decoded.R),
+		S:        orZeroBig(decoded.S),
 	})
 	return tx, nil
 }
@@ -376,9 +392,9 @@ func decodeAccessListRawTx(data []byte) (*types.Transaction, error) {
 		Value:      value,
 		Data:       decoded.Data,
 		AccessList: decoded.AccessList,
-		V:          decoded.V,
-		R:          decoded.R,
-		S:          decoded.S,
+		V:          orZeroBig(decoded.V),
+		R:          orZeroBig(decoded.R),
+		S:          orZeroBig(decoded.S),
 	})
 	return tx, nil
 }
@@ -403,9 +419,9 @@ func decodeDynamicFeeRawTx(data []byte) (*types.Transaction, error) {
 		Value:      value,
 		Data:       decoded.Data,
 		AccessList: decoded.AccessList,
-		V:          decoded.V,
-		R:          decoded.R,
-		S:          decoded.S,
+		V:          orZeroBig(decoded.V),
+		R:          orZeroBig(decoded.R),
+		S:          orZeroBig(decoded.S),
 	})
 	return tx, nil
 }
