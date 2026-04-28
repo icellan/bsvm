@@ -635,9 +635,10 @@ func cmdRun(ctx *cli.Context) error {
 
 	// 5.6: BEEF-driven bridge monitor is constructed below
 	// (BuildBridgeMonitor at the WireBEEFEndpoints call site). The
-	// block-scanning fallback path (BSVClient.SubscribeNewBlocks /
-	// GetBlockTransactions for non-BEEF deposits) is wired further
-	// down via startBridgeBlockScanner once chaintracks + the
+	// block-scanning fallback path (SubscribeNewBlocks /
+	// GetBlockTransactions on the cmd-side bridgeBSVClient adapter,
+	// driving monitor.ProcessBlock for non-BEEF deposits) is wired
+	// further down via startBridgeBlockScanner once chaintracks + the
 	// optional BSV-node RPC provider are both in scope. See
 	// cmd/bsvm/bridge_bsv_client.go for the adapter shape and the
 	// open gates (no-RPC fallback via WoC, automatic re-subscribe on

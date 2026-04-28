@@ -166,7 +166,6 @@ func newClaimHarness(t *testing.T, allocAddr types.Address, allocBal *uint256.In
 
 	bridgeMon := bridge.NewBridgeMonitor(
 		bridge.DefaultConfig(),
-		nil,
 		overlayNode,
 		database,
 	)

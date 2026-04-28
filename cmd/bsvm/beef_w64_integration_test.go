@@ -130,7 +130,7 @@ func TestWireBEEFEndpoints_W64_BridgeAcceptsValidEnvelope(t *testing.T) {
 	// Bridge monitor: persist deposits to an in-memory DB and watch
 	// the in-memory map for credit confirmation.
 	memDB := db.NewMemoryDB()
-	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, memDB)
+	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, memDB)
 	monitor.SetBridgeScriptHash(bridgeLockBytes)
 	monitor.SetLocalShardID(localShardID)
 
@@ -262,7 +262,7 @@ func TestWireBEEFEndpoints_W64_BridgeRejectsBadMerkle(t *testing.T) {
 	})
 
 	memDB := db.NewMemoryDB()
-	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, memDB)
+	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, memDB)
 	monitor.SetBridgeScriptHash(bridgeLockBytes)
 	monitor.SetLocalShardID(localShardID)
 
@@ -311,7 +311,7 @@ func TestWireBEEFEndpoints_W64_BridgeRejectsBadMerkle(t *testing.T) {
 // This guards against a misconfigured daemon silently minting wBSV.
 func TestWireBEEFEndpoints_W64_BridgeFailClosedNoChaintracks(t *testing.T) {
 	memDB := db.NewMemoryDB()
-	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, memDB)
+	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, memDB)
 
 	rpcServer := newRPCTestServer(t)
 	endpoints := WireBEEFEndpoints(beefWireOpts{

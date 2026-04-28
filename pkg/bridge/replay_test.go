@@ -52,7 +52,7 @@ func newReplayMonitor(t *testing.T, bridgeScript []byte) (*BridgeMonitor, *mockO
 	cfg.BSVConfirmations = 1
 	cfg.MinDepositSatoshis = 1
 	submitter := &mockOverlaySubmitter{}
-	m := NewBridgeMonitor(cfg, &mockBSVClient{}, submitter, store)
+	m := NewBridgeMonitor(cfg, submitter, store)
 	m.SetBridgeScriptHash(bridgeScript)
 	return m, submitter
 }

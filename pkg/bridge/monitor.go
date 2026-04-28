@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,25 +20,6 @@ var horizonKey = []byte("dh")
 // stalenessLimit is the maximum allowed distance (in blocks) between
 // the deposit horizon and the observed BSV tip.
 const stalenessLimit = 3
-
-// BSVClient is the interface for reading BSV blockchain data.
-// This is implemented by the BSV node client or a mock for testing.
-type BSVClient interface {
-	// GetTransaction returns a BSV transaction by its txid.
-	GetTransaction(txid types.Hash) (*BSVTransaction, error)
-
-	// GetBlockHeight returns the current BSV chain tip height.
-	GetBlockHeight() (uint64, error)
-
-	// GetBlockTransactions returns all transactions in a BSV block
-	// at the given height.
-	GetBlockTransactions(height uint64) ([]*BSVTransaction, error)
-
-	// SubscribeNewBlocks returns a channel that receives new BSV
-	// block heights as they are mined. The channel is closed when
-	// the context is cancelled.
-	SubscribeNewBlocks(ctx context.Context) (<-chan uint64, error)
-}
 
 // OverlaySubmitter is the interface for submitting deposit system
 // transactions to the overlay node for inclusion in L2 blocks.
@@ -83,9 +63,15 @@ type ReorgRollbackCallback func(bsvCommonAncestorHeight uint64)
 // overlay node. It also exposes the live BridgeUTXO snapshot so the
 // withdrawal-claim path can read a non-stale (txid, vout, balance) tuple
 // without scanning chaintracks itself.
+//
+// The monitor is purely a state-keeper: it exposes ProcessBlock,
+// RetractDepositsAbove, MarkProcessed, and the deposit / horizon
+// queries. The cmd-side block scanner
+// (cmd/bsvm/bridge_blockscan_wiring.go) drives ProcessBlock /
+// RetractDepositsAbove from a chaintracks-backed adapter; the monitor
+// itself owns no goroutine and no BSV-network client.
 type BridgeMonitor struct {
 	config            Config
-	bsvClient         BSVClient
 	overlay           OverlaySubmitter
 	db                DepositStore
 	bridgeScriptHash  []byte
@@ -99,14 +85,13 @@ type BridgeMonitor struct {
 }
 
 // NewBridgeMonitor creates a new BridgeMonitor with the given
-// configuration, BSV client, overlay submitter, and deposit database.
-// The database is used to persist processed deposits and the deposit
-// horizon across restarts. Pass nil for the database to use in-memory
-// only storage (no persistence across restarts).
-func NewBridgeMonitor(config Config, bsvClient BSVClient, overlay OverlaySubmitter, store DepositStore) *BridgeMonitor {
+// configuration, overlay submitter, and deposit database. The database
+// is used to persist processed deposits and the deposit horizon across
+// restarts. Pass nil for the database to use in-memory only storage (no
+// persistence across restarts).
+func NewBridgeMonitor(config Config, overlay OverlaySubmitter, store DepositStore) *BridgeMonitor {
 	return &BridgeMonitor{
 		config:            config,
-		bsvClient:         bsvClient,
 		overlay:           overlay,
 		db:                store,
 		processedDeposits: make(map[depositID]bool),
@@ -494,31 +479,6 @@ func (m *BridgeMonitor) DepositHorizon() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.lastHorizon
-}
-
-// Run subscribes to new BSV blocks and processes them as they arrive.
-// It blocks until the context is cancelled.
-func (m *BridgeMonitor) Run(ctx context.Context) error {
-	blockCh, err := m.bsvClient.SubscribeNewBlocks(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to new blocks: %w", err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case height, ok := <-blockCh:
-			if !ok {
-				return nil
-			}
-			txs, err := m.bsvClient.GetBlockTransactions(height)
-			if err != nil {
-				return fmt.Errorf("failed to get block transactions at height %d: %w", height, err)
-			}
-			m.ProcessBlock(height, txs)
-		}
-	}
 }
 
 // ValidateHorizon checks that the given horizon is within the

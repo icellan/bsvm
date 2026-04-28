@@ -1,9 +1,11 @@
-// Daemon-side wiring that activates the bridge.BridgeMonitor's block-
-// scanning loop using the bridgeBSVClient adapter (see
-// cmd/bsvm/bridge_bsv_client.go). The BEEF deposit path remains the
-// primary deposit channel; this scanner backs it up for deposits that
-// land directly on-chain (BSV tx with bridge-script output, no BEEF
-// envelope).
+// Daemon-side wiring that drives the bridge.BridgeMonitor's deposit-
+// detection methods (ProcessBlock / RetractDepositsAbove) from a
+// chaintracks-backed adapter (see cmd/bsvm/bridge_bsv_client.go). The
+// scanner replaces the per-package run loop the monitor used to host;
+// the monitor itself is now purely a state-keeper. The BEEF deposit
+// path remains the primary deposit channel; this scanner backs it up
+// for deposits that land directly on-chain (BSV tx with bridge-script
+// output, no BEEF envelope).
 //
 // startBridgeBlockScanner returns a Close function the caller defers
 // so the scanner goroutine + the chaintracks WS subscription unwind
@@ -78,12 +80,13 @@ func bridgeBSVProviderForScan(p BSVProviderClient) bridgeRPCClient {
 	return p
 }
 
-// startBridgeBlockScanner wires the bridge.BridgeMonitor's Run loop
-// against a bridgeBSVClient composed from chaintracks + WoC + the
-// optional BSV-node JSON-RPC failover provider. The scanner runs in its
-// own goroutine and exits when ctx is cancelled. Channel closures /
-// subscribe errors trigger an exponential-backoff reconnect rather
-// than a permanent exit (see file doc-comment).
+// startBridgeBlockScanner wires the bridge.BridgeMonitor's
+// ProcessBlock / RetractDepositsAbove methods against a bridgeBSVClient
+// composed from chaintracks + WoC + the optional BSV-node JSON-RPC
+// failover provider. The scanner runs in its own goroutine and exits
+// when ctx is cancelled. Channel closures / subscribe errors trigger an
+// exponential-backoff reconnect rather than a permanent exit (see file
+// doc-comment).
 //
 // Behaviour:
 //

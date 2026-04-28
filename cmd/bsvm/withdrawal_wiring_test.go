@@ -38,7 +38,7 @@ type withdrawalNoopCase struct {
 func newCompleteWiringOpts(t *testing.T) withdrawalWireOpts {
 	t.Helper()
 	overlayNode, chainDB := newTestOverlayNode(t)
-	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, nil)
+	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil)
 	monitor.SetBridgeScriptHash([]byte{0x76, 0xa9, 0x14}) // arbitrary 3-byte stub
 
 	signer, err := runar.NewLocalSigner("0000000000000000000000000000000000000000000000000000000000000001")

@@ -343,7 +343,7 @@ func TestBridgeBlockScanner_ProcessesDepositOnNewTip(t *testing.T) {
 	cfg.MinDepositSatoshis = 1
 	cfg.BSVConfirmations = 1
 	store := db.NewMemoryDB()
-	monitor := bridge.NewBridgeMonitor(cfg, nil, nil, store)
+	monitor := bridge.NewBridgeMonitor(cfg, nil, store)
 	monitor.SetBridgeScriptHash(bridgeScript)
 	monitor.SetLocalShardID(shardID)
 
@@ -434,7 +434,7 @@ func TestStartBridgeBlockScanner_NilMonitorIsNoOp(t *testing.T) {
 // helper degrades gracefully when the SPV anchor is missing.
 func TestStartBridgeBlockScanner_NilChaintracksIsNoOp(t *testing.T) {
 	cfg := bridge.DefaultConfig()
-	mon := bridge.NewBridgeMonitor(cfg, nil, nil, db.NewMemoryDB())
+	mon := bridge.NewBridgeMonitor(cfg, nil, db.NewMemoryDB())
 	closer, err := startBridgeBlockScanner(context.Background(), mon, nil, nil, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
