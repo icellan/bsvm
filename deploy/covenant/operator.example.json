@@ -1,0 +1,23 @@
+{
+  "_comment": "Sample operator config for deploy/covenant/cmd/deploy. Copy to operator.json (gitignored) and replace every placeholder. The chainId / shardId / governance.keys values below match deploy/testnet/bsvm.testnet.toml so a regtest dry-run that points at this file produces a covenant compatible with the testnet harness.",
+  "shardId": "bsvm-testnet-example",
+  "chainId": 8453111,
+  "verificationMode": "fri",
+  "governance": {
+    "mode": "single_key",
+    "threshold": 0,
+    "keys": ["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"]
+  },
+  "bridgeAdminPubKeyHex": "",
+  "bridgeInitialBalanceSats": 0,
+  "covenantSats": 10000,
+  "vkHashFile": "prover/guest/elf/SP1VerifyingKeyHash.txt",
+  "deployerKeyFile": "/REPLACE/WITH/PATH/TO/deployer.hex",
+  "fundingTxId": "0000000000000000000000000000000000000000000000000000000000000000",
+  "fundingVout": 0,
+  "fundingSats": 200000,
+  "fundingScriptHex": "76a914000000000000000000000000000000000000000088ac",
+  "arcEndpoint": "https://arc-test.taal.com",
+  "arcAuthToken": "",
+  "arcCallbackUrl": ""
+}

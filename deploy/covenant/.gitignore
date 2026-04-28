@@ -1,0 +1,9 @@
+# Operator-supplied configs hold endpoint URLs / tokens. Keep the
+# committed examples (.example.json) and let real configs stay
+# untracked.
+operator.json
+rotation.json
+
+# Wrapper scripts write the JSON summary here after each run.
+.last-deploy.json
+.last-rotation.json

@@ -1,0 +1,19 @@
+{
+  "_comment": "Sample rotate-vk config. Copy to rotation.json (gitignored), replace placeholders, and run ./deploy/covenant/rotate-vk.sh.",
+  "shardId": "bsvm-testnet-example",
+  "chainId": 8453111,
+  "verificationMode": "fri",
+  "governance": {
+    "mode": "single_key",
+    "threshold": 0,
+    "keys": ["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"]
+  },
+  "deployerKeyFile": "/REPLACE/WITH/PATH/TO/deployer.hex",
+  "covenantTxId": "0000000000000000000000000000000000000000000000000000000000000000",
+  "covenantVout": 0,
+  "covenantSatsLive": 10000,
+  "governanceSigsHex": ["REPLACE_WITH_64_BYTE_HEX_SIG"],
+  "newVKHashFile": "prover/guest/elf/SP1VerifyingKeyHash.txt",
+  "arcEndpoint": "https://arc-test.taal.com",
+  "arcAuthToken": ""
+}

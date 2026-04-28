@@ -193,7 +193,7 @@ func (c *BridgeCovenant) Withdraw(
 // ~24 hours) to ensure the deposit has had time to be processed.
 func (c *BridgeCovenant) Refund(
 	refundAmount runar.Bigint, // amount to refund in satoshis
-	locktime runar.ByteString, // sighash preimage for locktime check
+	locktime runar.SigHashPreimage, // sighash preimage for locktime check
 ) {
 	// Verify refund amount is positive and within balance
 	runar.Assert(refundAmount > 0)
