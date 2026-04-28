@@ -68,6 +68,11 @@ type bsvBroadcastResult struct {
 	// uses. Returned so downstream wiring re-uses the same instance
 	// rather than spawning a second connection pool.
 	Provider BSVProviderClient
+	// FeeWallet is the prover's BSV UTXO float. Exposed so the
+	// bridge.Withdrawer can fund per-claim miner fees from it (spec
+	// 07 Input 1 / Output 2). Same wallet the covenant-advance path
+	// spends from — they share UTXOs.
+	FeeWallet *overlay.FeeWallet
 }
 
 // wireBSVBroadcast builds the full covenant-advance broadcast stack —
@@ -223,6 +228,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 		FeeSigner:  localSigner,
 		FeeAddress: feeAddr,
 		Provider:   provider,
+		FeeWallet:  feeWallet,
 	}, nil
 }
 

@@ -75,6 +75,12 @@ type withdrawalWireOpts struct {
 	// (only useful for hermetic tests; production claims will be
 	// rejected by the bridge covenant if unsigned).
 	FeeSigner *runar.LocalSigner
+	// FeeWallet exposes the prover's BSV UTXO float. When set, the
+	// Withdrawer takes the spec-07 claim-tx shape — Input 1 funds the
+	// miner fee from a wallet UTXO (signed by the same FeeSigner key),
+	// Output 2 returns claimer change. nil leaves the legacy
+	// single-input path active (fee absorbed from the bridge change).
+	FeeWallet *overlay.FeeWallet
 	// PollInterval is how often ProcessFinalizedWithdrawals runs.
 	// Defaults to 30s when zero.
 	PollInterval time.Duration
@@ -182,6 +188,18 @@ func WireWithdrawer(opts withdrawalWireOpts) startWithdrawerFunc {
 		WithSigner(signer).
 		WithBridgeUTXOTracker(opts.BridgeMonitor, opts.BridgeMonitor)
 
+	// Spec 07 fee-funding UTXO. Production wiring uses the same
+	// FeeWallet that funds covenant advances — its PrivateKey is the
+	// FeeSigner above, so a single signer covers both inputs of the
+	// claim tx (bridge unlock + P2PKH unlock for the fee UTXO). When
+	// the FeeWallet is not wired the loop falls back to the legacy
+	// single-input path so existing deployments keep working.
+	if opts.FeeWallet != nil {
+		w = w.WithFeeUTXOProvider(&feeWalletUTXOProvider{wallet: opts.FeeWallet})
+	} else {
+		slog.Info("withdrawal processor: fee wallet not wired, using legacy single-input claim tx (fee absorbed from bridge change)")
+	}
+
 	pollInterval := opts.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -280,6 +298,61 @@ func (a *localSignerAdapter) SignInput(rawTxHex string, inputIndex int, prevScri
 	// because the bridge covenant balance fits comfortably in int64
 	// (BSV's 21M coin cap is ~2.1e15 satoshis << math.MaxInt64).
 	return a.signer.Sign(rawTxHex, inputIndex, prevScriptHex, int64(prevSatoshis), nil)
+}
+
+// feeWalletUTXOProvider adapts *overlay.FeeWallet to
+// bridge.FeeUTXOProvider so the Withdrawer can fund per-claim miner
+// fees from the prover's BSV UTXO float (spec 07 Input 1 / Output 2).
+//
+// The adapter selects the smallest single UTXO that covers
+// minSatoshis using the wallet's largest-first SelectUTXOs API.
+// For now we accept multi-UTXO selection only when no single UTXO
+// suffices — the claim-tx builder currently handles a single fee
+// input, so we surface a clear error if the wallet's best candidate
+// is undersized. A multi-input fee UTXO path is a follow-up
+// (TODO(NN-followup)).
+type feeWalletUTXOProvider struct {
+	wallet *overlay.FeeWallet
+}
+
+// ProvideClaimFeeUTXO returns the smallest single FeeWallet UTXO
+// covering minSatoshis. Errors out when the wallet is empty or every
+// available UTXO is undersized — both surfaces are loud-but-recoverable
+// because the Withdrawer logs + defers to the next pass on error.
+func (p *feeWalletUTXOProvider) ProvideClaimFeeUTXO(minSatoshis uint64) (*bridge.FeeUTXO, error) {
+	if p == nil || p.wallet == nil {
+		return nil, errors.New("fee wallet: not configured")
+	}
+	selected, _, err := p.wallet.SelectUTXOs(minSatoshis)
+	if err != nil {
+		return nil, fmt.Errorf("fee wallet: %w", err)
+	}
+	if len(selected) == 0 {
+		return nil, errors.New("fee wallet: empty selection")
+	}
+	if len(selected) > 1 {
+		// Multi-input fee funding requires the claim-tx builder to
+		// accept a slice of fee UTXOs. Until that lands the
+		// largest-first selection still gives us a working path
+		// when at least ONE wallet UTXO covers the budget — log
+		// loudly so operators see we're picking only the first.
+		slog.Warn("fee wallet: multi-utxo selection not yet supported in claim tx, using largest only",
+			"selected_count", len(selected),
+			"budget_sats", minSatoshis,
+			"first_utxo_sats", selected[0].Satoshis,
+		)
+	}
+	u := selected[0]
+	if u.Satoshis < minSatoshis {
+		return nil, fmt.Errorf("fee wallet: largest utxo %d < min %d (multi-input fee funding is TODO(NN-followup))",
+			u.Satoshis, minSatoshis)
+	}
+	return &bridge.FeeUTXO{
+		TxID:          u.TxID,
+		Vout:          u.Vout,
+		Satoshis:      u.Satoshis,
+		LockingScript: append([]byte(nil), u.ScriptPubKey...),
+	}, nil
 }
 
 // bsvTxFetcherAdapter satisfies bridge.BSVTxFetcher by translating the

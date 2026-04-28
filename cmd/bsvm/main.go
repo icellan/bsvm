@@ -929,6 +929,7 @@ func cmdRun(ctx *cli.Context) error {
 		wireOpts.Provider = broadcastWiring.Provider
 		wireOpts.FeeAddress = broadcastWiring.FeeAddress
 		wireOpts.FeeSigner = broadcastWiring.FeeSigner
+		wireOpts.FeeWallet = broadcastWiring.FeeWallet
 	}
 	startWithdrawer := WireWithdrawer(wireOpts)
 	startWithdrawer(bgCtx)
