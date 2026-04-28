@@ -326,15 +326,55 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 		}
 		t.Logf("[bench] %s prove time vs 60s GPU budget: %s", fx.name, state)
 	} else {
-		t.Logf("[bench] %s cycles=%d (budget: %d) wall_ms=%d %s",
-			fx.name, out.Cycles, budget, out.WallMs, hit)
+		// Log format matches the bench spec example exactly:
+		//   [bench] LegacyTransfer cycles=2_345_678 (budget: 5M) wall_ms=42
+		t.Logf("[bench] %s cycles=%s (budget: %s) wall_ms=%d %s",
+			fx.name, formatThousands(out.Cycles), formatBudget(budget),
+			out.WallMs, hit)
 		// Also log instructions + segments + public-values shape so a
 		// regression in any of these is visible in CI output.
-		t.Logf("[bench] %s instructions=%d segments=%d pv_bytes=%d pv_hash=%s",
-			fx.name, out.Instructions, out.Segments,
+		t.Logf("[bench] %s instructions=%s segments=%d pv_bytes=%d pv_hash=%s",
+			fx.name, formatThousands(out.Instructions), out.Segments,
 			(len(out.PublicValues)-2)/2, // strip "0x", divide by 2
 			out.PublicValuesHash)
 	}
+}
+
+// formatThousands renders a uint64 with `_` thousand separators, e.g.
+// `2_345_678`. Mirrors cmd/perf-summary's identically-named helper —
+// duplicated here rather than imported because pkg/prover doesn't link
+// against cmd/.
+func formatThousands(v uint64) string {
+	if v == 0 {
+		return "0"
+	}
+	s := fmt.Sprintf("%d", v)
+	pre := len(s) % 3
+	var out []byte
+	if pre > 0 {
+		out = append(out, s[:pre]...)
+		if len(s) > pre {
+			out = append(out, '_')
+		}
+	}
+	for i := pre; i < len(s); i += 3 {
+		out = append(out, s[i:i+3]...)
+		if i+3 < len(s) {
+			out = append(out, '_')
+		}
+	}
+	return string(out)
+}
+
+// formatBudget renders a budget cycle count compactly: 5_000_000 ⇒
+// `5M`, 50_000_000 ⇒ `50M`. Falls back to formatThousands for values
+// that aren't a whole number of millions, so a future budget like
+// `7_500_000` still renders informatively.
+func formatBudget(v uint64) string {
+	if v >= 1_000_000 && v%1_000_000 == 0 {
+		return fmt.Sprintf("%dM", v/1_000_000)
+	}
+	return formatThousands(v)
 }
 
 // TestSP1Bench runs the bench harness over every equivalenceFixture.
