@@ -152,19 +152,34 @@ type BSVSigner interface {
 }
 
 // FeeUTXOProvider supplies the per-claim fee-funding UTXO required by
-// spec 07's claim-tx structure (Input 1 + Output 2). The Withdrawer
+// spec 07's claim-tx structure (Input 1.. + Output 2). The Withdrawer
 // consults the provider once per claim before invoking
 // BuildWithdrawalClaimTx; returning a nil FeeUTXO falls back to the
 // legacy single-input shape (fee absorbed from the bridge change).
 //
-// minSatoshis hints at the minimum balance the FeeUTXO must carry to
-// cover the fee budget — the provider may return a larger UTXO and
-// the builder will emit the surplus as Output 2 change. When the
-// provider cannot satisfy the request (wallet empty / no eligible
-// UTXO) it returns an error; the Withdrawer surfaces this as a
-// transient failure so the loop retries on the next pass.
+// minSatoshis hints at the minimum balance the FeeUTXO(s) must
+// collectively carry to cover the fee budget — the provider may
+// return more and the builder will emit the surplus as Output 2
+// change. When the provider cannot satisfy the request (wallet empty
+// / no eligible UTXOs) it returns an error; the Withdrawer surfaces
+// this as a transient failure so the loop retries on the next pass.
 type FeeUTXOProvider interface {
 	ProvideClaimFeeUTXO(minSatoshis uint64) (*FeeUTXO, error)
+}
+
+// MultiFeeUTXOProvider is the multi-input extension of
+// FeeUTXOProvider. Implementations that can return more than one
+// fee-funding UTXO should implement this — the Withdrawer prefers it
+// over ProvideClaimFeeUTXO when the provider satisfies the interface.
+// Returning a slice with len==1 is equivalent to the single-UTXO API.
+//
+// The Withdrawer uses MultiFeeUTXOProvider in production wiring so a
+// fee wallet that holds many small UTXOs can still cover a claim
+// without first consolidating. Implementations should return UTXOs in
+// the order they want them spent (typically largest-first to minimise
+// the input count).
+type MultiFeeUTXOProvider interface {
+	ProvideClaimFeeUTXOs(minSatoshis uint64) ([]*FeeUTXO, error)
 }
 
 // Withdrawer orchestrates the complete withdrawal lifecycle:
@@ -387,23 +402,42 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 		csvDelay := CSVDelayForAmount(wd.AmountSatoshis)
 
 		// Spec 07 claim-tx fee-funding UTXO. When a provider is wired
-		// the builder takes the spec-07 path (Input 1 + Output 2);
-		// when no provider is set or the wallet has no eligible UTXO
+		// the builder takes the spec-07 path (Input 1.. + Output 2);
+		// when no provider is set or the wallet has no eligible UTXOs
 		// we fall back to the legacy single-input path so existing
 		// deployments keep working. The minSatoshis hint is a coarse
 		// upper bound on the fee budget — len(claim tx) * sat/byte
 		// is well under 1 KB at typical 1 sat/byte rates, so we
 		// request 5 000 sats (≈ 5x worst-case headroom for retries).
+		//
+		// Providers that implement MultiFeeUTXOProvider take the
+		// multi-input path; the legacy single-UTXO API stays as a
+		// fallback for compatibility with the original FeeUTXOProvider
+		// callers.
 		var feeUTXO *FeeUTXO
+		var feeUTXOs []*FeeUTXO
 		if w.feeUTXOProvider != nil && w.config.ClaimFeeSatPerByte > 0 {
 			minSats := uint64(5000)
-			fu, ferr := w.feeUTXOProvider.ProvideClaimFeeUTXO(minSats)
-			if ferr != nil {
-				slog.Warn("withdrawal claim fee-UTXO unavailable, deferring to next pass",
-					"nonce", wd.Nonce, "error", ferr)
-				break
+			if multi, ok := w.feeUTXOProvider.(MultiFeeUTXOProvider); ok {
+				fus, ferr := multi.ProvideClaimFeeUTXOs(minSats)
+				if ferr != nil {
+					slog.Warn("withdrawal claim fee-UTXOs unavailable, deferring to next pass",
+						"nonce", wd.Nonce, "error", ferr)
+					break
+				}
+				feeUTXOs = fus
+				if len(feeUTXOs) > 0 {
+					feeUTXO = feeUTXOs[0]
+				}
+			} else {
+				fu, ferr := w.feeUTXOProvider.ProvideClaimFeeUTXO(minSats)
+				if ferr != nil {
+					slog.Warn("withdrawal claim fee-UTXO unavailable, deferring to next pass",
+						"nonce", wd.Nonce, "error", ferr)
+					break
+				}
+				feeUTXO = fu
 			}
-			feeUTXO = fu
 		}
 
 		claim := &WithdrawalClaim{
@@ -423,6 +457,7 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			Signer:          w.signer,
 			FeeSatPerByte:   w.config.ClaimFeeSatPerByte,
 			FeeUTXO:         feeUTXO,
+			FeeUTXOs:        feeUTXOs,
 		}
 
 		claimTx, err := BuildWithdrawalClaimTx(claim)
@@ -787,10 +822,10 @@ func extractWithdrawalRootFromOpReturn(script []byte) types.Hash {
 
 // FeeUTXO describes a claimer-funded UTXO that pays the BSV miner fee
 // on a withdrawal claim transaction. Per spec 07 § "Claim transaction
-// structure", the claim tx carries this UTXO as Input 1 and emits the
-// claimer's change as Output 2 — the bridge UTXO (Input 0 / Output 0)
-// is conserved across claims modulo the withdrawal amount only, no
-// fee leakage.
+// structure", the claim tx carries fee-funding inputs as Input 1.. and
+// emits the claimer's change as Output 2 — the bridge UTXO (Input 0 /
+// Output 0) is conserved across claims modulo the withdrawal amount
+// only, no fee leakage.
 //
 // LockingScript is the prevout's scriptPubKey (typically a P2PKH
 // covering the claimer's wallet key — the same key that signs the
@@ -798,9 +833,15 @@ func extractWithdrawalRootFromOpReturn(script []byte) types.Hash {
 // scriptPubKey for Output 2 (claimer change); when omitted it
 // defaults to a P2PKH derived from the same locking-script hash160
 // the FeeUTXO unlocks (i.e. the claimer keeps change at the same
-// address). The Signer field is reused from WithdrawalClaim.Signer —
-// when production wiring uses a single FeeWallet for both inputs, no
-// separate signer is needed here.
+// address). When multiple FeeUTXOs are supplied, only the FIRST
+// non-nil ChangeScript is used; if all are nil the first FeeUTXO's
+// LockingScript is reused.
+//
+// Signer, when set, signs THIS specific fee-funding input. nil falls
+// back to claim.Signer (production wiring uses a single FeeWallet
+// PrivateKey for every input, so a single claim.Signer covers them
+// all). Per-FeeUTXO signers are useful when the wallet selects UTXOs
+// across multiple keys.
 type FeeUTXO struct {
 	TxID          types.Hash
 	Vout          uint32
@@ -810,6 +851,9 @@ type FeeUTXO struct {
 	// builder reuses LockingScript on the assumption the claimer
 	// recycles their own address.
 	ChangeScript []byte
+	// Signer, when non-nil, signs this fee-funding input. nil falls
+	// back to claim.Signer.
+	Signer BSVSigner
 }
 
 // WithdrawalClaim holds the data needed to construct a BSV withdrawal
@@ -861,7 +905,21 @@ type WithdrawalClaim struct {
 	// (claimer change). When nil the builder falls back to the
 	// single-input path with fee absorbed from the bridge change
 	// output — preserved for backwards compatibility / migration.
+	//
+	// When FeeUTXOs (plural) is set, FeeUTXO is treated as a shim
+	// over FeeUTXOs[0] for backwards compatibility — code that
+	// reads FeeUTXO continues to see the first selected UTXO.
 	FeeUTXO *FeeUTXO
+
+	// FeeUTXOs is the multi-input fee-funding form: each entry adds
+	// one Input (Input 1, Input 2, ...) to the claim tx. Output 2
+	// (claimer change) is sized as sum(FeeUTXOs[].Satoshis) - tx_fee
+	// and emitted to the first non-nil ChangeScript (or the first
+	// LockingScript if all ChangeScripts are nil). When set this
+	// supersedes FeeUTXO; when nil/empty the legacy single-FeeUTXO
+	// path (or fully-legacy single-input path if FeeUTXO is also
+	// nil) is used.
+	FeeUTXOs []*FeeUTXO
 }
 
 // WithdrawalClaimTx holds the result of building a withdrawal claim transaction.
@@ -893,21 +951,24 @@ func CSVDelayForAmount(satoshis uint64) uint32 {
 // withdrawal from the bridge covenant.
 //
 // Two transaction shapes are produced depending on whether
-// claim.FeeUTXO is set:
+// claim.FeeUTXO / claim.FeeUTXOs is set:
 //
 // (1) Spec 07 § "Claim transaction structure" — fee-funding UTXO path
-// (claim.FeeUTXO != nil):
+// (claim.FeeUTXO != nil OR claim.FeeUTXOs is non-empty):
 //
-//	Input 0:  Bridge covenant UTXO (unlock script supplied by Signer)
-//	Input 1:  Claimer fee-funding UTXO (P2PKH unlock signed by Signer)
-//	Output 0: New bridge covenant UTXO (balance = BridgeSats - SatoshiAmount, exact)
-//	Output 1: CSV-locked P2PKH payment to user's BSV address (full SatoshiAmount)
-//	Output 2: Claimer change (FeeUTXO.Satoshis - fee)
-//	Output 3: OP_RETURN withdrawal receipt
+//	Input 0:        Bridge covenant UTXO (unlock script supplied by Signer)
+//	Input 1..N:     Claimer fee-funding UTXOs (P2PKH unlocks)
+//	Output 0:       New bridge covenant UTXO (balance = BridgeSats - SatoshiAmount, exact)
+//	Output 1:       CSV-locked P2PKH payment to user's BSV address (full SatoshiAmount)
+//	Output 2:       Claimer change (sum(FeeUTXOs[].Satoshis) - fee)
+//	Output 3:       OP_RETURN withdrawal receipt
 //
 // In this shape the bridge balance is conserved exactly across claims
 // (no fee leakage). The miner fee is paid from the claimer's
-// fee-funding UTXO and any remainder lands in Output 2.
+// fee-funding UTXOs and any remainder lands in Output 2.
+// claim.FeeUTXO is treated as a single-element FeeUTXOs slice for
+// backwards compatibility; claim.FeeUTXOs takes precedence when
+// non-empty.
 //
 // (2) Legacy single-input path (claim.FeeUTXO == nil):
 //
@@ -947,8 +1008,17 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 		return nil, fmt.Errorf("bridge script must not be empty")
 	}
 
-	if claim.FeeUTXO != nil {
-		return buildClaimTxWithFeeUTXO(claim)
+	// Normalise FeeUTXO / FeeUTXOs into a single working slice so
+	// callers can use either field interchangeably. Precedence:
+	// FeeUTXOs (multi) wins when non-empty; otherwise the singular
+	// FeeUTXO becomes the sole entry; nil/empty in both falls
+	// through to the legacy single-input path.
+	working := claim.FeeUTXOs
+	if len(working) == 0 && claim.FeeUTXO != nil {
+		working = []*FeeUTXO{claim.FeeUTXO}
+	}
+	if len(working) > 0 {
+		return buildClaimTxWithFeeUTXO(claim, working)
 	}
 	return buildClaimTxLegacy(claim)
 }
@@ -1037,16 +1107,33 @@ func buildClaimTxLegacy(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) {
 }
 
 // buildClaimTxWithFeeUTXO emits the spec-07 claim-tx shape: bridge
-// balance is conserved exactly, miner fee is paid from a separate
-// claimer-funded UTXO (Input 1) with the remainder going to claimer
-// change (Output 2).
-func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) {
-	fu := claim.FeeUTXO
-	if len(fu.LockingScript) == 0 {
-		return nil, fmt.Errorf("fee UTXO locking script must not be empty")
+// balance is conserved exactly, miner fee is paid from one or more
+// separate claimer-funded UTXOs (Input 1, Input 2, ...) with the
+// remainder going to claimer change (Output 2). feeUTXOs must be a
+// non-empty slice; each entry contributes one input.
+func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim, feeUTXOs []*FeeUTXO) (*WithdrawalClaimTx, error) {
+	if len(feeUTXOs) == 0 {
+		return nil, fmt.Errorf("fee UTXOs slice must not be empty")
 	}
-	if fu.Satoshis == 0 {
-		return nil, fmt.Errorf("fee UTXO satoshis must be positive")
+	var totalFeeSats uint64
+	for i, fu := range feeUTXOs {
+		if fu == nil {
+			return nil, fmt.Errorf("fee UTXOs[%d] must not be nil", i)
+		}
+		if len(fu.LockingScript) == 0 {
+			return nil, fmt.Errorf("fee UTXOs[%d] locking script must not be empty", i)
+		}
+		if fu.Satoshis == 0 {
+			return nil, fmt.Errorf("fee UTXOs[%d] satoshis must be positive", i)
+		}
+		// Detect uint64 overflow defensively. Worst-case BSV float in
+		// a single wallet is ~21M BSV = 2.1e15 sats << MaxUint64, but
+		// we still guard so the builder never produces a tx with a
+		// silently-wrapped change output.
+		if totalFeeSats+fu.Satoshis < totalFeeSats {
+			return nil, fmt.Errorf("fee UTXOs sum overflows uint64")
+		}
+		totalFeeSats += fu.Satoshis
 	}
 
 	csvDelay := claim.CSVDelay
@@ -1074,13 +1161,15 @@ func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error)
 		sequence: 0xffffffff,
 	})
 
-	// Input 1: claimer fee-funding UTXO.
-	tx.inputs = append(tx.inputs, bsvInput{
-		prevTxID: fu.TxID,
-		prevVout: fu.Vout,
-		script:   nil,
-		sequence: 0xffffffff,
-	})
+	// Inputs 1..: claimer fee-funding UTXOs (one per FeeUTXO).
+	for _, fu := range feeUTXOs {
+		tx.inputs = append(tx.inputs, bsvInput{
+			prevTxID: fu.TxID,
+			prevVout: fu.Vout,
+			script:   nil,
+			sequence: 0xffffffff,
+		})
+	}
 
 	// Output 0: bridge continuation (exact, no fee).
 	tx.outputs = append(tx.outputs, bsvOutput{
@@ -1097,13 +1186,12 @@ func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error)
 
 	// Output 2: claimer change (placeholder value patched after fee
 	// computation; the script is fixed so the tx-byte size is stable
-	// across the patch).
-	changeScript := fu.ChangeScript
-	if len(changeScript) == 0 {
-		changeScript = fu.LockingScript
-	}
+	// across the patch). The change script is taken from the first
+	// non-nil ChangeScript; if all are nil we reuse the first
+	// FeeUTXO's LockingScript (the claimer recycles their address).
+	changeScript := selectChangeScript(feeUTXOs)
 	tx.outputs = append(tx.outputs, bsvOutput{
-		value:  fu.Satoshis, // patched below to fu.Satoshis - fee
+		value:  totalFeeSats, // patched below to totalFeeSats - fee
 		script: changeScript,
 	})
 
@@ -1114,13 +1202,12 @@ func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error)
 		script: receiptScript,
 	})
 
-	// Sign both inputs if a signer is configured. The two-pass
-	// protocol mirrors fee_wallet_consolidate.go: serialise the
-	// unsigned skeleton, ask the signer for each input's unlock-hex
-	// (giving it the prevout's locking script + satoshi amount),
-	// splice each unlock back in. Same Signer covers both inputs in
-	// production (single FeeWallet key); the caller owns multi-key
-	// signing if they need it.
+	// Sign each input if a signer is configured. The two-pass protocol
+	// mirrors fee_wallet_consolidate.go: serialise the unsigned skeleton,
+	// ask the signer for each input's unlock-hex (giving it the prevout's
+	// locking script + satoshi amount), splice each unlock back in. The
+	// claim-level signer covers Input 0 (the bridge); each FeeUTXO may
+	// override its own signer (otherwise it falls back to claim.Signer).
 	if claim.Signer != nil {
 		skeleton := tx.serialize()
 		skeletonHex := hex.EncodeToString(skeleton)
@@ -1136,28 +1223,35 @@ func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error)
 		}
 		tx.inputs[0].script = bridgeUnlock
 
-		feeUnlockHex, err := claim.Signer.SignInput(skeletonHex, 1,
-			hex.EncodeToString(fu.LockingScript), fu.Satoshis)
-		if err != nil {
-			return nil, fmt.Errorf("sign fee-funding input: %w", err)
+		for i, fu := range feeUTXOs {
+			signer := fu.Signer
+			if signer == nil {
+				signer = claim.Signer
+			}
+			inputIdx := i + 1
+			feeUnlockHex, err := signer.SignInput(skeletonHex, inputIdx,
+				hex.EncodeToString(fu.LockingScript), fu.Satoshis)
+			if err != nil {
+				return nil, fmt.Errorf("sign fee-funding input %d: %w", inputIdx, err)
+			}
+			feeUnlock, err := hex.DecodeString(feeUnlockHex)
+			if err != nil {
+				return nil, fmt.Errorf("decode fee-funding unlock script for input %d: %w", inputIdx, err)
+			}
+			tx.inputs[inputIdx].script = feeUnlock
 		}
-		feeUnlock, err := hex.DecodeString(feeUnlockHex)
-		if err != nil {
-			return nil, fmt.Errorf("decode fee-funding unlock script: %w", err)
-		}
-		tx.inputs[1].script = feeUnlock
 	}
 
 	// Subtract the BSV miner fee from the claimer-change output
 	// (Output 2). The bridge UTXO (Output 0) stays exact. We compute
 	// against the post-signing size so the rate is honoured; patching
 	// a fixed-width uint64 doesn't change layout, so size is stable.
-	changeBalance := fu.Satoshis
+	changeBalance := totalFeeSats
 	if claim.FeeSatPerByte > 0 {
 		serialized := tx.serialize()
 		fee := uint64(claim.FeeSatPerByte) * uint64(len(serialized))
 		if fee > changeBalance {
-			return nil, fmt.Errorf("claim fee %d exceeds fee-UTXO balance %d (rate=%d sat/byte, size=%d)",
+			return nil, fmt.Errorf("claim fee %d exceeds fee-UTXO total %d (rate=%d sat/byte, size=%d)",
 				fee, changeBalance, claim.FeeSatPerByte, len(serialized))
 		}
 		changeBalance -= fee
@@ -1173,6 +1267,19 @@ func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error)
 		NewBalance: newBridgeBalance,
 		CSVDelay:   csvDelay,
 	}, nil
+}
+
+// selectChangeScript returns the change-script for Output 2 in the
+// spec-07 multi-input claim-tx shape: the first non-nil ChangeScript
+// in feeUTXOs, falling back to the first FeeUTXO's LockingScript when
+// all ChangeScripts are nil. Caller guarantees feeUTXOs is non-empty.
+func selectChangeScript(feeUTXOs []*FeeUTXO) []byte {
+	for _, fu := range feeUTXOs {
+		if len(fu.ChangeScript) > 0 {
+			return fu.ChangeScript
+		}
+	}
+	return feeUTXOs[0].LockingScript
 }
 
 // buildCSVLockedP2PKH creates a CSV-locked P2PKH script:

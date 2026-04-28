@@ -13,8 +13,34 @@ import (
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/chaintracks"
+	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// makeBridgeScriptWithState produces a synthetic bridge-covenant
+// locking script that embeds the given BridgeState as a 48-byte
+// pushdata so the cold-boot recovery's parser can decode the
+// canonical LastClaimedNonce. Non-state fragments around the
+// pushdata mirror the verifier preamble emitted by Rúnar codegen but
+// are not significant to the parser.
+func makeBridgeScriptWithState(withdrawalNonce uint64) []byte {
+	state := covenant.BridgeState{
+		Balance:               0, // not used by parser; output value carries balance
+		WithdrawalNonce:       withdrawalNonce,
+		WithdrawalsCommitment: types.Hash{},
+	}
+	encoded := state.Encode()
+	var script []byte
+	// 32-byte readonly slot first (StateCovenantScriptHash).
+	script = append(script, 0x20) // direct push of 32 bytes
+	script = append(script, make([]byte, 32)...)
+	// 48-byte BridgeState pushdata.
+	script = append(script, 0x30) // direct push of 48 bytes
+	script = append(script, encoded...)
+	// Non-push opcodes (mirror the preamble).
+	script = append(script, 0x76, 0xa9, 0x88)
+	return script
+}
 
 // fakeRecoveryBlockClient is the in-memory bridgeRecoveryBlockClient
 // the recovery tests drive. blocks maps height → tx slice; missing
@@ -620,6 +646,360 @@ func TestBootPath_BuildBridgeMonitorThenRecover(t *testing.T) {
 	if got.LastClaimedNonce != 5 {
 		t.Errorf("LastClaimedNonce = %d, want 5 (preserved from operator hint)", got.LastClaimedNonce)
 	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ChainNonceWinsOverHint pins the
+// round-7 follow-up policy: when the on-chain locking script encodes
+// a parseable BridgeState with WithdrawalNonce N, the recovery uses
+// N-1 as LastClaimedNonce regardless of what the operator hint says.
+// The hint becomes a fallback only for the unparseable-script case.
+func TestRecoverBridgeUTXOFromChain_ChainNonceWinsOverHint(t *testing.T) {
+	bridgeScript := makeBridgeScriptWithState(7) // chain says 7 claimed (next claim = 7)
+	chainTxID := hashAt(0xab)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 100}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			99: {makeBridgeOutputTx(chainTxID, bridgeScript, 5_000)},
+		},
+	}
+
+	// Hint claims a different (and stale) nonce.
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          5_000,
+		LastClaimedNonce: 3, // stale
+		Script:           bridgeScript,
+	}
+
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	// Chain says WithdrawalNonce=7 → LastClaimedNonce=6. Hint says 3.
+	if got.LastClaimedNonce != 6 {
+		t.Errorf("LastClaimedNonce = %d, want 6 (chain wins over stale hint)",
+			got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ParseFailureFallsBackToHintNonce
+// pins the fallback path: when the on-chain script does NOT contain a
+// parseable BridgeState pushdata, the recovery uses the hint's
+// LastClaimedNonce so an undecodable artifact doesn't reset the
+// Withdrawer to nonce 0.
+func TestRecoverBridgeUTXOFromChain_ParseFailureFallsBackToHintNonce(t *testing.T) {
+	bridgeScript := []byte{0x76, 0xa9, 0x14, 0x00, 0x88, 0xac} // P2PKH-shaped, no 48-byte push
+	chainTxID := hashAt(0xcd)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 50}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			49: {makeBridgeOutputTx(chainTxID, bridgeScript, 1_000)},
+		},
+	}
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          1_000,
+		LastClaimedNonce: 9,
+		Script:           bridgeScript,
+	}
+
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	if got.LastClaimedNonce != 9 {
+		t.Errorf("LastClaimedNonce = %d, want 9 (hint preserved on parse failure)",
+			got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ChainNonceZeroPrefersHint pins the
+// asymmetry described in applyHintNonceFallback: an on-chain nonce
+// of 0 is indistinguishable from a parse failure in the
+// LastClaimedNonceUnset sentinel, so we prefer the hint when the
+// chain-decoded nonce sits at the unset sentinel and the hint has
+// real data.
+func TestRecoverBridgeUTXOFromChain_ChainNonceZeroPrefersHint(t *testing.T) {
+	bridgeScript := makeBridgeScriptWithState(0) // genuinely no claims yet
+	chainTxID := hashAt(0xef)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 30}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			29: {makeBridgeOutputTx(chainTxID, bridgeScript, 100)},
+		},
+	}
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          100,
+		LastClaimedNonce: 4,
+		Script:           bridgeScript,
+	}
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		5,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	if got.LastClaimedNonce != 4 {
+		t.Errorf("LastClaimedNonce = %d, want 4 (hint preferred when chain reports unset/0)",
+			got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChainHistory_UpgradeBoundary pins the
+// covenant-upgrade walker behaviour: blocks 1-2 paid an OLD bridge
+// script, blocks 4-5 paid a NEW bridge script (block 3 has no bridge
+// tx). The walker must find block 5's UTXO under the new hash and
+// log a (info-level) hint that the chain has the new version active.
+// We simulate this by setting the tip at block 5 and supplying both
+// scripts in history (old first, new last).
+func TestRecoverBridgeUTXOFromChainHistory_UpgradeBoundary(t *testing.T) {
+	oldScript := []byte{0xde, 0xad, 0xbe, 0xef}
+	newScript := []byte{0xca, 0xfe, 0xba, 0xbe}
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 5}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			1: {makeBridgeOutputTx(hashAt(0x01), oldScript, 100)},
+			2: {makeBridgeOutputTx(hashAt(0x02), oldScript, 200)},
+			3: {makeUnrelatedTx(hashAt(0x03))},
+			4: {makeBridgeOutputTx(hashAt(0x04), newScript, 400)},
+			5: {makeBridgeOutputTx(hashAt(0x05), newScript, 500)},
+		},
+	}
+
+	monitor := newRecoveryMonitor(t)
+	history := []ScriptHashVersion{
+		{Index: 0, Hash: oldScript},
+		{Index: 1, Hash: newScript},
+	}
+	if err := recoverBridgeUTXOFromChainHistory(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		nil,
+		history,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChainHistory: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	// Newest match is block 5, balance 500, script newScript.
+	if got.TxID != hashAt(0x05) {
+		t.Errorf("TxID = %x, want %x (block 5 newest match)", got.TxID, hashAt(0x05))
+	}
+	if got.Balance != 500 {
+		t.Errorf("Balance = %d, want 500", got.Balance)
+	}
+	if !scriptHashesEqual(got.Script, newScript) {
+		t.Errorf("Script = %x, want %x (newest version)", got.Script, newScript)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChainHistory_OldVersionMatchOnly pins the
+// "no new-version activity yet" branch: history contains both old
+// and new scripts but the chain has only paid the old one. The
+// walker matches on the old version and emits a WARN about the
+// upgrade boundary so operators can spot a stale chain.
+func TestRecoverBridgeUTXOFromChainHistory_OldVersionMatchOnly(t *testing.T) {
+	oldScript := []byte{0xab, 0xcd}
+	newScript := []byte{0x12, 0x34}
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 5}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			3: {makeBridgeOutputTx(hashAt(0xa1), oldScript, 100)},
+		},
+	}
+
+	monitor := newRecoveryMonitor(t)
+	history := []ScriptHashVersion{
+		{Index: 0, Hash: oldScript},
+		{Index: 1, Hash: newScript},
+	}
+	if err := recoverBridgeUTXOFromChainHistory(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		nil,
+		history,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChainHistory: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	// Walker should have matched against oldScript at block 3.
+	if !scriptHashesEqual(got.Script, oldScript) {
+		t.Errorf("Script = %x, want %x (old version)", got.Script, oldScript)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChainHistory_SingleVersionEquivalentToPP
+// pins that supplying a one-element history matches the
+// pre-upgrade (PP) single-hash recovery semantics byte-for-byte.
+func TestRecoverBridgeUTXOFromChainHistory_SingleVersionEquivalentToPP(t *testing.T) {
+	bridgeScript := []byte{0x99, 0x88}
+	chainTxID := hashAt(0xfe)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 50}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			49: {makeBridgeOutputTx(chainTxID, bridgeScript, 1000)},
+		},
+	}
+
+	// Path 1: single-hash legacy entry point.
+	monitorLegacy := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitorLegacy,
+		nil,
+		bridgeScript,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	gotLegacy := monitorLegacy.CurrentBridgeUTXO()
+
+	// Path 2: history-aware entry point with len(history)==1.
+	monitorMulti := newRecoveryMonitor(t)
+	history := []ScriptHashVersion{{Index: 0, Hash: bridgeScript}}
+	if err := recoverBridgeUTXOFromChainHistory(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitorMulti,
+		nil,
+		history,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChainHistory: %v", err)
+	}
+	gotMulti := monitorMulti.CurrentBridgeUTXO()
+
+	if gotLegacy == nil || gotMulti == nil {
+		t.Fatal("expected both paths to discover a UTXO")
+	}
+	if gotLegacy.TxID != gotMulti.TxID || gotLegacy.Balance != gotMulti.Balance {
+		t.Errorf("legacy vs multi mismatch: legacy=%+v multi=%+v", gotLegacy, gotMulti)
+	}
+}
+
+// TestBuildBridgeScriptHashHistory_AppendsCurrent verifies that the
+// helper turns hex strings + a current-hash into an ordered slice
+// where the current hash is last (newest version). Empty entries are
+// skipped.
+func TestBuildBridgeScriptHashHistory_AppendsCurrent(t *testing.T) {
+	historyHex := []string{
+		"deadbeef",
+		"",         // skipped
+		"0xcafe01", // 0x prefix tolerated
+	}
+	current := []byte{0x99, 0x88, 0x77}
+
+	out, err := buildBridgeScriptHashHistory(historyHex, current)
+	if err != nil {
+		t.Fatalf("buildBridgeScriptHashHistory: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d entries, want 3", len(out))
+	}
+	if !scriptHashesEqual(out[0].Hash, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Errorf("entry 0 = %x, want deadbeef", out[0].Hash)
+	}
+	if !scriptHashesEqual(out[1].Hash, []byte{0xca, 0xfe, 0x01}) {
+		t.Errorf("entry 1 = %x, want cafe01", out[1].Hash)
+	}
+	if !scriptHashesEqual(out[2].Hash, current) {
+		t.Errorf("entry 2 = %x, want %x", out[2].Hash, current)
+	}
+	// Indices are 0..N-1.
+	for i, v := range out {
+		if v.Index != i {
+			t.Errorf("entry %d Index = %d, want %d", i, v.Index, i)
+		}
+	}
+}
+
+// TestBuildBridgeScriptHashHistory_RejectsMalformedHex pins the
+// error surface for invalid hex.
+func TestBuildBridgeScriptHashHistory_RejectsMalformedHex(t *testing.T) {
+	_, err := buildBridgeScriptHashHistory([]string{"not-hex"}, []byte{0x01})
+	if err == nil {
+		t.Fatal("expected error for malformed hex")
+	}
+}
+
+// scriptHashesEqual is a tiny helper to avoid pulling bytes into this test
+// file (it's already imported by the package, but cleaner to keep
+// the tests self-contained).
+func scriptHashesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestRecoverBridgeUTXOFromChain_TransientBlockErrorSkips pins that a

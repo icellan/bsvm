@@ -18,6 +18,40 @@ func makeFeeUTXO(sats uint64) *FeeUTXO {
 	}
 }
 
+// makeFeeUTXOAt returns a FeeUTXO with the given txid byte-pattern and
+// satoshi value. Used to plant distinct multi-input UTXOs in tests.
+func makeFeeUTXOAt(txidPattern byte, sats uint64) *FeeUTXO {
+	var h types.Hash
+	for i := range h {
+		h[i] = txidPattern
+	}
+	return &FeeUTXO{
+		TxID:          h,
+		Vout:          0,
+		Satoshis:      sats,
+		LockingScript: []byte{0x76, 0xa9, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x88, 0xac},
+	}
+}
+
+// recordingSigner returns a fixed unlock script for every input and
+// records the satoshi/script values it was called with. Used to
+// assert that each input was signed against its own prevout data.
+type recordingSigner struct {
+	unlockHex string
+	calls     []recordingSignerCall
+}
+
+type recordingSignerCall struct {
+	inputIndex   int
+	prevScript   string
+	prevSatoshis uint64
+}
+
+func (s *recordingSigner) SignInput(_ string, inputIndex int, prevScript string, prevSatoshis uint64) (string, error) {
+	s.calls = append(s.calls, recordingSignerCall{inputIndex: inputIndex, prevScript: prevScript, prevSatoshis: prevSatoshis})
+	return s.unlockHex, nil
+}
+
 // TestBuildWithdrawalClaimTx_WithFeeUTXO_ConservesBridgeBalance
 // asserts spec 07's claim-tx shape: Output 0 = BridgeSats - SatoshiAmount
 // exactly (no fee leakage from bridge). Output 2 = FeeUTXO.Satoshis - fee.
@@ -157,6 +191,208 @@ func TestBuildWithdrawalClaimTx_LegacyPathUnchanged(t *testing.T) {
 	if dec.outputs[0].value >= bridgeSats-withdrawSats {
 		t.Errorf("legacy bridge change = %d, expected < %d (fee absorbed)",
 			dec.outputs[0].value, bridgeSats-withdrawSats)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_MultipleFeeUTXOs_FourInputs verifies the
+// spec-07 multi-input fee-funding path: 3 fee UTXOs produce 4 inputs
+// (bridge + 3 fee), each signed correctly, with claimer change equal
+// to the sum of fee-UTXO sats minus the miner fee.
+func TestBuildWithdrawalClaimTx_MultipleFeeUTXOs_FourInputs(t *testing.T) {
+	const (
+		bridgeSats    = uint64(100_000_000_000)
+		withdrawSats  = uint64(50_000_000)
+		feeSatPerByte = int64(1)
+	)
+
+	addr := bytes.Repeat([]byte{0xab}, 20)
+	feeUTXOs := []*FeeUTXO{
+		makeFeeUTXOAt(0xa1, 4_000),
+		makeFeeUTXOAt(0xa2, 5_000),
+		makeFeeUTXOAt(0xa3, 6_000),
+	}
+	totalFeeSats := uint64(4_000 + 5_000 + 6_000)
+
+	signer := &recordingSigner{unlockHex: "5151"}
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.HexToHash("0xb1"),
+		BridgeVout:    0,
+		BridgeSats:    bridgeSats,
+		BridgeScript:  []byte{0x52, 0x53},
+		BSVAddress:    addr,
+		SatoshiAmount: withdrawSats,
+		Nonce:         0,
+		FeeSatPerByte: feeSatPerByte,
+		Signer:        signer,
+		FeeUTXOs:      feeUTXOs,
+	}
+	out, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	if out.NewBalance != bridgeSats-withdrawSats {
+		t.Errorf("NewBalance = %d, want %d (bridge conserved)",
+			out.NewBalance, bridgeSats-withdrawSats)
+	}
+
+	dec, err := decodeRawTx(out.RawTx)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := len(dec.inputs); got != 4 {
+		t.Errorf("inputs = %d, want 4 (bridge + 3 fee)", got)
+	}
+	if got := len(dec.outputs); got != 4 {
+		t.Errorf("outputs = %d, want 4", got)
+	}
+
+	// Each fee input must reference its corresponding FeeUTXO outpoint.
+	for i, fu := range feeUTXOs {
+		idx := i + 1
+		if dec.inputs[idx].prevTxID != fu.TxID {
+			t.Errorf("input %d prevTxID = %x, want %x", idx, dec.inputs[idx].prevTxID, fu.TxID)
+		}
+	}
+
+	// Signer must have been called once per input (4 total) with
+	// the right satoshi value.
+	if len(signer.calls) != 4 {
+		t.Fatalf("signer calls = %d, want 4", len(signer.calls))
+	}
+	if signer.calls[0].prevSatoshis != bridgeSats {
+		t.Errorf("input 0 sats = %d, want %d", signer.calls[0].prevSatoshis, bridgeSats)
+	}
+	for i, fu := range feeUTXOs {
+		idx := i + 1
+		if signer.calls[idx].prevSatoshis != fu.Satoshis {
+			t.Errorf("input %d sats = %d, want %d (FeeUTXO[%d])",
+				idx, signer.calls[idx].prevSatoshis, fu.Satoshis, i)
+		}
+	}
+
+	// Claimer change must reflect total fee UTXO sats minus the fee.
+	if dec.outputs[2].value == 0 {
+		t.Error("claimer change = 0, expected positive")
+	}
+	if dec.outputs[2].value >= totalFeeSats {
+		t.Errorf("claimer change %d >= total fee sats %d (fee not deducted)",
+			dec.outputs[2].value, totalFeeSats)
+	}
+	// Conservation: in - out = fee.
+	totalIn := bridgeSats + totalFeeSats
+	totalOut := dec.outputs[0].value + dec.outputs[1].value + dec.outputs[2].value + dec.outputs[3].value
+	if totalIn-totalOut == 0 && feeSatPerByte > 0 {
+		t.Error("expected non-zero fee")
+	}
+	if totalOut > totalIn {
+		t.Errorf("output sum %d exceeds input sum %d (impossible)", totalOut, totalIn)
+	}
+}
+
+// TestBuildWithdrawalClaimTx_EmptyFeeUTXOsFallsThroughToLegacy
+// verifies that an empty FeeUTXOs slice (with FeeUTXO also nil) falls
+// through to the legacy single-input shape. This is the migration
+// safety net.
+func TestBuildWithdrawalClaimTx_EmptyFeeUTXOsFallsThroughToLegacy(t *testing.T) {
+	const (
+		bridgeSats   = uint64(100_000_000_000)
+		withdrawSats = uint64(50_000_000)
+	)
+	addr := bytes.Repeat([]byte{0xab}, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.HexToHash("0xb1"),
+		BridgeVout:    0,
+		BridgeSats:    bridgeSats,
+		BridgeScript:  []byte{0x52, 0x53},
+		BSVAddress:    addr,
+		SatoshiAmount: withdrawSats,
+		Nonce:         0,
+		FeeSatPerByte: 1,
+		FeeUTXOs:      []*FeeUTXO{}, // empty, not nil
+	}
+	out, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	dec, err := decodeRawTx(out.RawTx)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(dec.inputs) != 1 {
+		t.Errorf("legacy inputs = %d, want 1", len(dec.inputs))
+	}
+	if len(dec.outputs) != 3 {
+		t.Errorf("legacy outputs = %d, want 3", len(dec.outputs))
+	}
+}
+
+// TestBuildWithdrawalClaimTx_TotalFeeUTXOsBelowFee asserts that when
+// the sum of fee UTXOs cannot cover the miner fee the builder rejects
+// the claim with a clear error before signing.
+func TestBuildWithdrawalClaimTx_TotalFeeUTXOsBelowFee(t *testing.T) {
+	addr := bytes.Repeat([]byte{0xab}, 20)
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.HexToHash("0xb1"),
+		BridgeVout:    0,
+		BridgeSats:    100_000_000_000,
+		BridgeScript:  []byte{0x52, 0x53},
+		BSVAddress:    addr,
+		SatoshiAmount: 50_000_000,
+		Nonce:         0,
+		FeeSatPerByte: 100, // wildly above realistic
+		FeeUTXOs: []*FeeUTXO{
+			makeFeeUTXOAt(0xa1, 10),
+			makeFeeUTXOAt(0xa2, 20),
+		},
+	}
+	_, err := BuildWithdrawalClaimTx(claim)
+	if err == nil {
+		t.Fatal("expected fee-total-insufficient error")
+	}
+	if !strings.Contains(err.Error(), "fee") {
+		t.Errorf("error %q does not mention fee", err.Error())
+	}
+}
+
+// TestBuildWithdrawalClaimTx_FeeUTXOsTakesPrecedenceOverFeeUTXO
+// verifies that when both the singular FeeUTXO and the FeeUTXOs slice
+// are set, FeeUTXOs wins and produces the multi-input shape.
+func TestBuildWithdrawalClaimTx_FeeUTXOsTakesPrecedenceOverFeeUTXO(t *testing.T) {
+	addr := bytes.Repeat([]byte{0xab}, 20)
+	multiInputs := []*FeeUTXO{
+		makeFeeUTXOAt(0xa1, 5_000),
+		makeFeeUTXOAt(0xa2, 5_000),
+	}
+	claim := &WithdrawalClaim{
+		BridgeTxID:    types.HexToHash("0xb1"),
+		BridgeVout:    0,
+		BridgeSats:    100_000_000_000,
+		BridgeScript:  []byte{0x52, 0x53},
+		BSVAddress:    addr,
+		SatoshiAmount: 50_000_000,
+		Nonce:         0,
+		FeeSatPerByte: 1,
+		FeeUTXO:       makeFeeUTXOAt(0xff, 999_999), // singular — should be ignored
+		FeeUTXOs:      multiInputs,
+	}
+	out, err := BuildWithdrawalClaimTx(claim)
+	if err != nil {
+		t.Fatalf("BuildWithdrawalClaimTx: %v", err)
+	}
+	dec, err := decodeRawTx(out.RawTx)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// 1 bridge + 2 fee inputs from FeeUTXOs (FeeUTXO[0xff] must NOT
+	// appear).
+	if len(dec.inputs) != 3 {
+		t.Errorf("inputs = %d, want 3 (bridge + 2 from FeeUTXOs)", len(dec.inputs))
+	}
+	for i, fu := range multiInputs {
+		if dec.inputs[i+1].prevTxID != fu.TxID {
+			t.Errorf("input %d prevTxID mismatch: got %x, want %x",
+				i+1, dec.inputs[i+1].prevTxID, fu.TxID)
+		}
 	}
 }
 

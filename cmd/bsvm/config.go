@@ -383,6 +383,18 @@ type BridgeSection struct {
 	// envelopes are stored but no L2 credit is applied.
 	BridgeScriptHex string `toml:"bridge_script_hex"`
 
+	// BridgeScriptHexHistory is the ordered list of PRIOR bridge
+	// covenant locking scripts (oldest first). When the bridge
+	// covenant is upgraded mid-walk via governance freeze+upgrade the
+	// cold-boot recovery's chain walker matches outputs against ANY
+	// of these hashes plus the current BridgeScriptHex; the most
+	// recent (newest version) match wins, and the upgrade boundary is
+	// logged loudly. Leaving this empty means "no upgrades" (the
+	// walker matches BridgeScriptHex only). Each entry is the hex
+	// encoding of a complete locking script — same format as
+	// BridgeScriptHex.
+	BridgeScriptHexHistory []string `toml:"bridge_script_hex_history"`
+
 	// BridgeUTXOTxIDHex / BridgeUTXOVout / BridgeUTXOBalanceSat seed the
 	// live bridge UTXO snapshot the BridgeMonitor exposes via
 	// CurrentBridgeUTXO. Operators set these once at boot from the most

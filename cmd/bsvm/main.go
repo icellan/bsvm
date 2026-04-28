@@ -916,14 +916,23 @@ func cmdRun(ctx *cli.Context) error {
 				"err", recAdapterErr,
 			)
 		} else {
+			// Build the script-hash history slice from operator
+			// config. The history is the prior bridge covenant
+			// scripts (oldest first); the current bridgeScriptHash is
+			// appended last so the walker accepts both pre- and
+			// post-upgrade outputs and prefers the newest match.
+			history, hErr := buildBridgeScriptHashHistory(nodeCfg.Bridge.BridgeScriptHexHistory, bridgeScriptHash)
+			if hErr != nil {
+				return fmt.Errorf("bridge recovery: parse script history: %w", hErr)
+			}
 			hint := bridgeMonitor.CurrentBridgeUTXO()
-			if recErr := recoverBridgeUTXOFromChain(
+			if recErr := recoverBridgeUTXOFromChainHistory(
 				bgCtx,
 				chaintracksClient,
 				recoveryAdapter,
 				bridgeMonitor,
 				hint,
-				bridgeScriptHash,
+				history,
 				0, // 0 = use defaultBridgeRecoveryWalkBound
 				slog.Default(),
 			); recErr != nil {
