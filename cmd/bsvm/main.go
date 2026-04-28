@@ -145,6 +145,7 @@ func main() {
 			},
 			devCommand(),
 			adminCommand(),
+			anchorBackfillCommand(),
 		},
 	}
 
