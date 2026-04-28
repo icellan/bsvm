@@ -1067,34 +1067,11 @@ func TestDualEVMEquivalence_RealRevmHarness(t *testing.T) {
 	for _, fx := range equivalenceFixtures {
 		fx := fx
 		t.Run(fx.name, func(t *testing.T) {
-			// BlobTx is still partially blocked. Commit 1831db5
-			// surfaced BlobHashes / BlobGasFeeCap onto the EVM
-			// message, which got the BLOBHASH opcode wired up.
-			// What's still missing on the Go side is the blob-gas
-			// fee deduction itself: pkg/block does not charge
-			// BLOB_GAS_PER_BLOB * blob_gas_price from the sender
-			// balance the way revm (and geth) do. The harness
-			// surfaces this as a sender-balance divergence of
-			// exactly 0x2000 wei (8192 = BLOB_GAS_PER_BLOB *
-			// MIN_BLOB_GASPRICE for one blob with excess=0; the
-			// fixture's BlobFeeCap=1_000_000 sets the cap, not
-			// the actual charge), so the post-state digest and
-			// canonical MPT root both diverge.
-			//
-			// This is a pkg/block state-transition gap, not a
-			// comparator bug — the comparator correctly reports
-			// the divergence. Fix is non-trivial: add blob-gas
-			// fee accounting to ApplyTransaction, mirroring
-			// revm's intrinsic_blob_gas + sender debit. Leaving
-			// the skip in place until that work lands; sender
-			// recovery + envelope encoding are still pinned by
-			// TestDualEVMEquivalence_BlobTxSenderRecovery.
-			if fx.name == "BlobTx" {
-				t.Skip("BlobTx full-execution comparison blocked on " +
-					"pkg/block not charging blob-gas (sender balance " +
-					"diverges by BLOB_GAS_PER_BLOB * MIN_BLOB_GASPRICE; " +
-					"see file-level comment)")
-			}
+			// BlobTx full-execution comparison previously blocked on
+			// pkg/block not charging blob-gas. HH (round 6) added
+			// buyBlobGas / preCheck blob-gas debit so the Go side
+			// now matches revm's intrinsic blob-gas accounting; this
+			// subtest is unskipped accordingly.
 			runRealRevmCase(t, binary, fx)
 		})
 	}

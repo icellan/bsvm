@@ -50,7 +50,23 @@ var (
 	ErrTipAboveFeeCap = errors.New("max priority fee per gas higher than max fee per gas")
 	// ErrMaxInitCodeSizeExceeded is returned if initcode exceeds the max size.
 	ErrMaxInitCodeSizeExceeded = errors.New("max initcode size exceeded")
+	// ErrBlobFeeCapTooLow is returned if a blob transaction's
+	// MaxFeePerBlobGas is below the prevailing blob gas price (EIP-4844).
+	ErrBlobFeeCapTooLow = errors.New("max fee per blob gas less than block blob gas price")
+	// ErrInsufficientFundsForBlobGas is returned if the sender does not
+	// have enough balance to cover the upfront blob gas burn.
+	ErrInsufficientFundsForBlobGas = errors.New("insufficient funds for blob gas")
 )
+
+// minBlobGasPrice is the EIP-4844 floor for blob_gas_price. With no on-
+// chain ExcessBlobGas tracking yet (header field deferred — see
+// pkg/block/types.go L2Header), every block effectively has zero excess
+// blob gas, so blob_gas_price collapses to MIN_BLOB_GASPRICE = 1. This
+// matches what revm computes against an SP1 fixture run on a clean
+// chain and keeps Go-EVM <-> revm balance accounting byte-identical
+// for the BlobTx case. When ExcessBlobGas tracking lands on the L2
+// header, replace this with the EIP-4844 fake_exponential schedule.
+const minBlobGasPrice uint64 = 1
 
 // Message represents an EVM message (transaction converted to execution format).
 type Message struct {
@@ -246,6 +262,56 @@ func (st *stateTransition) buyGas() error {
 	return nil
 }
 
+// buyBlobGas implements EIP-4844 upfront blob-gas accounting. For type-3
+// (BlobTx) transactions the sender is debited
+//
+//	blob_fee = len(BlobVersionedHashes) * BLOB_GAS_PER_BLOB * blob_gas_price
+//
+// from balance, separately from execution gas. The fee is BURNED — it is
+// not credited to the coinbase. Reverts with ErrBlobFeeCapTooLow if the
+// transaction's MaxFeePerBlobGas is below the prevailing blob_gas_price,
+// and ErrInsufficientFundsForBlobGas if the sender cannot cover it.
+//
+// blob_gas_price uses minBlobGasPrice (= 1) until the L2 header carries
+// ExcessBlobGas/BlobGasUsed; see the const doc-comment for the upgrade
+// path. This matches revm's behaviour on a clean chain (zero excess) and
+// keeps Go-EVM <-> revm canonical MPT roots byte-identical for the
+// dual-EVM equivalence harness.
+func (st *stateTransition) buyBlobGas() error {
+	if len(st.msg.BlobHashes) == 0 {
+		// Non-blob transaction (or type-3 with no hashes — rejected upstream
+		// at decode time, but defensive).
+		return nil
+	}
+	blobGasPrice := new(big.Int).SetUint64(minBlobGasPrice)
+	if st.msg.BlobGasFeeCap == nil || st.msg.BlobGasFeeCap.Cmp(blobGasPrice) < 0 {
+		var have *big.Int
+		if st.msg.BlobGasFeeCap != nil {
+			have = st.msg.BlobGasFeeCap
+		} else {
+			have = new(big.Int)
+		}
+		return fmt.Errorf("%w: address %v, maxFeePerBlobGas: %s, blobGasPrice: %s",
+			ErrBlobFeeCapTooLow, st.msg.From.Hex(), have, blobGasPrice)
+	}
+
+	blobGas := uint64(len(st.msg.BlobHashes)) * vm.BlobTxBlobGasPerBlob
+	blobFee := new(big.Int).SetUint64(blobGas)
+	blobFee.Mul(blobFee, blobGasPrice)
+
+	blobFeeU256, overflow := uint256.FromBig(blobFee)
+	if overflow {
+		return fmt.Errorf("%w: address %v blob fee exceeds 256 bits",
+			ErrInsufficientFundsForBlobGas, st.msg.From.Hex())
+	}
+	if have := st.state.GetBalance(st.msg.From); have.Cmp(blobFeeU256) < 0 {
+		return fmt.Errorf("%w: address %v have %v want %v",
+			ErrInsufficientFundsForBlobGas, st.msg.From.Hex(), have, blobFeeU256)
+	}
+	st.state.SubBalance(st.msg.From, blobFeeU256, tracing.BalanceDecreaseGasBuy)
+	return nil
+}
+
 // preCheck validates the nonce, checks sender is an EOA, verifies fee caps,
 // and buys gas.
 func (st *stateTransition) preCheck() error {
@@ -302,7 +368,12 @@ func (st *stateTransition) preCheck() error {
 		}
 	}
 
-	return st.buyGas()
+	if err := st.buyGas(); err != nil {
+		return err
+	}
+	// EIP-4844: debit upfront blob fee (BURNED) for type-3 txs. No-op
+	// for non-blob transactions.
+	return st.buyBlobGas()
 }
 
 // execute will transition the state by applying the current message and
