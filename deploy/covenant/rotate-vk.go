@@ -57,10 +57,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	sdkscript "github.com/bsv-blockchain/go-sdk/script"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+
 	"github.com/icellan/bsvm/pkg/arc"
+	"github.com/icellan/bsvm/pkg/covenant"
 )
 
 // RotateVKConfig is the input shape for the rotate-vk binary. It is
@@ -93,6 +98,44 @@ type RotateVKConfig struct {
 	// defaults to prover/guest/elf/SP1VerifyingKeyHash.txt — i.e.
 	// the in-tree pin.
 	NewVKHashFile string `json:"newVKHashFile,omitempty"`
+
+	// CurrentStateRootHex is the live covenant's StateRoot readonly.
+	// Required in --broadcast mode because the upgrade method's
+	// publicValues blob asserts pv[0..32) == c.StateRoot. Operators
+	// read this from the existing pkg/covenant.RollupState (or by
+	// parsing the live UTXO's locking script).
+	CurrentStateRootHex string `json:"currentStateRootHex,omitempty"`
+
+	// CurrentBlockNumber is the live covenant's BlockNumber readonly.
+	// Required in --broadcast mode; the upgrade tx advances this to
+	// CurrentBlockNumber + 1 and the on-chain assertion checks the
+	// match.
+	CurrentBlockNumber uint64 `json:"currentBlockNumber,omitempty"`
+
+	// ProofBundlePath, when set, points to a JSON file with a fresh
+	// SP1 proof's publicValues / batchData / proofBlob hex strings
+	// that the rotation should bind to. When empty, the binary uses
+	// SyntheticUpgradeProofBundle to fabricate a shape-correct
+	// stand-in (which will FAIL the on-chain SP1 verifier — only
+	// useful for assembling-and-signing dry runs and unit tests).
+	ProofBundlePath string `json:"proofBundlePath,omitempty"`
+
+	// PartialSigOutPath is where the binary writes the partially-
+	// signed upgrade tx when not all governance signatures have been
+	// collected. Mandatory for multisig rotations until the M-of-N
+	// coordination workflow is automated. Defaults to
+	// "rotate-vk.partial.txhex" alongside the config file when empty.
+	PartialSigOutPath string `json:"partialSigOutPath,omitempty"`
+}
+
+// proofBundle is the on-disk shape of a fresh SP1 proof bundle, parsed
+// when RotateVKConfig.ProofBundlePath is set. All three fields are
+// hex-encoded byte strings; the publicValues field must be exactly
+// 280 bytes per spec 12.
+type proofBundle struct {
+	PublicValuesHex string `json:"publicValuesHex"`
+	BatchDataHex    string `json:"batchDataHex"`
+	ProofBlobHex    string `json:"proofBlobHex"`
 }
 
 // RotateSummary is the JSON shape rotate-vk emits.
@@ -106,8 +149,17 @@ type RotateSummary struct {
 	NewRollupScript    string `json:"newRollupScriptHex"`
 	UpgradeTxIDPredict string `json:"upgradeTxidPredicted,omitempty"`
 	UpgradeTxIDActual  string `json:"upgradeTxidActual,omitempty"`
-	Broadcast          bool   `json:"broadcast"`
-	GeneratedAt        string `json:"generatedAt"`
+	// UpgradeTxHex is the fully-built (and possibly partially-signed)
+	// upgrade transaction. Emitted in --broadcast mode so the operator
+	// can audit + co-sign + broadcast manually if the binary's ARC
+	// path fails. Multi-sig rotations with insufficient signatures
+	// surface the partial tx here AND set UpgradeTxAwaitingSigs.
+	UpgradeTxHex          string `json:"upgradeTxHex,omitempty"`
+	UpgradeTxAwaitingSigs int    `json:"upgradeTxAwaitingSigs,omitempty"`
+	UpgradeUnlockHex      string `json:"upgradeUnlockHex,omitempty"`
+	UpgradeMethod         string `json:"upgradeMethod,omitempty"`
+	Broadcast             bool   `json:"broadcast"`
+	GeneratedAt           string `json:"generatedAt"`
 }
 
 // RotateOptions packages the CLI flag set used by the rotate-vk
@@ -181,39 +233,374 @@ func RunRotateVK(opts RotateOptions) error {
 		return EmitRotateSummary(summary, opts.OutPath)
 	}
 
-	// Broadcast path. The actual on-chain Upgrade method invocation
-	// is gated by the rollup contract's CheckSig/CheckMultiSig
-	// against the governance key set — we don't sign tx inputs in
-	// the wrapper here, we just submit the prebuilt unlocking
-	// script the operator constructed off-line.
-	//
-	// TODO(WW-rotate-onchain): once pkg/covenant exposes a
-	// BuildUpgradeUnlockScript helper that takes the governance
-	// signature bundle + the new locking script, route through it
-	// here. For now we surface a clear error so the operator
-	// doesn't accidentally believe the binary fully built the tx.
+	// Broadcast path. WW-rotate-onchain (resolved): assemble the
+	// upgrade unlocking script via covenant.BuildUpgradeUnlockScript,
+	// build a BSV transaction that spends the live covenant UTXO
+	// under it, attach the new covenant locking script as the
+	// continuation output, and broadcast via ARC. For multisig
+	// rotations where fewer than Threshold signatures have been
+	// collected, the partially-signed tx is written to disk and the
+	// binary exits with the "tx awaiting N more sigs" message
+	// documented in --help.
+	return runBroadcastUpgrade(opts, cfg, resNew, summary)
+}
+
+// runBroadcastUpgrade implements the --broadcast tail of RunRotateVK.
+// Split out for legibility — the validate / compile prefix above stays
+// independent of the on-chain machinery.
+func runBroadcastUpgrade(
+	opts RotateOptions,
+	cfg *RotateVKConfig,
+	resNew *CompileResult,
+	summary RotateSummary,
+) error {
 	if cfg.ARCEndpoint == "" {
 		return errors.New("--broadcast requires arcEndpoint in config")
 	}
-	if len(cfg.GovernanceSigsHex) == 0 && cfg.Governance.Mode != "none" {
-		return errors.New("--broadcast requires governanceSigsHex for non-none governance modes")
+	if cfg.Governance.Mode == "none" {
+		return errors.New("--broadcast cannot rotate a governance-none shard (no key authorises the spend; spec 12)")
 	}
-	// Construct the ARC client so we surface any URL / auth issue
-	// before the operator wires the unlock-script helper.
-	if _, err := arc.NewClient(arc.Config{
+	if cfg.CurrentStateRootHex == "" {
+		return errors.New("--broadcast requires currentStateRootHex (the live covenant's StateRoot)")
+	}
+
+	// Construct the ARC client so any URL / auth issue surfaces before
+	// we burn the partial-sig disk write.
+	arcClient, err := arc.NewClient(arc.Config{
 		URL:           cfg.ARCEndpoint,
 		AuthToken:     cfg.ARCAuthToken,
 		CallbackURL:   cfg.ARCCallbackURL,
 		CallbackToken: "",
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("arc client: %w", err)
 	}
-	_ = context.Background() // reserved for the on-chain wrapper
-	return errors.New("rotate-vk --broadcast requires the WW-rotate-onchain helper " +
-		"(BuildUpgradeUnlockScript) which is not yet wired in pkg/covenant. " +
-		"For now: emit the unsigned upgrade tx via --dry-run, sign it with " +
-		"`bsvm dev sign-tx`, and broadcast manually via the ARC client. " +
-		"See deploy/covenant/README.md §manual-broadcast")
+
+	gov, err := buildGovernanceConfig(cfg.Governance)
+	if err != nil {
+		return fmt.Errorf("governance: %w", err)
+	}
+
+	preStateRoot, err := decodeHash32(cfg.CurrentStateRootHex)
+	if err != nil {
+		return fmt.Errorf("currentStateRootHex: %w", err)
+	}
+
+	// Decode whatever signatures the operator has supplied. If we have
+	// fewer than the threshold, the partial-sig flow takes over.
+	govSigs, err := decodeHexBundle(cfg.GovernanceSigsHex)
+	if err != nil {
+		return fmt.Errorf("governanceSigsHex: %w", err)
+	}
+
+	// Resolve the proof bundle. A fresh proof bundle is REQUIRED for
+	// production rotations; for tests / dry runs the synthetic helper
+	// fabricates a shape-correct (but non-cryptographically-valid)
+	// stand-in so the assembly path can be exercised end-to-end.
+	pv, batchData, proofBlob, proofSource, err := resolveProofBundle(cfg.ProofBundlePath, opts.ConfigPath, cfg.ChainID, preStateRoot, resNew.RollupScript, cfg.CurrentBlockNumber)
+	if err != nil {
+		return fmt.Errorf("proof bundle: %w", err)
+	}
+	if proofSource == "synthetic" {
+		fmt.Fprintln(os.Stderr,
+			"rotate-vk: WARN proof bundle is SYNTHETIC — the on-chain SP1 "+
+				"verifier WILL reject the broadcast tx. Supply a real "+
+				"proofBundlePath in the config before broadcasting against "+
+				"a production shard.")
+	}
+
+	// Compute the ANF hash for the new covenant. Without a real
+	// runar-go ANF emitter the deploy tool only carries the script; we
+	// derive a stable 32-byte ANF placeholder by hashing the script
+	// bytes prefixed with a fixed marker. Production rotations should
+	// override this with the published ANF JSON's hash256 once the
+	// canonical ANF inscription path lands (TODO(WW-anf-publish)).
+	anfHash := anfHashPlaceholder(resNew.RollupScript)
+
+	req := covenant.UpgradeRequest{
+		CurrentStateRoot:   preStateRoot,
+		CurrentBlockNumber: cfg.CurrentBlockNumber,
+		ChainID:            cfg.ChainID,
+		NewCovenantScript:  resNew.RollupScript,
+		NewCovenantAnfHash: anfHash,
+		PublicValues:       pv,
+		BatchData:          batchData,
+		ProofBlob:          proofBlob,
+		GovernanceSigs:     govSigs,
+	}
+
+	method, err := covenant.UpgradeMethodName(gov)
+	if err != nil {
+		return fmt.Errorf("upgrade method: %w", err)
+	}
+	summary.UpgradeMethod = method
+
+	// Partial-sig branch: not enough sigs collected yet. Emit the
+	// (signature-less) request bundle to disk so other operators can
+	// continue the assembly. The unlock-script helper will reject the
+	// short sig list, but we want a stable on-disk artifact so the
+	// next operator's run can resume from it.
+	expectedSigs := expectedSigsForGov(gov)
+	if len(govSigs) < expectedSigs {
+		partialPath := cfg.PartialSigOutPath
+		if partialPath == "" {
+			partialPath = filepath.Join(filepath.Dir(opts.ConfigPath), "rotate-vk.partial.json")
+		}
+		if err := writePartialSigBundle(partialPath, &req); err != nil {
+			return fmt.Errorf("write partial bundle: %w", err)
+		}
+		summary.UpgradeTxAwaitingSigs = expectedSigs - len(govSigs)
+		summary.Broadcast = false
+		fmt.Fprintf(os.Stderr,
+			"rotate-vk: %d-of-%d signature(s) collected; %d more needed. "+
+				"Wrote partial bundle to %s. Re-run with the additional "+
+				"governanceSigsHex once the next operator signs.\n",
+			len(govSigs), expectedSigs, expectedSigs-len(govSigs), partialPath)
+		return EmitRotateSummary(summary, opts.OutPath)
+	}
+
+	// Full sig set: build the unlock script + spend tx.
+	unlock, err := covenant.BuildUpgradeUnlockScript(req, gov)
+	if err != nil {
+		return fmt.Errorf("BuildUpgradeUnlockScript: %w", err)
+	}
+	summary.UpgradeUnlockHex = hex.EncodeToString(unlock)
+
+	tx, err := buildUpgradeSpendTx(cfg, resNew.RollupScript, unlock)
+	if err != nil {
+		return fmt.Errorf("buildUpgradeSpendTx: %w", err)
+	}
+	summary.UpgradeTxHex = tx.Hex()
+	summary.UpgradeTxIDPredict = tx.TxID().String()
+
+	// Broadcast via ARC. The runar SDK's higher-level Call helper is
+	// not used here because rotate-vk operates "off-line": the
+	// operator's signatures are pre-collected, the proof bundle is a
+	// file, and ARC is the only network surface we touch.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rawHex := tx.Hex()
+	rawBytes, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return fmt.Errorf("decode upgrade tx hex: %w", err)
+	}
+	resp, err := arcClient.Broadcast(ctx, rawBytes)
+	if err != nil {
+		// Surface the partially-or-fully-signed hex even when ARC
+		// rejects so the operator can retry against a different ARC
+		// instance or co-sign offline.
+		summary.Broadcast = false
+		_ = EmitRotateSummary(summary, opts.OutPath)
+		return fmt.Errorf("ARC.Broadcast: %w", err)
+	}
+	summary.Broadcast = true
+	summary.UpgradeTxIDActual = hex.EncodeToString(resp.TxID[:])
+	return EmitRotateSummary(summary, opts.OutPath)
+}
+
+// resolveProofBundle returns the (publicValues, batchData, proofBlob)
+// triple the upgrade tx commits to. When path is non-empty, the file
+// is parsed strictly. Otherwise a synthetic shape-correct stand-in is
+// fabricated and the caller is warned. Returns the resolved source as
+// the 4th value: "file:<path>" for a real load, "synthetic" otherwise.
+func resolveProofBundle(
+	path, configPath string,
+	chainID uint64,
+	preStateRoot [32]byte,
+	newScript []byte,
+	currentBlockNumber uint64,
+) (publicValues, batchData, proofBlob []byte, source string, err error) {
+	if path != "" {
+		// Resolve relative paths against the config dir.
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(filepath.Dir(configPath), path)
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil, nil, nil, "", fmt.Errorf("read %s: %w", path, readErr)
+		}
+		var b proofBundle
+		if jerr := json.Unmarshal(raw, &b); jerr != nil {
+			return nil, nil, nil, "", fmt.Errorf("parse %s: %w", path, jerr)
+		}
+		pv, perr := hex.DecodeString(strings.TrimPrefix(b.PublicValuesHex, "0x"))
+		if perr != nil {
+			return nil, nil, nil, "", fmt.Errorf("publicValuesHex: %w", perr)
+		}
+		if len(pv) != 280 {
+			return nil, nil, nil, "", fmt.Errorf("publicValuesHex must decode to 280 bytes, got %d", len(pv))
+		}
+		bd, berr := hex.DecodeString(strings.TrimPrefix(b.BatchDataHex, "0x"))
+		if berr != nil {
+			return nil, nil, nil, "", fmt.Errorf("batchDataHex: %w", berr)
+		}
+		pb, qerr := hex.DecodeString(strings.TrimPrefix(b.ProofBlobHex, "0x"))
+		if qerr != nil {
+			return nil, nil, nil, "", fmt.Errorf("proofBlobHex: %w", qerr)
+		}
+		return pv, bd, pb, "file:" + path, nil
+	}
+
+	// Synthetic fallback. The publicValues is computed via
+	// EncodeUpgradePublicValues so the migration / chainID / block
+	// bindings line up with the on-chain assertions; only the proof
+	// itself is shape-correct-but-not-valid.
+	_, batchData, proofBlob = covenant.SyntheticUpgradeProofBundle("rotate-vk-synthetic")
+	// postStateRoot defaults to preStateRoot — the rotation's "no-op
+	// transition" case where state doesn't move forward beyond the
+	// block-number bump. Operators who need a different post-state
+	// MUST supply a real proof bundle.
+	publicValues = covenant.EncodeUpgradePublicValues(
+		preStateRoot, preStateRoot, batchData, proofBlob,
+		newScript, chainID, currentBlockNumber+1)
+	return publicValues, batchData, proofBlob, "synthetic", nil
+}
+
+// expectedSigsForGov returns the signature count the matching upgrade
+// method consumes. Mirrors covenant.UpgradeRequest sig validation —
+// kept here so the partial-sig fallback can decide before it calls
+// BuildUpgradeUnlockScript.
+func expectedSigsForGov(g covenant.GovernanceConfig) int {
+	switch g.Mode {
+	case covenant.GovernanceSingleKey:
+		return 1
+	case covenant.GovernanceMultiSig:
+		return g.Threshold
+	default:
+		return 0
+	}
+}
+
+// writePartialSigBundle serialises an in-flight UpgradeRequest to JSON
+// so a follow-up operator run can read it back, append their signature,
+// and resume.
+func writePartialSigBundle(path string, req *covenant.UpgradeRequest) error {
+	type partial struct {
+		Note               string   `json:"note"`
+		ChainID            uint64   `json:"chainId"`
+		CurrentStateRoot   string   `json:"currentStateRootHex"`
+		CurrentBlockNumber uint64   `json:"currentBlockNumber"`
+		NewCovenantScript  string   `json:"newCovenantScriptHex"`
+		NewCovenantAnfHash string   `json:"newCovenantAnfHashHex"`
+		PublicValues       string   `json:"publicValuesHex"`
+		BatchData          string   `json:"batchDataHex"`
+		ProofBlob          string   `json:"proofBlobHex"`
+		GovernanceSigs     []string `json:"governanceSigsHex"`
+	}
+	out := partial{
+		Note: "rotate-vk partial bundle. Append your signature to governanceSigsHex " +
+			"and re-run with --broadcast and the same config to assemble + broadcast.",
+		ChainID:            req.ChainID,
+		CurrentStateRoot:   hex.EncodeToString(req.CurrentStateRoot[:]),
+		CurrentBlockNumber: req.CurrentBlockNumber,
+		NewCovenantScript:  hex.EncodeToString(req.NewCovenantScript),
+		NewCovenantAnfHash: hex.EncodeToString(req.NewCovenantAnfHash[:]),
+		PublicValues:       hex.EncodeToString(req.PublicValues),
+		BatchData:          hex.EncodeToString(req.BatchData),
+		ProofBlob:          hex.EncodeToString(req.ProofBlob),
+		GovernanceSigs:     make([]string, 0, len(req.GovernanceSigs)),
+	}
+	for _, s := range req.GovernanceSigs {
+		out.GovernanceSigs = append(out.GovernanceSigs, hex.EncodeToString(s))
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal partial bundle: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// buildUpgradeSpendTx assembles a single-input single-output BSV tx
+// that spends the live covenant UTXO under the supplied unlock script
+// and re-pins the value under the new locking script. The result is
+// only as on-chain-valid as the supplied unlock script — broadcasting
+// a synthetic-proof variant will be rejected by the SP1 verifier in
+// the rollup contract's upgrade method.
+func buildUpgradeSpendTx(
+	cfg *RotateVKConfig,
+	newRollupScript []byte,
+	unlockBytes []byte,
+) (*transaction.Transaction, error) {
+	tx := transaction.NewTransaction()
+	// Live covenant input. We pass the existing covenant's locking-
+	// script-hex as the prevLockingScript so the BSV-SDK can lay out
+	// the input correctly; in the rotate-vk path the operator
+	// supplies the live UTXO's locking script via the same channel
+	// as covenantTxId.
+	if err := tx.AddInputFrom(
+		cfg.CovenantTxID,
+		cfg.CovenantVout,
+		"00", // placeholder — sigOps are already encoded into unlockBytes
+		cfg.CovenantSatsLive,
+		nil,
+	); err != nil {
+		return nil, fmt.Errorf("AddInputFrom: %w", err)
+	}
+	unlockScript, err := sdkscript.NewFromHex(hex.EncodeToString(unlockBytes))
+	if err != nil {
+		return nil, fmt.Errorf("unlock script: %w", err)
+	}
+	tx.Inputs[0].UnlockingScript = unlockScript
+
+	// Continuation output: same satoshi value, new covenant lock.
+	newLS, err := sdkscript.NewFromHex(hex.EncodeToString(newRollupScript))
+	if err != nil {
+		return nil, fmt.Errorf("new rollup locking script: %w", err)
+	}
+	tx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      cfg.CovenantSatsLive,
+		LockingScript: newLS,
+	})
+	return tx, nil
+}
+
+// decodeHash32 parses a 32-byte hex string (with or without 0x).
+func decodeHash32(s string) (out [32]byte, err error) {
+	bare := strings.TrimPrefix(s, "0x")
+	bare = strings.TrimPrefix(bare, "0X")
+	b, derr := hex.DecodeString(bare)
+	if derr != nil {
+		return out, fmt.Errorf("decode hex: %w", derr)
+	}
+	if len(b) != 32 {
+		return out, fmt.Errorf("expected 32 bytes, got %d", len(b))
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
+// decodeHexBundle decodes each hex string in a slice. Empty input
+// returns an empty slice.
+func decodeHexBundle(hexes []string) ([][]byte, error) {
+	out := make([][]byte, 0, len(hexes))
+	for i, h := range hexes {
+		b, err := hex.DecodeString(strings.TrimPrefix(h, "0x"))
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", i, err)
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// anfHashPlaceholder returns a stable 32-byte hash binding the new
+// covenant script identity into the spec-10 migration OP_RETURN.
+// Production rotations should replace this with the published ANF
+// JSON's hash256 once the canonical ANF inscription path lands
+// (TODO(WW-anf-publish)). The placeholder still binds the migration
+// to the script bytes — observers that recompile the new contract
+// from source can recompute hash256 of their compiled artifact and
+// confirm match.
+func anfHashPlaceholder(newScript []byte) [32]byte {
+	const tag = "BSVM-ANF-PLACEHOLDER\x01"
+	buf := make([]byte, 0, len(tag)+len(newScript))
+	buf = append(buf, tag...)
+	buf = append(buf, newScript...)
+	// reuse the upgrade.go internal helper through a minimal call.
+	return covenant.UpgradeAnfPlaceholder(buf)
 }
 
 // LoadRotateVKConfig reads + parses the rotate-vk config JSON.

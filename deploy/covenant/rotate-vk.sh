@@ -89,8 +89,15 @@ ATTENTION — VK rotation impact:
     OLD rollup script. After the rotation lands, you MUST also redeploy
     the bridge with the NEW StateCovenantScriptHash. Pending withdrawal
     proofs constructed against the OLD bridge will be invalid.
-  * If governance is multisig, all M signatures MUST be present in
-    governanceSigsHex before --broadcast will succeed.
+  * Multi-sig partial-sig flow: if fewer than Threshold signatures are
+    listed in governanceSigsHex, --broadcast writes a JSON partial
+    bundle to partialSigOutPath (default: rotate-vk.partial.json) and
+    exits successfully. Re-run with the additional signatures appended
+    to governanceSigsHex to assemble + broadcast the final tx.
+  * Synthetic proof warning: if proofBundlePath is unset the binary
+    fabricates a shape-correct stand-in that the on-chain SP1 verifier
+    WILL reject. Production rotations MUST supply a fresh proof bundle
+    via proofBundlePath in the config.
 
 EOF
   printf 'Proceed with broadcast? [y/N] ' >&2
