@@ -21,13 +21,11 @@ package beef
 //
 //	go test -run FuzzCorpus -count=1 ./pkg/beef/
 //
-// TODO(round-trip): ParsedBEEF currently has no public Encode method
-// (BEEF V1/V2 round-trip is delegated to go-sdk's
-// NewTransactionFromBEEF / Transaction.BEEF). The parse fuzzer
-// therefore checks the (*ParsedBEEF, error) contract but does not
-// re-encode. Add a round-trip property when ParseBEEF gains a
-// matching encoder, or when this package starts emitting BEEF bytes
-// directly.
+// Round-trip property: when Parse succeeds, Encode then Parse-again
+// must succeed and produce a structurally equal *ParsedBEEF. This
+// catches encoder regressions (e.g. wrong varint widths, dropped BUMP
+// bytes, miscounted has-bump flags) that wouldn't surface from the
+// (*ParsedBEEF, error) contract alone.
 
 import (
 	"bytes"
@@ -84,11 +82,63 @@ func FuzzParseBEEF(f *testing.F) {
 					t.Fatalf("parsed tx %d txid mismatch: got %x want %x", i, tx.TxID[:], want[:])
 				}
 			}
-			// TODO(round-trip): once ParsedBEEF gains an Encode
-			// method, assert ParseBEEF(ParsedBEEF.Encode()).Equal(parsed).
 			_ = parsed.Target()
+
+			// Property 4: round-trip via Encode. If Parse succeeded
+			// against `body`, ParseBEEF(parsed.Encode()) must also
+			// succeed and produce a structurally equal result.
+			encoded := parsed.Encode()
+			roundtripped, err := ParseBEEF(encoded)
+			if err != nil {
+				t.Fatalf("re-parse after Encode failed: %v\nencoded=%x", err, encoded)
+			}
+			if roundtripped == nil {
+				t.Fatalf("re-parse after Encode returned (nil, nil)")
+			}
+			if !parsedBEEFEqual(parsed, roundtripped) {
+				t.Fatalf("round-trip mismatch:\n parsed=%+v\n roundtripped=%+v\n encoded=%x",
+					parsed, roundtripped, encoded)
+			}
 		}
 	})
+}
+
+// parsedBEEFEqual compares two *ParsedBEEF for the structural fields
+// that the round-trip property claims to preserve. Used by both the
+// fuzzer and TestParseEncodeRoundtrip.
+func parsedBEEFEqual(a, b *ParsedBEEF) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Version != b.Version || a.TargetID != b.TargetID {
+		return false
+	}
+	if len(a.BUMPs) != len(b.BUMPs) || len(a.Txs) != len(b.Txs) {
+		return false
+	}
+	for i := range a.BUMPs {
+		if a.BUMPs[i].BlockHeight != b.BUMPs[i].BlockHeight {
+			return false
+		}
+		if !bytes.Equal(a.BUMPs[i].Raw, b.BUMPs[i].Raw) {
+			return false
+		}
+	}
+	for i := range a.Txs {
+		if a.Txs[i].TxID != b.Txs[i].TxID {
+			return false
+		}
+		if a.Txs[i].HasBUMP != b.Txs[i].HasBUMP {
+			return false
+		}
+		if a.Txs[i].BUMPRef != b.Txs[i].BUMPRef {
+			return false
+		}
+		if !bytes.Equal(a.Txs[i].RawTx, b.Txs[i].RawTx) {
+			return false
+		}
+	}
+	return true
 }
 
 // buildSeedSingleTxBEEF returns the same minimal envelope that
