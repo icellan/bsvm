@@ -108,6 +108,7 @@ func startBridgeBlockScanner(
 	wocClient whatsonchain.WhatsOnChainClient,
 	rpcClient bridgeRPCClient,
 	logger *slog.Logger,
+	wocBlockTxFanoutMaxOverride int,
 ) (blockScannerCloseFunc, error) {
 	if monitor == nil {
 		// No bridge configured for this shard — nothing to scan.
@@ -118,7 +119,9 @@ func startBridgeBlockScanner(
 		return nil, nil
 	}
 
-	adapter, err := newBridgeBSVClient(chaintracksClient, wocClient, rpcClient, monitor, logger)
+	adapter, err := newBridgeBSVClientWithFanout(
+		chaintracksClient, wocClient, rpcClient, monitor, logger, wocBlockTxFanoutMaxOverride,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("bridge block scanner: %w", err)
 	}

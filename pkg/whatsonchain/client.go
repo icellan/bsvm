@@ -30,6 +30,12 @@ type Config struct {
 	URL     string        // base URL, e.g. https://api.whatsonchain.com/v1/bsv/main
 	Timeout time.Duration // HTTP request timeout (default 30s)
 	APIKey  string        // optional WoC API key
+	// BlockPageFetchWorkers overrides the per-block page-fetch
+	// concurrency used by the paginated GetBlockTxIDs path. Zero or
+	// negative falls back to the package default
+	// (blockPageFetchWorkers). Operators on a WoC paid tier may raise
+	// this; rate-limit-budget-constrained operators may dial it lower.
+	BlockPageFetchWorkers int
 }
 
 // UTXO is a single unspent output as returned by /address/<addr>/unspent.
@@ -53,6 +59,10 @@ type ChainInfo struct {
 type Client struct {
 	cfg  Config
 	http *http.Client
+	// pageWorkers is the resolved per-block page-fetch concurrency. It
+	// is populated from cfg.BlockPageFetchWorkers if positive, else
+	// the package default blockPageFetchWorkers.
+	pageWorkers int
 }
 
 // WhatsOnChainClient is the interface BSVM consumes.
@@ -78,9 +88,14 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
+	workers := cfg.BlockPageFetchWorkers
+	if workers <= 0 {
+		workers = blockPageFetchWorkers
+	}
 	return &Client{
-		cfg:  cfg,
-		http: &http.Client{Timeout: cfg.Timeout},
+		cfg:         cfg,
+		http:        &http.Client{Timeout: cfg.Timeout},
+		pageWorkers: workers,
 	}, nil
 }
 
@@ -355,7 +370,10 @@ func (c *Client) fetchPagedBlockTxIDs(ctx context.Context, pageURIs []string, fe
 		err error
 	}
 
-	workers := blockPageFetchWorkers
+	workers := c.pageWorkers
+	if workers <= 0 {
+		workers = blockPageFetchWorkers
+	}
 	if workers > len(pageURIs) {
 		workers = len(pageURIs)
 	}

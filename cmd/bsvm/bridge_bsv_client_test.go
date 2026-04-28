@@ -362,7 +362,7 @@ func TestBridgeBlockScanner_ProcessesDepositOnNewTip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	closer, err := startBridgeBlockScanner(ctx, monitor, cht, nil, rpc, slog.Default())
+	closer, err := startBridgeBlockScanner(ctx, monitor, cht, nil, rpc, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestBridgeBSVClient_RequiresChaintracks(t *testing.T) {
 // TestStartBridgeBlockScanner_NilMonitorIsNoOp asserts the wiring
 // helper degrades gracefully when no bridge is configured.
 func TestStartBridgeBlockScanner_NilMonitorIsNoOp(t *testing.T) {
-	closer, err := startBridgeBlockScanner(context.Background(), nil, chaintracks.NewInMemoryClient(), nil, nil, slog.Default())
+	closer, err := startBridgeBlockScanner(context.Background(), nil, chaintracks.NewInMemoryClient(), nil, nil, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestStartBridgeBlockScanner_NilMonitorIsNoOp(t *testing.T) {
 func TestStartBridgeBlockScanner_NilChaintracksIsNoOp(t *testing.T) {
 	cfg := bridge.DefaultConfig()
 	mon := bridge.NewBridgeMonitor(cfg, nil, db.NewMemoryDB())
-	closer, err := startBridgeBlockScanner(context.Background(), mon, nil, nil, nil, slog.Default())
+	closer, err := startBridgeBlockScanner(context.Background(), mon, nil, nil, nil, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}

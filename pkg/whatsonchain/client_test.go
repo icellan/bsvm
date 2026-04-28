@@ -205,6 +205,84 @@ func TestGetBlockTxIDs_PaginatedThreePages(t *testing.T) {
 	}
 }
 
+// TestGetBlockTxIDs_PageWorkersConfigOverride asserts that a Client
+// constructed with a non-zero Config.BlockPageFetchWorkers actually
+// drives the paginated path with that concurrency. We measure the
+// observed peak in-flight page requests and confirm it never exceeds
+// the configured worker cap.
+func TestGetBlockTxIDs_PageWorkersConfigOverride(t *testing.T) {
+	const numPages = 8
+	const wantMaxConcurrency = 2
+
+	pages := make([][]string, numPages)
+	for i := range pages {
+		pages[i] = []string{makeTxIDHex(i)}
+	}
+
+	var inFlight, peak atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/page/") {
+			cur := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			// Track peak concurrency.
+			for {
+				p := peak.Load()
+				if cur <= p || peak.CompareAndSwap(p, cur) {
+					break
+				}
+			}
+			// Linger long enough for other workers to pile in if the cap
+			// were higher.
+			time.Sleep(50 * time.Millisecond)
+			for i := range pages {
+				if strings.HasSuffix(r.URL.Path, fmt.Sprintf("/page/%d", i+1)) {
+					_ = json.NewEncoder(w).Encode(pages[i])
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/block/hash/") {
+			pageURIs := make([]string, numPages)
+			for i := 0; i < numPages; i++ {
+				pageURIs[i] = fmt.Sprintf("/block/hash/test/page/%d", i+1)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tx":    []string{},
+				"pages": map[string]any{"uri": pageURIs},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Config{
+		URL:                   srv.URL,
+		Timeout:               5 * time.Second,
+		BlockPageFetchWorkers: wantMaxConcurrency,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	var blockHash [32]byte
+	for i := range blockHash {
+		blockHash[i] = 0xee
+	}
+	got, err := c.GetBlockTxIDs(context.Background(), blockHash)
+	if err != nil {
+		t.Fatalf("GetBlockTxIDs: %v", err)
+	}
+	if len(got) != numPages {
+		t.Fatalf("got %d txids, want %d", len(got), numPages)
+	}
+	if p := peak.Load(); int(p) > wantMaxConcurrency {
+		t.Fatalf("observed peak in-flight pages = %d, want <= %d (worker cap not honoured)", p, wantMaxConcurrency)
+	}
+}
+
 // TestGetBlockTxIDs_MalformedPagination exercises the fault-tolerance
 // posture for a malformed paginated response: a header that names
 // pages whose payload doesn't decode. GetBlockTxIDs must surface a

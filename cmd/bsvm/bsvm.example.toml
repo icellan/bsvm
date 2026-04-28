@@ -62,6 +62,20 @@ confirmations = 6
 # WoC enforces per-IP rate limits; caching content-addressed lookups
 # keeps the budget free for fresh queries. Set to 0 to disable.
 woc_cache_size = 1000
+# Per-block tx-fetch cap for the chaintracks-only block-scan path.
+# Defensive ceiling on the WoC fan-out a single block can trigger;
+# anything beyond is logged + skipped so a pathological block can't
+# exhaust an operator's daily WoC quota. Default 1_000_000 (well above
+# any block ever mined). Lower this on rate-limit-budget-constrained
+# free-tier deployments; raise it on paid-tier high-throughput shards.
+woc_block_tx_fanout_max = 1000000
+# Per-block page-fetch concurrency for the paginated GetBlockTxIDs
+# path. WoC paginates large blocks (~10k+ txs) into per-page endpoints;
+# this controls how many pages are fetched in parallel. Default 4 —
+# balances aggregate throughput against burst-load on the WoC API.
+# Operators on the free tier should keep it low; paid-tier operators
+# may raise it for faster cold-start scans.
+woc_block_page_fetch_workers = 4
 
 # Multi-endpoint ARC fan-out (W6-3). Add one block per ARC provider.
 # [[bsv.arc_endpoint]]

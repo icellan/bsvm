@@ -61,8 +61,9 @@ func BuildWoCClient(cfg BSVSection) (whatsonchain.WhatsOnChainClient, error) {
 		return nil, nil
 	}
 	inner, err := whatsonchain.NewClient(whatsonchain.Config{
-		URL:     url,
-		Timeout: 30 * time.Second,
+		URL:                   url,
+		Timeout:               30 * time.Second,
+		BlockPageFetchWorkers: cfg.WoCBlockPageFetchWorkers,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("whatsonchain client: %w", err)

@@ -902,12 +902,13 @@ func cmdRun(ctx *cli.Context) error {
 	// runs BEFORE startBridgeBlockScanner so the block scanner sees a
 	// trustworthy snapshot from the first event it processes.
 	if bridgeMonitor != nil && chaintracksClient != nil {
-		recoveryAdapter, recAdapterErr := newBridgeBSVClient(
+		recoveryAdapter, recAdapterErr := newBridgeBSVClientWithFanout(
 			chaintracksClient,
 			bridgeWoCClient,
 			bridgeBSVProviderForScan(bsvProvider),
 			nil, // no reorg retraction during cold boot
 			slog.Default(),
+			nodeCfg.BSV.WoCBlockTxFanoutMax,
 		)
 		if recAdapterErr != nil {
 			slog.Warn("bridge recovery: failed to build BSV client adapter, skipping cold-boot scan",
@@ -937,6 +938,7 @@ func cmdRun(ctx *cli.Context) error {
 		bridgeWoCClient,
 		bridgeBSVProviderForScan(bsvProvider),
 		slog.Default(),
+		nodeCfg.BSV.WoCBlockTxFanoutMax,
 	)
 	if err != nil {
 		return fmt.Errorf("start bridge block scanner: %w", err)
