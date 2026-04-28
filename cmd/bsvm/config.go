@@ -241,6 +241,20 @@ type BSVSection struct {
 	// UTXO sets) bypass the cache. Default 1000 entries. Set to 0 to
 	// disable caching entirely (every call hits WoC upstream).
 	WoCCacheSize int `toml:"woc_cache_size"`
+	// WoCBlockTxFanoutMax caps the per-block tx-fetch fan-out used by
+	// the chaintracks-only block-scan path (cmd/bsvm/bridge_bsv_client.go).
+	// Default 1_000_000 — well above any block ever mined and trivial
+	// in memory cost. Operators with strict WoC rate-limit budgets may
+	// dial it lower; operators on a paid tier with high-throughput
+	// shards may raise it. Set to 0 to use the package default.
+	WoCBlockTxFanoutMax int `toml:"woc_block_tx_fanout_max"`
+	// WoCBlockPageFetchWorkers caps the per-block page-fetch concurrency
+	// used by the paginated GetBlockTxIDs path (pkg/whatsonchain).
+	// Default 4 — balances throughput against burst-load on the WoC
+	// API. Operators on a paid tier may raise this for faster cold-
+	// start scans; operators on the free tier should keep it low. Set
+	// to 0 to use the package default.
+	WoCBlockPageFetchWorkers int `toml:"woc_block_page_fetch_workers"`
 	// Chaintracks configures the SPV header oracle including the
 	// W6-2 multi-upstream quorum. See pkg/chaintracks.MultiClient and
 	// docs/decisions/header-oracle-quorum.md.
@@ -439,6 +453,8 @@ func DefaultNodeConfig() *NodeConfig {
 			Network:                    "mainnet",
 			Confirmations:              6,
 			WoCCacheSize:               1000,
+			WoCBlockTxFanoutMax:        1_000_000,
+			WoCBlockPageFetchWorkers:   4,
 			NodeMaxConsecutiveFailures: 3,
 			NodeCooldown:               "30s",
 		},

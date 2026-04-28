@@ -485,3 +485,45 @@ confirmations = 3
 		t.Errorf("BSV.Confirmations = %d, want %d", loaded.BSV.Confirmations, 3)
 	}
 }
+
+// TestBSVSection_WoCFanoutDefaults asserts the WoC fan-out + page-
+// fetcher defaults match the documented values. These knobs are
+// operator-tunable; if defaults shift the example.toml + WoC client
+// must be updated in lock-step.
+func TestBSVSection_WoCFanoutDefaults(t *testing.T) {
+	cfg := DefaultNodeConfig()
+	if got, want := cfg.BSV.WoCBlockTxFanoutMax, 1_000_000; got != want {
+		t.Errorf("WoCBlockTxFanoutMax default = %d, want %d", got, want)
+	}
+	if got, want := cfg.BSV.WoCBlockPageFetchWorkers, 4; got != want {
+		t.Errorf("WoCBlockPageFetchWorkers default = %d, want %d", got, want)
+	}
+}
+
+// TestBSVSection_WoCFanoutOverride asserts the operator-supplied TOML
+// values reach the loaded config — the cmd-side wiring uses these to
+// override the package-level defaults.
+func TestBSVSection_WoCFanoutOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	content := `
+[bsv]
+woc_block_tx_fanout_max = 50000
+woc_block_page_fetch_workers = 16
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadNodeConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadNodeConfig: %v", err)
+	}
+	if loaded.BSV.WoCBlockTxFanoutMax != 50000 {
+		t.Errorf("WoCBlockTxFanoutMax = %d, want 50000", loaded.BSV.WoCBlockTxFanoutMax)
+	}
+	if loaded.BSV.WoCBlockPageFetchWorkers != 16 {
+		t.Errorf("WoCBlockPageFetchWorkers = %d, want 16", loaded.BSV.WoCBlockPageFetchWorkers)
+	}
+}

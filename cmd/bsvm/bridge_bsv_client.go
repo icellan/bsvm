@@ -127,6 +127,11 @@ type bridgeBSVClient struct {
 	monitor bridgeNotifier // optional; when non-nil reorgs trigger RetractDepositsAbove
 	logger  *slog.Logger
 
+	// fanoutMax is the resolved per-block tx-fetch cap for the WoC
+	// fan-out path. Populated from operator config; falls back to the
+	// package-level wocBlockTxFanoutMax when zero.
+	fanoutMax int
+
 	mu      sync.Mutex
 	lastTip [32]byte // tracked so duplicate stream frames don't re-publish heights
 }
@@ -135,13 +140,29 @@ type bridgeBSVClient struct {
 // monitor cannot scan without an SPV anchor). rpc is optional; when
 // nil GetBlockTransactions returns ErrBlockFetchUnsupported. woc is
 // optional; when nil GetTransaction returns whatsonchain.ErrNotFound
-// for every txid.
+// for every txid. The per-block fan-out cap is taken from the
+// package-level wocBlockTxFanoutMax; callers wanting an operator
+// override should use newBridgeBSVClientWithFanout.
 func newBridgeBSVClient(
 	cht chaintracks.ChaintracksClient,
 	woc whatsonchain.WhatsOnChainClient,
 	rpc bridgeRPCClient,
 	monitor bridgeNotifier,
 	logger *slog.Logger,
+) (*bridgeBSVClient, error) {
+	return newBridgeBSVClientWithFanout(cht, woc, rpc, monitor, logger, 0)
+}
+
+// newBridgeBSVClientWithFanout is the operator-tunable form. fanoutMax
+// overrides the package-level wocBlockTxFanoutMax cap; pass 0 to
+// inherit the default.
+func newBridgeBSVClientWithFanout(
+	cht chaintracks.ChaintracksClient,
+	woc whatsonchain.WhatsOnChainClient,
+	rpc bridgeRPCClient,
+	monitor bridgeNotifier,
+	logger *slog.Logger,
+	fanoutMax int,
 ) (*bridgeBSVClient, error) {
 	if cht == nil {
 		return nil, errors.New("bridge bsv client: chaintracks required")
@@ -150,12 +171,24 @@ func newBridgeBSVClient(
 		logger = slog.Default()
 	}
 	return &bridgeBSVClient{
-		cht:     cht,
-		woc:     woc,
-		rpc:     rpc,
-		monitor: monitor,
-		logger:  logger,
+		cht:       cht,
+		woc:       woc,
+		rpc:       rpc,
+		monitor:   monitor,
+		logger:    logger,
+		fanoutMax: fanoutMax,
 	}, nil
+}
+
+// effectiveFanoutMax resolves the per-block tx-fetch cap. Operator
+// config takes precedence; otherwise we fall back to the package-level
+// default (which the unit tests temporarily mutate for cap-enforcement
+// assertions, hence the late binding).
+func (a *bridgeBSVClient) effectiveFanoutMax() int {
+	if a.fanoutMax > 0 {
+		return a.fanoutMax
+	}
+	return wocBlockTxFanoutMax
 }
 
 // GetTransaction fetches a single BSV transaction by txid via the
@@ -456,13 +489,14 @@ func (a *bridgeBSVClient) getBlockTransactionsViaWoC(ctx context.Context, height
 	if len(txids) == 0 {
 		return nil, nil
 	}
-	if len(txids) > wocBlockTxFanoutMax {
+	fanoutCap := a.effectiveFanoutMax()
+	if len(txids) > fanoutCap {
 		a.logger.Warn("bridge block-scan: WoC fan-out cap reached, truncating",
 			"height", height,
 			"tx_count", len(txids),
-			"cap", wocBlockTxFanoutMax,
+			"cap", fanoutCap,
 		)
-		txids = txids[:wocBlockTxFanoutMax]
+		txids = txids[:fanoutCap]
 	}
 
 	// Fan-out fetch with a bounded worker pool. We preserve block-
