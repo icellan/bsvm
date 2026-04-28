@@ -13,13 +13,42 @@ import (
 	"github.com/icellan/bsvm/pkg/types"
 )
 
+// LastClaimedNonceUnset is the canonical "no-withdrawal-claimed-yet"
+// sentinel for BridgeUTXO.LastClaimedNonce and the Rúnar bridge
+// covenant's lastClaimedNonce state. ApplyWithdrawTx emits 0-indexed
+// nonces (the predeploy initializes slot 2 to zero and the EVM reads
+// it before incrementing), so the first claim must present nonce 0.
+// Initialising LastClaimedNonce to ^uint64(0) makes the sequential
+// gate "nonce == LastClaimedNonce + 1" admit nonce 0 by uint64
+// wraparound (^uint64(0) + 1 == 0). See
+// docs/decisions/II-withdrawal-nonce-convention.md.
+const LastClaimedNonceUnset = ^uint64(0)
+
 // BridgeUTXO tracks the single bridge covenant UTXO.
+//
+// Construct with NewBridgeUTXO so LastClaimedNonce is initialised to
+// the LastClaimedNonceUnset sentinel. Direct struct literals must set
+// LastClaimedNonce explicitly — a default-init zero value would reject
+// the first (nonce 0) withdrawal.
 type BridgeUTXO struct {
 	TxID             types.Hash
 	Vout             uint32
 	Balance          uint64 // total BSV held in the bridge (satoshis)
-	LastClaimedNonce uint64 // last withdrawal nonce claimed (sequential)
+	LastClaimedNonce uint64 // last withdrawal nonce claimed; LastClaimedNonceUnset when no claim has succeeded yet
 	Script           []byte // compiled bridge covenant locking script
+}
+
+// NewBridgeUTXO constructs a BridgeUTXO with LastClaimedNonce
+// initialised to LastClaimedNonceUnset so the first finalised
+// withdrawal (nonce 0) passes the sequential gate.
+func NewBridgeUTXO(txid types.Hash, vout uint32, balance uint64, script []byte) *BridgeUTXO {
+	return &BridgeUTXO{
+		TxID:             txid,
+		Vout:             vout,
+		Balance:          balance,
+		LastClaimedNonce: LastClaimedNonceUnset,
+		Script:           script,
+	}
 }
 
 // UpdateAfterWithdrawal updates the bridge UTXO state after a
@@ -198,6 +227,11 @@ func (w *Withdrawer) SetBroadcastRetryPolicy(attempts int, backoffs []time.Durat
 //     wallet key.
 //  5. Broadcasting via ARC, retrying on transient failure.
 func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
+	// Withdrawal nonces are 0-indexed: ApplyWithdrawTx emits the first
+	// withdrawal log with nonce 0. A fresh BridgeUTXO has
+	// LastClaimedNonce == LastClaimedNonceUnset (^uint64(0)), and the
+	// uint64 addition below wraps to 0 — so the first claim is admitted.
+	// See docs/decisions/II-withdrawal-nonce-convention.md.
 	nextNonce := w.bridgeUTXO.LastClaimedNonce + 1
 	pendingWithdrawals, err := w.scanner.ScanPendingWithdrawals(nextNonce)
 	if err != nil {
