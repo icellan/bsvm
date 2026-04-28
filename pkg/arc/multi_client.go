@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // Strategy selects how a MultiClient aggregates responses across its
@@ -212,6 +214,20 @@ func NewMultiClient(cfg MultiConfig) (*MultiClient, error) {
 // Endpoints returns the resolved endpoint configurations (with
 // defaults filled in). The returned slice MUST NOT be mutated.
 func (m *MultiClient) Endpoints() []EndpointConfig { return m.endpoint }
+
+// SetMetrics propagates the daemon's shared *metrics.Counters into
+// every inner *Client so ARCBroadcastAttempts / ARCBroadcastFailed
+// counters fire across the fan-out. Passing nil falls back to a
+// fresh no-op registry on each inner client (consistent with
+// Client.SetMetrics).
+func (m *MultiClient) SetMetrics(c *metrics.Counters) {
+	if m == nil {
+		return
+	}
+	for _, inner := range m.clients {
+		inner.SetMetrics(c)
+	}
+}
 
 // Strategy reports the aggregation strategy.
 func (m *MultiClient) Strategy() Strategy { return m.cfg.Strategy }

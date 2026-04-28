@@ -668,6 +668,7 @@ func cmdRun(ctx *cli.Context) error {
 			OverlayNode: overlayNode,
 			CovenantMgr: covenantMgr,
 			Provider:    bsvProvider,
+			Counters:    overlayNode.Counters(),
 		})
 		if err != nil {
 			return fmt.Errorf("BSV broadcast wiring failed: %w", err)
