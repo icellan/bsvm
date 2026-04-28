@@ -17,6 +17,15 @@ import (
 // the claim for the next pass instead of dropping it.
 var ErrAdvanceNotYetAnchored = errors.New("bridge: covenant advance for L2 block not yet anchored")
 
+// ErrAdvanceNotYetConfirmed signals that the L2 block's covenant advance
+// has been broadcast and persisted, but has not reached BSV confirmation
+// yet. The Withdrawer treats it the same as ErrAdvanceNotYetAnchored —
+// queue for retry — but the distinct error lets operators tell mempool-
+// pending advances apart from never-broadcast ones in logs. Issuing a
+// claim against an unconfirmed anchor is unsafe: a re-org that buries
+// the advance would orphan the claim's reference output.
+var ErrAdvanceNotYetConfirmed = errors.New("bridge: covenant advance broadcast but not yet confirmed on BSV")
+
 // AnchorReader reads AnchorRecord-style entries from the chain database.
 // Implementations are typically a thin adapter over *block.ChainDB.
 // Defined in pkg/bridge so the package's CovenantAdvanceFinder seam can
@@ -65,8 +74,19 @@ func NewChainDBAdvanceFinder(anchors AnchorReader, fetcher BSVTxFetcher) *ChainD
 }
 
 // FindCovenantAdvanceForBlock implements CovenantAdvanceFinder. Returns
-// ErrAdvanceNotYetAnchored when the block has no AnchorRecord yet, so
-// the Withdrawer can distinguish "retry later" from a permanent error.
+// ErrAdvanceNotYetAnchored when the block has no AnchorRecord yet, or
+// ErrAdvanceNotYetConfirmed when the record exists but the watcher has
+// not yet seen at least one BSV confirmation. The Withdrawer treats
+// both as "retry later" so the claim is queued for the next pass; the
+// distinct errors let operators distinguish never-broadcast from
+// mempool-pending in logs.
+//
+// Gating on Confirmed=true matters: a claim broadcast against an
+// unconfirmed anchor risks being orphaned by a re-org of the advance
+// transaction itself. Spec 09 finality semantics require >= 1 BSV
+// confirmation on the advance before referencing it from a claim;
+// >= 6 confirmations are required for the L2 block to be tagged
+// `finalized` (handled separately by FinalizedTipProvider).
 func (f *ChainDBAdvanceFinder) FindCovenantAdvanceForBlock(l2BlockNum uint64) (*BSVTransaction, error) {
 	if f == nil || f.anchors == nil || f.fetcher == nil {
 		return nil, errors.New("bridge: finder not fully configured")
@@ -75,20 +95,18 @@ func (f *ChainDBAdvanceFinder) FindCovenantAdvanceForBlock(l2BlockNum uint64) (*
 	if !ok {
 		return nil, fmt.Errorf("%w: l2_block=%d", ErrAdvanceNotYetAnchored, l2BlockNum)
 	}
+	if !confirmed {
+		slog.Debug("withdrawal finder: anchor not yet confirmed; deferring claim",
+			"block", l2BlockNum, "bsvTx", txid.BSVString())
+		return nil, fmt.Errorf("%w: l2_block=%d, bsvTx=%s",
+			ErrAdvanceNotYetConfirmed, l2BlockNum, txid.BSVString())
+	}
 	tx, err := f.fetcher.FetchBSVTx(txid)
 	if err != nil {
 		return nil, fmt.Errorf("fetch advance tx %s: %w", txid.BSVString(), err)
 	}
 	if tx == nil {
 		return nil, fmt.Errorf("advance tx %s not found", txid.BSVString())
-	}
-	if !confirmed {
-		// Not fatal — the bridge covenant verifies inclusion on chain
-		// regardless. We log so operators can correlate "claim built
-		// against unconfirmed anchor" with downstream broadcaster
-		// errors if the BSV mempool rejects it.
-		slog.Debug("withdrawal finder: anchor not yet marked confirmed",
-			"block", l2BlockNum, "bsvTx", txid.BSVString())
 	}
 	return tx, nil
 }
