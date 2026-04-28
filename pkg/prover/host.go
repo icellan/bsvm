@@ -12,17 +12,34 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/icellan/bsvm/pkg/crypto"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/types"
 )
 
 // SP1Prover generates STARK proofs of EVM execution via SP1.
 type SP1Prover struct {
-	config Config
+	config  Config
+	metrics *metrics.Counters
 }
 
 // NewSP1Prover creates a new SP1Prover with the given configuration.
 func NewSP1Prover(config Config) *SP1Prover {
-	return &SP1Prover{config: config}
+	return &SP1Prover{config: config, metrics: metrics.DisabledCounters()}
+}
+
+// SetMetrics swaps the prover's Counters pointer. Pass the daemon's
+// shared *metrics.Counters at boot to enable proof-duration histogram
+// + proof-size histogram observations; passing nil falls back to a
+// fresh no-op registry so .Observe() stays safe.
+func (p *SP1Prover) SetMetrics(c *metrics.Counters) {
+	if p == nil {
+		return
+	}
+	if c == nil {
+		p.metrics = metrics.DisabledCounters()
+		return
+	}
+	p.metrics = c
 }
 
 // Mode returns the prover backend mode (local / network / mock). Exposed
@@ -160,21 +177,41 @@ type ProveOutput struct {
 
 // Prove generates a STARK proof of correct EVM execution. The proof mode
 // (local, network, mock) is determined by the prover's configuration.
+//
+// Observability: every successful Prove call records the wall-clock
+// duration into ProverProofDurationSeconds and the size of the
+// returned proof bytes into ProverProofSizeBytes. Failed calls are not
+// observed (they never produced a proof) — operators looking for stuck
+// provers should consult the JSON-RPC bsv_provingStatus snapshot for
+// in-flight counts instead.
 func (p *SP1Prover) Prove(ctx context.Context, input *ProveInput) (*ProveOutput, error) {
 	if input == nil {
 		return nil, fmt.Errorf("prove input is nil")
 	}
 
+	start := time.Now()
+	var (
+		out *ProveOutput
+		err error
+	)
 	switch p.config.Mode {
 	case ProverLocal:
-		return p.proveLocal(ctx, input)
+		out, err = p.proveLocal(ctx, input)
 	case ProverNetwork:
-		return p.proveNetwork(ctx, input)
+		out, err = p.proveNetwork(ctx, input)
 	case ProverMock:
-		return p.proveMock(ctx, input)
+		out, err = p.proveMock(ctx, input)
 	default:
 		return nil, fmt.Errorf("unknown prover mode: %d", p.config.Mode)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if p.metrics != nil && out != nil {
+		p.metrics.ProverProofDurationSeconds.Observe(time.Since(start).Seconds())
+		p.metrics.ProverProofSizeBytes.Observe(float64(len(out.Proof)))
+	}
+	return out, nil
 }
 
 // proveLocal invokes the bsvm-host-bridge Rust binary as a subprocess,

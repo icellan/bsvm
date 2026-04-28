@@ -592,6 +592,9 @@ func (n *OverlayNode) processBatchInternal(
 				slog.Warn("covenant broadcast failed", "block", l2Block.NumberU64(), "error", bcErr)
 			} else {
 				broadcastResult = result
+				if n.counters != nil {
+					n.counters.OverlayBatchesAdvancedTotal.Inc()
+				}
 				// processBatchInternal is documented to be called with
 				// n.mu held, so the field read is already serialised
 				// against StartConfirmationWatcher; reaching for the

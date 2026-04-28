@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // Status is an ARC transaction status code.
@@ -77,8 +79,20 @@ type TxStatus struct {
 
 // Client is the canonical ARC client. Construct via NewClient.
 type Client struct {
-	cfg  Config
-	http *http.Client
+	cfg     Config
+	http    *http.Client
+	metrics *metrics.Counters
+}
+
+// SetMetrics swaps the ARC client's Counters pointer. Pass the daemon's
+// shared *metrics.Counters at boot to enable broadcast-attempt /
+// failure counters; passing nil falls back to a fresh no-op registry.
+func (c *Client) SetMetrics(m *metrics.Counters) {
+	if m == nil {
+		c.metrics = metrics.DisabledCounters()
+		return
+	}
+	c.metrics = m
 }
 
 // Config configures an ARC Client.
@@ -115,8 +129,9 @@ func NewClient(cfg Config) (*Client, error) {
 		cfg.Timeout = 30 * time.Second
 	}
 	return &Client{
-		cfg:  cfg,
-		http: &http.Client{Timeout: cfg.Timeout},
+		cfg:     cfg,
+		http:    &http.Client{Timeout: cfg.Timeout},
+		metrics: metrics.DisabledCounters(),
 	}, nil
 }
 
@@ -174,6 +189,9 @@ func decodeHashBE(s string, out *[32]byte) error {
 // application/octet-stream BEEF can be added once the surface
 // stabilises.
 func (c *Client) Broadcast(ctx context.Context, txOrBeef []byte) (*BroadcastResponse, error) {
+	if c.metrics != nil {
+		c.metrics.ARCBroadcastAttemptsTotal.Inc()
+	}
 	endpoint := strings.TrimRight(c.cfg.URL, "/") + "/v1/tx"
 	body, err := json.Marshal(map[string]string{"rawTx": hex.EncodeToString(txOrBeef)})
 	if err != nil {
@@ -200,16 +218,20 @@ func (c *Client) Broadcast(ctx context.Context, txOrBeef []byte) (*BroadcastResp
 		// before a status was received). Surface as an ARCBroadcastError
 		// with HTTPStatus=0 so callers can classify via IsTransient
 		// without resorting to string matching.
-		return nil, &ARCBroadcastError{Underlying: err}
+		brErr := &ARCBroadcastError{Underlying: err}
+		c.recordBroadcastFailure(brErr)
+		return nil, brErr
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, &ARCBroadcastError{
+		brErr := &ARCBroadcastError{
 			HTTPStatus: resp.StatusCode,
 			Underlying: err,
 			Detail:     "read response body",
 		}
+		c.recordBroadcastFailure(brErr)
+		return nil, brErr
 	}
 	if resp.StatusCode >= 400 {
 		// Parse the body opportunistically — ARC frequently returns the
@@ -221,11 +243,13 @@ func (c *Client) Broadcast(ctx context.Context, txOrBeef []byte) (*BroadcastResp
 		txStatus := ""
 		_ = json.Unmarshal(respBody, &w)
 		txStatus = w.TxStatus
-		return nil, &ARCBroadcastError{
+		brErr := &ARCBroadcastError{
 			HTTPStatus: resp.StatusCode,
 			TxStatus:   txStatus,
 			Detail:     string(respBody),
 		}
+		c.recordBroadcastFailure(brErr)
+		return nil, brErr
 	}
 	var w wireBroadcast
 	if err := json.Unmarshal(respBody, &w); err != nil {
@@ -240,13 +264,32 @@ func (c *Client) Broadcast(ctx context.Context, txOrBeef []byte) (*BroadcastResp
 		StatusDoubleSpendAttempted,
 		StatusDoubleSpendConfirmed,
 		StatusSeenInOrphanMempool:
-		return nil, &ARCBroadcastError{
+		brErr := &ARCBroadcastError{
 			HTTPStatus: resp.StatusCode,
 			TxStatus:   w.TxStatus,
 			Detail:     w.ExtraInfo,
 		}
+		c.recordBroadcastFailure(brErr)
+		return nil, brErr
 	}
 	return w.toBroadcastResponse()
+}
+
+// recordBroadcastFailure bumps the ARC broadcast failure counter under
+// the appropriate class label. Permanent (terminal) errors increment
+// class=permanent; everything else (transport, 5xx, 4xx without a
+// terminal txStatus) is bucketed as class=transient. Safe when c.metrics
+// is nil — the metrics field is always seeded by NewClient and SetMetrics
+// guards nil values, but the helper is defensive.
+func (c *Client) recordBroadcastFailure(err *ARCBroadcastError) {
+	if c.metrics == nil || err == nil {
+		return
+	}
+	if err.IsPermanent() {
+		c.metrics.IncARCBroadcastFailed("permanent")
+		return
+	}
+	c.metrics.IncARCBroadcastFailed("transient")
 }
 
 type wireStatus struct {

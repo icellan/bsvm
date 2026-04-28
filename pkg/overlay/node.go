@@ -74,6 +74,12 @@ type OverlayNode struct {
 
 	eventFeed *event.Feed
 
+	// counters is the daemon-wide Prometheus counter set. nil-safe;
+	// populated by NewOverlayNodeWithObservability when registry is
+	// non-nil. Exposed via Counters() so SetCounters can mutate after
+	// construction.
+	counters *metrics.Counters
+
 	mu sync.Mutex
 }
 
@@ -137,6 +143,16 @@ func NewOverlayNodeWithObservability(
 	// Create the signer.
 	signer := types.LatestSignerForChainID(big.NewInt(config.ChainID))
 
+	// Resolve the unified counter set up-front. nil registry seeds a
+	// no-op so .Inc() / .Observe() on n.counters stays safe without
+	// per-call nil-checks in the process-batch hot path.
+	var counters *metrics.Counters
+	if registry != nil {
+		counters = metrics.NewCounters(registry)
+	} else {
+		counters = metrics.DisabledCounters()
+	}
+
 	// Initialise the node.
 	node := &OverlayNode{
 		config:         config,
@@ -151,10 +167,17 @@ func NewOverlayNodeWithObservability(
 		signer:         signer,
 		executionTip:   headHeader.Number.Uint64(),
 		eventFeed:      &event.Feed{},
+		counters:       counters,
 		txCache: NewTxCache(ConfirmedState{
 			StateRoot:  headHeader.StateRoot,
 			L2BlockNum: headHeader.Number.Uint64(),
 		}),
+	}
+
+	// Propagate the same counter set to the prover host so its
+	// Prove() observations land on the daemon's /metrics endpoint.
+	if sp1Prover != nil {
+		sp1Prover.SetMetrics(counters)
 	}
 
 	// Create the batcher.
@@ -221,6 +244,18 @@ func NewOverlayNodeWithObservability(
 	}
 
 	return node, nil
+}
+
+// Counters returns the overlay's daemon-wide Prometheus counter set.
+// Always non-nil — when the OverlayNode was constructed without a
+// registry the value is a fresh no-op set so .Inc() / .Observe() stays
+// safe. Other subsystems wired via cmd/bsvm pull this through to share
+// one Counters across the process.
+func (n *OverlayNode) Counters() *metrics.Counters {
+	if n == nil {
+		return nil
+	}
+	return n.counters
 }
 
 // ExecutionTip returns the latest executed L2 block number.

@@ -43,6 +43,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // Reasonable defaults; overridable via RemoteConfig.
@@ -106,6 +108,11 @@ type streamHub struct {
 	stopOnce  sync.Once
 	stop      chan struct{}
 	stopped   chan struct{}
+
+	// metrics is the daemon-wide Prometheus counter set, populated by
+	// the parent RemoteClient before Start. nil-safe — the increments
+	// in run() and acceptReorg below check before dispatching.
+	metrics *metrics.Counters
 }
 
 // newStreamHub builds a hub for the given base URL and config. The
@@ -226,6 +233,9 @@ func (h *streamHub) run() {
 		case <-h.stop:
 			return
 		default:
+		}
+		if h.metrics != nil {
+			h.metrics.ChaintracksReconnectsTotal.Inc()
 		}
 		err := h.connectAndPump()
 		if err != nil {
@@ -453,6 +463,9 @@ func (h *streamHub) acceptReorg(commonAncestor [32]byte, newChain []*BlockHeader
 	h.tipWork = newWork
 	h.chainHead = newTip
 	h.mu.Unlock()
+	if h.metrics != nil {
+		h.metrics.ChaintracksReorgsTotal.Inc()
+	}
 	h.broadcast(&ReorgEvent{
 		CommonAncestor: commonAncestor,
 		OldTip:         oldTip,
