@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/icellan/bsvm/pkg/types"
@@ -170,5 +171,58 @@ func TestBSVPrecompilesNotRegisteredWithoutFlag(t *testing.T) {
 		if _, ok := m[addr]; ok {
 			t.Errorf("BSV precompile %s should NOT be registered without IsBSVM flag", addr.Hex())
 		}
+	}
+}
+
+// TestBlake2FRequiredGasBoundsRounds asserts the EIP-152 pricing
+// formula returns gas == rounds, so a malicious caller requesting a
+// huge number of rounds is rate-limited by gas alone (~4.3 billion gas
+// for the worst case) and never gets to invoke the compression
+// function. This pins the contract that gas is the only DoS bound on
+// blake2f — no separate numeric cap is required.
+func TestBlake2FRequiredGasBoundsRounds(t *testing.T) {
+	bf := &blake2F{}
+
+	// Build a syntactically valid 213-byte input with a controlled
+	// rounds prefix. Body content is irrelevant to RequiredGas.
+	mkInput := func(rounds uint32) []byte {
+		buf := make([]byte, blake2FInputLength)
+		binary.BigEndian.PutUint32(buf[0:4], rounds)
+		buf[212] = 0 // f flag valid
+		return buf
+	}
+
+	cases := []struct {
+		name   string
+		rounds uint32
+		want   uint64
+	}{
+		{"zero rounds", 0, 0},
+		{"typical rounds", 12, 12},
+		{"large but reasonable", 1 << 16, 1 << 16},
+		{"max uint32 — gas explodes well past block limit", 0xFFFFFFFF, 0xFFFFFFFF},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bf.RequiredGas(mkInput(tc.rounds))
+			if got != tc.want {
+				t.Fatalf("RequiredGas(rounds=%d) = %d, want %d", tc.rounds, got, tc.want)
+			}
+		})
+	}
+
+	// Sanity: with rounds=2^32-1 the gas demand exceeds any plausible
+	// block gas limit (mainnet ~30M, our L2 likewise) by two orders of
+	// magnitude, so the EVM rejects the call before Run() runs.
+	const blockGasLimitCeiling uint64 = 1 << 30 // 1 billion — generous
+	if got := bf.RequiredGas(mkInput(0xFFFFFFFF)); got <= blockGasLimitCeiling {
+		t.Fatalf("expected RequiredGas(MAX_ROUNDS) > %d, got %d", blockGasLimitCeiling, got)
+	}
+
+	// And the input-length guard returns 0 (free) when malformed —
+	// matches geth, prevents accidental over-charge for a call the EVM
+	// is going to error out on anyway.
+	if got := bf.RequiredGas(make([]byte, 100)); got != 0 {
+		t.Fatalf("expected 0 gas for malformed input, got %d", got)
 	}
 }
