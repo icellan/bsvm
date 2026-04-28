@@ -452,6 +452,203 @@ func TestCachedClient_GetBlockTxIDs_UpstreamFallbackCachesResult(t *testing.T) {
 	}
 }
 
+// fakePagedBlockClient is an in-process upstream that satisfies BOTH
+// PaginatedBlockTxIDsFetcher AND PageFetcher. It exists so the
+// CachedClient can wrap a non-*Client upstream and still exercise the
+// per-page LRU+singleflight path. The header response is simulated
+// inline (no HTTP); FetchPage hands out canned per-URI responses and
+// counts the call so tests can verify singleflight + cache HIT.
+type fakePagedBlockClient struct {
+	mu        sync.Mutex
+	pageCalls map[string]int
+	pages     map[string][]string // pageURI → flat hex txid list
+	// blockPages maps blockHash → []pageURI (the manifest the upstream
+	// would return from its `/block/hash/<hash>` header endpoint).
+	blockPages map[[32]byte][]string
+}
+
+func newFakePagedBlockClient() *fakePagedBlockClient {
+	return &fakePagedBlockClient{
+		pageCalls:  make(map[string]int),
+		pages:      make(map[string][]string),
+		blockPages: make(map[[32]byte][]string),
+	}
+}
+
+func (f *fakePagedBlockClient) GetTx(_ context.Context, _ [32]byte) ([]byte, error) {
+	return nil, ErrNotFound
+}
+func (f *fakePagedBlockClient) GetUTXOs(_ context.Context, _ string) ([]UTXO, error) {
+	return nil, nil
+}
+func (f *fakePagedBlockClient) ChainInfo(_ context.Context) (*ChainInfo, error) { return nil, nil }
+func (f *fakePagedBlockClient) Ping(_ context.Context) error                    { return nil }
+
+// GetBlockTxIDs is called when the cache falls back to the upstream
+// without page caching; we drive the same orchestration here for
+// parity with GetBlockTxIDsWithPageFetcher.
+func (f *fakePagedBlockClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	return f.GetBlockTxIDsWithPageFetcher(ctx, blockHash, f)
+}
+
+// GetBlockTxIDsWithPageFetcher orchestrates header+pages using the
+// supplied PageFetcher (which the cache wraps in its LRU+singleflight
+// gate). Implements PaginatedBlockTxIDsFetcher.
+func (f *fakePagedBlockClient) GetBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32]byte, pf PageFetcher) ([][32]byte, error) {
+	f.mu.Lock()
+	uris := append([]string(nil), f.blockPages[blockHash]...)
+	f.mu.Unlock()
+	out := make([][32]byte, 0, 8)
+	for _, uri := range uris {
+		ids, err := pf.FetchPage(ctx, uri)
+		if err != nil {
+			return nil, err
+		}
+		decoded, err := decodeBlockTxIDs(ids, blockTxIDsAbsoluteMax)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, decoded...)
+	}
+	return out, nil
+}
+
+// FetchPage implements PageFetcher. Counts calls per URI so tests can
+// assert dedupe.
+func (f *fakePagedBlockClient) FetchPage(_ context.Context, pageURI string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pageCalls[pageURI]++
+	ids, ok := f.pages[pageURI]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out, nil
+}
+
+func (f *fakePagedBlockClient) callsFor(uri string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pageCalls[uri]
+}
+
+func (f *fakePagedBlockClient) seedPage(uri string, ids []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]string, len(ids))
+	copy(cp, ids)
+	f.pages[uri] = cp
+}
+
+func (f *fakePagedBlockClient) seedBlock(blockHash [32]byte, pageURIs []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]string, len(pageURIs))
+	copy(cp, pageURIs)
+	f.blockPages[blockHash] = cp
+}
+
+// TestCachedClient_PageFetcherInterface_StubGetsPageCache asserts that
+// a non-*Client upstream that implements PageFetcher +
+// PaginatedBlockTxIDsFetcher gets the per-page LRU wrapping for free.
+// A second fetch of the same page URI (driven by an adjacent block
+// whose manifest shares the URI) must hit the cache and never call
+// FetchPage again.
+func TestCachedClient_PageFetcherInterface_StubGetsPageCache(t *testing.T) {
+	stub := newFakePagedBlockClient()
+	const sharedURI = "/block/hash/test/page/shared"
+	stub.seedPage(sharedURI, []string{makeTxIDHex(1), makeTxIDHex(2)})
+
+	var blockA, blockB [32]byte
+	for i := range blockA {
+		blockA[i] = 0xa1
+		blockB[i] = 0xb2
+	}
+	stub.seedBlock(blockA, []string{sharedURI})
+	stub.seedBlock(blockB, []string{sharedURI})
+
+	cached := NewCachedClient(stub, DefaultCacheConfig())
+
+	// First block lookup populates the per-page LRU.
+	got, err := cached.GetBlockTxIDs(context.Background(), blockA)
+	if err != nil {
+		t.Fatalf("GetBlockTxIDs(A): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("blockA returned %d ids, want 2", len(got))
+	}
+	if calls := stub.callsFor(sharedURI); calls != 1 {
+		t.Fatalf("after blockA: page calls = %d, want 1", calls)
+	}
+
+	// Second block lookup against a DIFFERENT block hash whose manifest
+	// references the same page URI. Block-level cache misses (different
+	// key); page-level cache must HIT and skip the upstream FetchPage.
+	got2, err := cached.GetBlockTxIDs(context.Background(), blockB)
+	if err != nil {
+		t.Fatalf("GetBlockTxIDs(B): %v", err)
+	}
+	if len(got2) != 2 {
+		t.Fatalf("blockB returned %d ids, want 2", len(got2))
+	}
+	if calls := stub.callsFor(sharedURI); calls != 1 {
+		t.Fatalf("after blockB: page calls = %d, want 1 (page LRU should dedupe across blocks via PageFetcher interface)", calls)
+	}
+}
+
+// TestCachedClient_PageFetcherInterface_NoFetcherFallback asserts that
+// an upstream that doesn't implement PageFetcher /
+// PaginatedBlockTxIDsFetcher still works — block-level caching kicks
+// in via the upstream.GetBlockTxIDs passthrough, and the page LRU is
+// simply not exercised. (No regression vs the previous *Client
+// type-assertion path.)
+func TestCachedClient_PageFetcherInterface_NoFetcherFallback(t *testing.T) {
+	stub := &stubBlockClient{
+		result: [][32]byte{{0x11}, {0x22}},
+	}
+	cached := NewCachedClient(stub, DefaultCacheConfig())
+
+	var blockHash [32]byte
+	for i := range blockHash {
+		blockHash[i] = 0xcc
+	}
+
+	for i := 0; i < 3; i++ {
+		got, err := cached.GetBlockTxIDs(context.Background(), blockHash)
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("iter %d returned %d ids", i, len(got))
+		}
+	}
+	if stub.callCount() != 1 {
+		t.Fatalf("expected 1 upstream call (block-level cache), got %d", stub.callCount())
+	}
+}
+
+// TestCachedClient_PageFetcherInterface_ClientImplements is a
+// compile-time-style guard: *Client must continue to satisfy
+// PageFetcher AND PaginatedBlockTxIDsFetcher so the production wiring
+// keeps the per-page LRU.
+func TestCachedClient_PageFetcherInterface_ClientImplements(t *testing.T) {
+	var _ PageFetcher = (*Client)(nil)
+	var _ PaginatedBlockTxIDsFetcher = (*Client)(nil)
+}
+
+// TestNoopPageFetcher_ReturnsErrNotFound asserts the documented stub
+// behaviour: NoopPageFetcher always returns ErrNotFound. Tests that
+// wire it must keep the header path inline (no pages.uri).
+func TestNoopPageFetcher_ReturnsErrNotFound(t *testing.T) {
+	pf := NoopPageFetcher()
+	_, err := pf.FetchPage(context.Background(), "/any")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("NoopPageFetcher.FetchPage = %v, want ErrNotFound", err)
+	}
+}
+
 func TestLRU_EvictsOldest(t *testing.T) {
 	lru := newLRU(2)
 	lru.put("a", 1)

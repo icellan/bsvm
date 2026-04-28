@@ -273,7 +273,7 @@ func (c *Client) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]b
 	// Paginated path: WoC returned a `pages.uri` list. Fetch each page
 	// (with bounded concurrency) and concatenate in order.
 	if len(hdr.Pages.URI) > 0 {
-		return c.fetchPagedBlockTxIDs(ctx, hdr.Pages.URI, fetchBlockPage)
+		return c.fetchPagedBlockTxIDs(ctx, hdr.Pages.URI, c)
 	}
 	// Inline path: the `tx` field carries the full manifest.
 	return decodeBlockTxIDs(hdr.Tx, blockTxIDsAbsoluteMax)
@@ -315,15 +315,23 @@ func decodeBlockTxIDs(in []string, maxIDs int) ([][32]byte, error) {
 	return out, nil
 }
 
-// pageFetchFn is the page-fetch primitive GetBlockTxIDs hands to its
-// pagination worker. Pulling it out to a function-typed parameter lets
-// the cache wrapper inject a singleflight+LRU-backed implementation
-// without exposing internal helpers across packages.
-type pageFetchFn func(ctx context.Context, c *Client, pageURI string) ([]string, error)
+// PageFetcher is the per-page primitive of the paginated GetBlockTxIDs
+// path. Each page URI is content-addressed (a stable WoC identifier
+// like /block/hash/<hash>/page/<n>) so any compliant implementation
+// must return the same flat slice of big-endian hex txid strings for
+// the same URI. *Client is the canonical implementation; stub
+// upstreams (test fakes, in-process fixtures) can implement this
+// interface to opt into the per-page LRU+singleflight wrapping
+// CachedClient applies — a refinement over the previous *Client
+// type-assertion which excluded stubs from page-URI dedupe.
+type PageFetcher interface {
+	FetchPage(ctx context.Context, pageURI string) ([]string, error)
+}
 
-// fetchBlockPage fetches a single page of a paginated block-tx manifest.
+// FetchPage fetches a single page of a paginated block-tx manifest.
 // The response is a flat JSON array of big-endian hex txid strings.
-func fetchBlockPage(ctx context.Context, c *Client, pageURI string) ([]string, error) {
+// Implements PageFetcher.
+func (c *Client) FetchPage(ctx context.Context, pageURI string) ([]string, error) {
 	body, err := c.get(ctx, pageURI)
 	if err != nil {
 		return nil, err
@@ -335,12 +343,46 @@ func fetchBlockPage(ctx context.Context, c *Client, pageURI string) ([]string, e
 	return ids, nil
 }
 
-// getBlockTxIDsWithPageFetcher is the testable / cache-injectable form
+// PaginatedBlockTxIDsFetcher is implemented by upstreams that expose
+// the header→pages orchestration as a separate seam from the
+// per-page primitive. CachedClient uses this seam to inject its own
+// PageFetcher (the singleflight+LRU wrapper) without losing the
+// header roundtrip semantics. *Client is the canonical
+// implementation; in-process test fakes that want page-URI caching
+// implement this AND PageFetcher.
+type PaginatedBlockTxIDsFetcher interface {
+	GetBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32]byte, pf PageFetcher) ([][32]byte, error)
+}
+
+// noopPageFetcher is a sentinel PageFetcher that always returns
+// ErrNotFound. It exists for tests / fake upstreams that want to
+// satisfy the PaginatedBlockTxIDsFetcher contract without a real
+// per-page primitive — the surrounding test must arrange for the
+// header response to carry an empty pages.uri (i.e. no pagination)
+// so this fetcher is never actually invoked.
+type noopPageFetcher struct{}
+
+// FetchPage on the no-op fetcher always returns ErrNotFound. Its
+// purpose is to provide a typed nil-equivalent for the
+// PaginatedBlockTxIDsFetcher contract; tests that wire it MUST keep
+// the header path inline (no pages.uri).
+func (noopPageFetcher) FetchPage(ctx context.Context, pageURI string) ([]string, error) {
+	return nil, ErrNotFound
+}
+
+// NoopPageFetcher returns a PageFetcher that always errs with
+// ErrNotFound. Useful for test wiring where an upstream must satisfy
+// PaginatedBlockTxIDsFetcher but the test never exercises the
+// paginated path.
+func NoopPageFetcher() PageFetcher { return noopPageFetcher{} }
+
+// GetBlockTxIDsWithPageFetcher is the testable / cache-injectable form
 // of GetBlockTxIDs. It runs the same header→pagination flow but lets
-// the caller supply a custom page-fetch primitive — used by
-// CachedClient to wire each page through its singleflight+LRU gate so
-// repeated block lookups skip the page fetch entirely on a cache HIT.
-func (c *Client) getBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32]byte, fetch pageFetchFn) ([][32]byte, error) {
+// the caller supply a custom PageFetcher — used by CachedClient to
+// wire each page through its singleflight+LRU gate so repeated block
+// lookups skip the page fetch entirely on a cache HIT. Implements
+// PaginatedBlockTxIDsFetcher.
+func (c *Client) GetBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32]byte, pf PageFetcher) ([][32]byte, error) {
 	beHash := make([]byte, 32)
 	for i := 0; i < 32; i++ {
 		beHash[i] = blockHash[31-i]
@@ -354,7 +396,7 @@ func (c *Client) getBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32
 		return nil, err
 	}
 	if len(hdr.Pages.URI) > 0 {
-		return c.fetchPagedBlockTxIDs(ctx, hdr.Pages.URI, fetch)
+		return c.fetchPagedBlockTxIDs(ctx, hdr.Pages.URI, pf)
 	}
 	return decodeBlockTxIDs(hdr.Tx, blockTxIDsAbsoluteMax)
 }
@@ -363,7 +405,7 @@ func (c *Client) getBlockTxIDsWithPageFetcher(ctx context.Context, blockHash [32
 // bounded worker pool, preserving manifest order. A failure on any
 // page is fatal — partial block-tx manifests would silently drop
 // deposits, so we surface the first error.
-func (c *Client) fetchPagedBlockTxIDs(ctx context.Context, pageURIs []string, fetch pageFetchFn) ([][32]byte, error) {
+func (c *Client) fetchPagedBlockTxIDs(ctx context.Context, pageURIs []string, pf PageFetcher) ([][32]byte, error) {
 	type pageResult struct {
 		idx int
 		ids []string
@@ -393,7 +435,7 @@ func (c *Client) fetchPagedBlockTxIDs(ctx context.Context, pageURIs []string, fe
 					results <- pageResult{idx: i, err: ctx.Err()}
 					continue
 				}
-				ids, err := fetch(ctx, c, pageURIs[i])
+				ids, err := pf.FetchPage(ctx, pageURIs[i])
 				results <- pageResult{idx: i, ids: ids, err: err}
 			}
 		}()

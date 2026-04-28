@@ -148,12 +148,15 @@ func (c *CachedClient) GetUTXOs(ctx context.Context, address string) ([]UTXO, er
 //     content-addressed (a sealed block's manifest never changes), so
 //     a HIT skips both the header roundtrip and any paginated page
 //     fetches the upstream would otherwise perform.
-//  2. A per-page LRU keyed on the page URI, used only when the upstream
-//     is a *Client (the canonical implementation). Pages are stable
-//     content-addressed lookups in their own right; caching them
-//     amortises the cost when the block-level cache misses (e.g. an
-//     adjacent block in a hot scan range that shares no pages with
-//     this one — the overhead is bounded by BlockPageCacheSize).
+//  2. A per-page LRU keyed on the page URI, used whenever the upstream
+//     satisfies PaginatedBlockTxIDsFetcher + PageFetcher. *Client is
+//     the canonical implementation; in-process test fakes that want
+//     page-URI caching can implement these interfaces directly. Pages
+//     are stable content-addressed lookups in their own right;
+//     caching them amortises the cost when the block-level cache
+//     misses (e.g. an adjacent block in a hot scan range that shares
+//     no pages with this one — the overhead is bounded by
+//     BlockPageCacheSize).
 //
 // Singleflight collapses concurrent requests for the same block into
 // a single upstream call, mirroring the GetTx posture.
@@ -186,23 +189,47 @@ func (c *CachedClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([
 }
 
 // fetchBlockTxIDs is the upstream-resolved fetch path used on a cache
-// MISS. When the upstream is a *Client we drive its paginated path
-// with a singleflight+LRU-backed page fetcher; otherwise we fall back
-// to the upstream's GetBlockTxIDs (which is what stub clients in tests
-// implement directly).
+// MISS. When the upstream satisfies PaginatedBlockTxIDsFetcher AND
+// PageFetcher we drive its paginated path with a singleflight+LRU-
+// backed PageFetcher (so per-page fetches dedupe across blocks);
+// otherwise we fall back to the upstream's GetBlockTxIDs (which is
+// what stub clients without page-URI plumbing implement directly).
+//
+// The interface gate (vs the previous *Client type-assertion) lets
+// in-process test fakes opt into page-URI caching by implementing
+// PageFetcher + PaginatedBlockTxIDsFetcher — neither requires the
+// real WoC HTTP machinery.
 func (c *CachedClient) fetchBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
-	if real, ok := c.upstream.(*Client); ok {
-		return real.getBlockTxIDsWithPageFetcher(ctx, blockHash, c.cachedPageFetch)
+	if paginated, ok := c.upstream.(PaginatedBlockTxIDsFetcher); ok {
+		if pf, ok := c.upstream.(PageFetcher); ok {
+			return paginated.GetBlockTxIDsWithPageFetcher(ctx, blockHash, c.cachedPageFetcher(pf))
+		}
 	}
 	return c.upstream.GetBlockTxIDs(ctx, blockHash)
 }
 
-// cachedPageFetch wraps a single paginated-page fetch with the page
-// LRU + singleflight. Each page URI is a content-addressed lookup so
-// hits are always safe to serve from cache.
-func (c *CachedClient) cachedPageFetch(ctx context.Context, real *Client, pageURI string) ([]string, error) {
+// cachedPageFetcher returns a PageFetcher that wraps inner with the
+// per-page LRU + singleflight gate. When the page cache is disabled
+// the wrapper degenerates to a transparent passthrough (inner is
+// invoked directly each call).
+func (c *CachedClient) cachedPageFetcher(inner PageFetcher) PageFetcher {
+	return &cachingPageFetcher{owner: c, inner: inner}
+}
+
+// cachingPageFetcher applies the CachedClient's per-page LRU +
+// singleflight gate to inner. Implements PageFetcher.
+type cachingPageFetcher struct {
+	owner *CachedClient
+	inner PageFetcher
+}
+
+// FetchPage caches and singleflights inner.FetchPage by URI. Each
+// page URI is a content-addressed lookup so HITs are always safe to
+// serve from cache.
+func (p *cachingPageFetcher) FetchPage(ctx context.Context, pageURI string) ([]string, error) {
+	c := p.owner
 	if c.blockPageCache == nil {
-		return fetchBlockPage(ctx, real, pageURI)
+		return p.inner.FetchPage(ctx, pageURI)
 	}
 	if v, ok := c.blockPageCache.get(pageURI); ok {
 		return cloneStrings(v.([]string)), nil
@@ -211,7 +238,7 @@ func (c *CachedClient) cachedPageFetch(ctx context.Context, real *Client, pageUR
 		if cached, ok := c.blockPageCache.get(pageURI); ok {
 			return cached, nil
 		}
-		ids, err := fetchBlockPage(ctx, real, pageURI)
+		ids, err := p.inner.FetchPage(ctx, pageURI)
 		if err != nil {
 			return nil, err
 		}
