@@ -214,7 +214,16 @@ func opTstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]b
 
 // opBaseFee implements BASEFEE opcode
 func opBaseFee(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-	baseFee, _ := uint256.FromBig(interpreter.evm.Context.BaseFee)
+	// BlockContext.BaseFee is *big.Int and may be nil for callers that
+	// don't supply it (fuzz harnesses, pre-EIP-1559 chain configs).
+	// Mirror the defensive zero-default applied to opDifficulty /
+	// opRandom / opBlobBaseFee.
+	baseFee := new(uint256.Int)
+	if interpreter.evm.Context.BaseFee != nil {
+		if v, _ := uint256.FromBig(interpreter.evm.Context.BaseFee); v != nil {
+			baseFee = v
+		}
+	}
 	scope.Stack.push(baseFee)
 	return nil, nil
 }

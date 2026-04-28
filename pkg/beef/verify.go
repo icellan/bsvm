@@ -119,12 +119,39 @@ func (v *Verifier) Verify(ctx context.Context, beefBytes []byte) (*VerifiedBEEF,
 	if len(beefBytes) == 0 {
 		return nil, ErrEmptyBEEF
 	}
+	// Defensive size cap. A real BEEF envelope encoding a deeply-nested
+	// payment graph can be megabytes, but never tens of megabytes; an
+	// attacker shipping a crafted multi-GB body would otherwise exhaust
+	// memory or pin a verifier core for minutes inside a slow
+	// hex/varint path. 4 MiB matches the network-layer maxStreamReadSize
+	// for genesis-sync covenant scripts and bounds the parser cost.
+	const maxBEEFBytes = 4 * 1024 * 1024
+	if len(beefBytes) > maxBEEFBytes {
+		return nil, fmt.Errorf("%w: body %d bytes exceeds %d cap", ErrParse, len(beefBytes), maxBEEFBytes)
+	}
 
-	// Step 1: parse the BEEF and recover the target tx with its full
+	// Step 1a: cheap structural pre-flight using our own bounded
+	// ParseBEEF. This rejects envelopes whose varint headers advertise
+	// nonsense ancestor counts before we hand the bytes to go-sdk's
+	// reader (which has been observed to panic or burn CPU on adversarial
+	// truncated bodies — see safeNewTransactionFromBEEF below).
+	if _, perr := ParseBEEF(beefBytes); perr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrParse, perr)
+	}
+
+	// Step 1b: parse the BEEF and recover the target tx with its full
 	// ancestry graph. NewTransactionFromBEEF wires every input's
 	// SourceTransaction pointer so the script interpreter can see
 	// ancestor outputs without an extra fetch.
-	target, err := sdktx.NewTransactionFromBEEF(beefBytes)
+	//
+	// Defensive: go-sdk's BEEF reader has been observed to panic on
+	// malformed input (e.g. a 2^63-1-element BUMP varint header
+	// triggers `makeslice: len out of range` inside readBUMPs). A
+	// gossip peer must not be able to crash a verifier node by
+	// shipping a crafted envelope, so we recover any panic here and
+	// surface it as ErrParse. This is purely a hardening boundary —
+	// production builds keep go-sdk pinned to a known-good revision.
+	target, err := safeNewTransactionFromBEEF(beefBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrParse, err)
 	}
@@ -385,6 +412,22 @@ func (c *validatedCache) has(key [32]byte) bool {
 	}
 	_, ok := c.set[key]
 	return ok
+}
+
+// safeNewTransactionFromBEEF wraps sdktx.NewTransactionFromBEEF
+// with a panic recover. Malformed BEEF bodies have been observed to
+// trigger panics inside the SDK (notably "makeslice: len out of
+// range" when a varint header advertises an absurd ancestor count).
+// We must not let a gossip peer crash the verifier; convert any
+// panic to a typed error.
+func safeNewTransactionFromBEEF(body []byte) (target *sdktx.Transaction, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			target = nil
+			err = fmt.Errorf("sdk panic during BEEF parse: %v", r)
+		}
+	}()
+	return sdktx.NewTransactionFromBEEF(body)
 }
 
 // Verifier errors. Callers can errors.Is against these to drive
