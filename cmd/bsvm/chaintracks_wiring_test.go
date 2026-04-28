@@ -278,7 +278,7 @@ func TestWireBEEFEndpoints_FullWiringWithFakeChaintracks(t *testing.T) {
 	defer chaintracksClient.Close()
 
 	memDB := db.NewMemoryDB()
-	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, memDB)
+	monitor := bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, memDB)
 	monitor.SetBridgeScriptHash(bridgeLockBytes)
 	monitor.SetLocalShardID(localShardID)
 

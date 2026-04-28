@@ -6,11 +6,13 @@
 // to the pre-Item-3 fail-closed path: envelopes were stored but no L2
 // credit was ever applied.
 //
-// The monitor instance constructed here is BEEF-driven: the bsvClient
-// (legacy block-scanning) parameter is left nil because the BEEF flow
+// The monitor instance constructed here is BEEF-driven: the BEEF flow
 // supplies fully-verified deposits via the consumer callback rather
-// than scanning blocks. PersistDeposit only needs the DepositStore (the
-// daemon's shared LevelDB) and the script-hash + shard-id setters.
+// than scanning blocks. The block-scanning fallback path is driven
+// externally by cmd/bsvm/bridge_blockscan_wiring.go, which calls
+// monitor.ProcessBlock from a chaintracks-backed adapter. PersistDeposit
+// only needs the DepositStore (the daemon's shared LevelDB) and the
+// script-hash + shard-id setters.
 //
 // The L1 bridge covenant locking script must be provisioned out of
 // band — the operator pastes its hex into [bridge].bridge_script_hex
@@ -87,12 +89,12 @@ func BuildBridgeMonitor(
 		bcfg.BSVConfirmations = cfg.BSVConfirmations
 	}
 
-	// bsvClient is intentionally nil — the BEEF flow supplies pre-
-	// verified deposits through the consumer callback (PersistDeposit).
-	// Block-scanning paths (which DO need a BSV client) are not used
-	// here; if they're activated later, supply a real client at that
-	// site so SubscribeNewBlocks etc. don't NPE.
-	monitor := bridge.NewBridgeMonitor(bcfg, nil, overlayNode, depositStore)
+	// The monitor itself owns no BSV-network client — block scanning is
+	// driven externally by cmd/bsvm/bridge_blockscan_wiring.go, which
+	// composes a chaintracks-backed adapter and calls ProcessBlock /
+	// RetractDepositsAbove on the monitor directly. The BEEF flow
+	// supplies pre-verified deposits through PersistDeposit.
+	monitor := bridge.NewBridgeMonitor(bcfg, overlayNode, depositStore)
 	monitor.SetBridgeScriptHash(scriptHash)
 	if chainID > 0 {
 		monitor.SetLocalShardID(uint32(chainID))

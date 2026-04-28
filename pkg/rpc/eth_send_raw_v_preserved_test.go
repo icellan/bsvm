@@ -16,26 +16,29 @@ import (
 // RLP encodes a *big.Int with value 0 as the empty string (0x80), which the
 // decoder maps back to a nil pointer. For typed (EIP-2930 / EIP-1559)
 // transactions the recovery id IS the V value (no chainID offset like
-// EIP-155), so V == 0 is the common case. If the RPC's decode path leaves V
-// nil, the signer's Sender() call returns "missing signature values" and
-// every nonce-0 typed tx with even-y signatures (~50% of all such txs)
-// fails to validate.
+// EIP-155), so V == 0 is the common case. If the decode path leaves V nil,
+// the signer's Sender() call returns "missing signature values" and every
+// nonce-0 typed tx with even-y signatures (~50% of all such txs) fails to
+// validate.
 //
-// The fix lives in pkg/rpc/eth_api.go's decodeLegacyRawTx /
-// decodeAccessListRawTx / decodeDynamicFeeRawTx, which now wrap V/R/S in
-// orZeroBig — the same pattern already used by Transaction.DecodeRLP in
-// pkg/types/transaction.go.
+// The RPC layer no longer carries its own decoders — pkg/rpc/eth_api.go's
+// decodeRawTransaction now delegates to the canonical
+// types.Transaction.UnmarshalBinary entrypoint (via pkg/types.DecodeTx),
+// which is the single source of truth for V/R/S handling. This test
+// exercises that canonical path end-to-end so any future regression in
+// pkg/types — or any reintroduction of an RPC-side decoder that drifts
+// from it — is caught here.
 //
-// This test exercises both halves of the failure mode:
+// The test exercises both halves of the failure mode:
 //
-//  1. Round-trip a signed tx through SendRawTransaction → decode → assert
-//     V/R/S survived. This catches the immediate bug.
+//  1. Round-trip a signed tx through eth_sendRawTransaction → decode →
+//     assert V/R/S survived. This catches the immediate bug.
 //  2. Run Sender() against the decoded tx — the actual downstream consumer
 //     that surfaced the original "missing signature values" error.
 //
-// We exercise three envelopes so a future regression in any of the three
-// decode paths is caught: legacy EIP-155, EIP-2930 access list, EIP-1559
-// dynamic fee.
+// Three envelopes are exercised so a regression in any of the typed-tx
+// branches inside Transaction.UnmarshalBinary / DecodeTx is caught: legacy
+// EIP-155, EIP-2930 access list, EIP-1559 dynamic fee.
 func TestEthSendRawTransaction_PreservesSignatureV(t *testing.T) {
 	recipient := types.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	gasPrice := big.NewInt(1_000_000_000)

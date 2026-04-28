@@ -1,11 +1,12 @@
-// Daemon-side adapter that satisfies bridge.BSVClient by composing
-// the chaintracks header oracle (W6-1/2/9), the WhatsOnChain raw-tx
-// fetcher (W6-8), and the BSV-node JSON-RPC failover provider (W6-11).
-// Until this file landed, BuildBridgeMonitor was always called with a
-// nil bsvClient because no single in-tree client implemented the
-// SubscribeNewBlocks / GetBlockTransactions surface the monitor needs
-// for the legacy block-scanning fallback path. The BEEF deposit path
-// (W6-4) had been wired and remains the primary deposit channel; this
+// Daemon-side adapter that exposes the
+// SubscribeNewBlocks / GetBlockTransactions surface the
+// startBridgeBlockScanner loop (cmd/bsvm/bridge_blockscan_wiring.go)
+// drives, by composing the chaintracks header oracle (W6-1/2/9), the
+// WhatsOnChain raw-tx fetcher (W6-8), and the BSV-node JSON-RPC
+// failover provider (W6-11). The bridge package itself no longer has
+// a BSVClient interface — the monitor is a pure state-keeper now and
+// this adapter is wired straight into the cmd-side scanner. The BEEF
+// deposit path (W6-4) remains the primary deposit channel; this
 // adapter restores the secondary path for deposits that arrive
 // directly on-chain (BSV tx with a bridge-script output, no BEEF
 // envelope).
@@ -88,8 +89,9 @@ var (
 
 // ErrBlockFetchUnsupported is returned by GetBlockTransactions when
 // neither a BSV-node RPC provider NOR a WoC client is wired — there
-// is simply nowhere to ask. Callers (the BridgeMonitor.Run loop) are
-// expected to log + skip; the BEEF deposit path is unaffected.
+// is simply nowhere to ask. Callers (the cmd-side block scanner in
+// bridge_blockscan_wiring.go) are expected to log + skip; the BEEF
+// deposit path is unaffected.
 var ErrBlockFetchUnsupported = errors.New("bridge bsv client: getblock unsupported (no BSV-node RPC or WoC client configured)")
 
 // blockFetchTimeout caps each per-block RPC call. A verbose getblock on
@@ -112,10 +114,12 @@ type bridgeRPCClient interface {
 	Call(method string, params ...interface{}) (json.RawMessage, error)
 }
 
-// bridgeBSVClient implements bridge.BSVClient by composing the
-// chaintracks SPV anchor with WoC raw-tx lookups and (optionally) the
-// BSV-node JSON-RPC failover provider. See the package doc-comment for
-// the full design rationale.
+// bridgeBSVClient exposes the SubscribeNewBlocks /
+// GetBlockTransactions / GetTransaction / GetBlockHeight surface the
+// cmd-side block scanner drives, composing the chaintracks SPV anchor
+// with WoC raw-tx lookups and (optionally) the BSV-node JSON-RPC
+// failover provider. See the package doc-comment for the full design
+// rationale.
 type bridgeBSVClient struct {
 	cht     chaintracks.ChaintracksClient
 	woc     whatsonchain.WhatsOnChainClient

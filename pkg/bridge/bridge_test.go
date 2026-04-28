@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"math"
@@ -503,12 +502,11 @@ func TestWithdrawalProofEdgeCases(t *testing.T) {
 // --- TestBridgeMonitorProcessDeposit ---
 
 func TestBridgeMonitorProcessDeposit(t *testing.T) {
-	client := &mockBSVClient{}
 	submitter := &mockOverlaySubmitter{}
 	config := DefaultConfig()
 	config.BSVConfirmations = 6
 
-	monitor := NewBridgeMonitor(config, client, submitter, nil)
+	monitor := NewBridgeMonitor(config, submitter, nil)
 	bridgeScript := []byte{0xaa, 0xbb, 0xcc}
 	monitor.SetBridgeScriptHash(bridgeScript)
 
@@ -568,10 +566,9 @@ func TestBridgeMonitorProcessDeposit(t *testing.T) {
 // --- TestBridgeMonitorDedup ---
 
 func TestBridgeMonitorDedup(t *testing.T) {
-	client := &mockBSVClient{}
 	submitter := &mockOverlaySubmitter{}
 	config := DefaultConfig()
-	monitor := NewBridgeMonitor(config, client, submitter, nil)
+	monitor := NewBridgeMonitor(config, submitter, nil)
 	bridgeScript := []byte{0xaa, 0xbb, 0xcc}
 	monitor.SetBridgeScriptHash(bridgeScript)
 
@@ -633,12 +630,11 @@ func TestBridgeMonitorDedup(t *testing.T) {
 // --- TestBridgeMonitorMinDeposit ---
 
 func TestBridgeMonitorMinDeposit(t *testing.T) {
-	client := &mockBSVClient{}
 	submitter := &mockOverlaySubmitter{}
 	config := DefaultConfig()
 	config.MinDepositSatoshis = 10000
 
-	monitor := NewBridgeMonitor(config, client, submitter, nil)
+	monitor := NewBridgeMonitor(config, submitter, nil)
 	bridgeScript := []byte{0xaa, 0xbb, 0xcc}
 	monitor.SetBridgeScriptHash(bridgeScript)
 
@@ -803,36 +799,6 @@ func TestOddNumberOfLeaves(t *testing.T) {
 
 // --- Test helpers ---
 
-// mockBSVClient implements BSVClient for testing.
-type mockBSVClient struct {
-	txs         map[types.Hash]*BSVTransaction
-	blockHeight uint64
-	blockTxs    map[uint64][]*BSVTransaction
-}
-
-func (m *mockBSVClient) GetTransaction(txid types.Hash) (*BSVTransaction, error) {
-	if m.txs == nil {
-		return nil, nil
-	}
-	return m.txs[txid], nil
-}
-
-func (m *mockBSVClient) GetBlockHeight() (uint64, error) {
-	return m.blockHeight, nil
-}
-
-func (m *mockBSVClient) GetBlockTransactions(height uint64) ([]*BSVTransaction, error) {
-	if m.blockTxs == nil {
-		return nil, nil
-	}
-	return m.blockTxs[height], nil
-}
-
-func (m *mockBSVClient) SubscribeNewBlocks(_ context.Context) (<-chan uint64, error) {
-	ch := make(chan uint64)
-	return ch, nil
-}
-
 // mockOverlaySubmitter implements OverlaySubmitter for testing.
 type mockOverlaySubmitter struct {
 	submitted []*types.DepositTransaction
@@ -861,7 +827,7 @@ func newTestMonitor(t *testing.T) (*BridgeMonitor, *db.MemoryDB) {
 	store := db.NewMemoryDB()
 	config := DefaultConfig()
 	config.BSVConfirmations = 6
-	m := NewBridgeMonitor(config, &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m := NewBridgeMonitor(config, &mockOverlaySubmitter{}, store)
 	return m, store
 }
 
@@ -887,7 +853,7 @@ func TestBridgeMonitor_PersistDeposit(t *testing.T) {
 	}
 
 	// Create a new monitor with the same DB and reload.
-	m2 := NewBridgeMonitor(DefaultConfig(), &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m2 := NewBridgeMonitor(DefaultConfig(), &mockOverlaySubmitter{}, store)
 	if err := m2.LoadProcessedDeposits(); err != nil {
 		t.Fatalf("LoadProcessedDeposits: %v", err)
 	}
@@ -915,7 +881,7 @@ func TestBridgeMonitor_LoadProcessedDeposits(t *testing.T) {
 	}
 
 	// Create a new monitor and load.
-	m2 := NewBridgeMonitor(DefaultConfig(), &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m2 := NewBridgeMonitor(DefaultConfig(), &mockOverlaySubmitter{}, store)
 	if err := m2.LoadProcessedDeposits(); err != nil {
 		t.Fatalf("LoadProcessedDeposits: %v", err)
 	}
@@ -1018,7 +984,7 @@ func TestBridgeMonitor_PersistMultiple(t *testing.T) {
 	}
 
 	// Reload in a new monitor.
-	m2 := NewBridgeMonitor(DefaultConfig(), &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m2 := NewBridgeMonitor(DefaultConfig(), &mockOverlaySubmitter{}, store)
 	if err := m2.LoadProcessedDeposits(); err != nil {
 		t.Fatalf("LoadProcessedDeposits: %v", err)
 	}
@@ -1219,7 +1185,7 @@ func TestBridgeMonitor_HorizonPersistence(t *testing.T) {
 	}
 
 	// Create a new monitor and reload from DB.
-	m2 := NewBridgeMonitor(DefaultConfig(), &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m2 := NewBridgeMonitor(DefaultConfig(), &mockOverlaySubmitter{}, store)
 	if err := m2.LoadProcessedDeposits(); err != nil {
 		t.Fatalf("LoadProcessedDeposits: %v", err)
 	}
@@ -1414,92 +1380,6 @@ func TestBridgeMonitor_MarkProcessed_CompositeKey(t *testing.T) {
 	if m.IsProcessed(txID, 1) {
 		t.Error("vout 1 should not be processed")
 	}
-}
-
-// --- TestBridgeMonitor_Run ---
-
-func TestBridgeMonitor_Run(t *testing.T) {
-	blockCh := make(chan uint64, 2)
-	client := &mockBSVClientWithSub{
-		blockCh: blockCh,
-	}
-	submitter := &mockOverlaySubmitter{}
-	config := DefaultConfig()
-	config.BSVConfirmations = 1
-
-	monitor := NewBridgeMonitor(config, client, submitter, nil)
-	bridgeScript := []byte{0xaa, 0xbb, 0xcc}
-	monitor.SetBridgeScriptHash(bridgeScript)
-
-	l2Addr := types.HexToAddress("0x1111111111111111111111111111111111111111")
-	shardID := make([]byte, 4)
-
-	payload := make([]byte, 0, 29)
-	payload = append(payload, DepositMagic...)
-	payload = append(payload, DepositMsgType)
-	payload = append(payload, shardID...)
-	payload = append(payload, l2Addr[:]...)
-	opReturnScript := make([]byte, 0, 2+len(payload))
-	opReturnScript = append(opReturnScript, 0x6a, byte(len(payload)))
-	opReturnScript = append(opReturnScript, payload...)
-
-	// Set up block transactions for the mock client.
-	client.blockTxs = map[uint64][]*BSVTransaction{
-		100: {
-			{
-				TxID:        types.HexToHash("0x0100"),
-				BlockHeight: 100,
-				Outputs: []BSVOutput{
-					{Script: bridgeScript, Value: 50000},
-					{Script: opReturnScript, Value: 0},
-				},
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Send block height, then close.
-	blockCh <- 100
-	close(blockCh)
-
-	err := monitor.Run(ctx)
-	cancel()
-
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	// The deposit should be pending.
-	if monitor.PendingCount() != 1 {
-		t.Errorf("expected 1 pending deposit after Run, got %d", monitor.PendingCount())
-	}
-}
-
-// mockBSVClientWithSub implements BSVClient with a controllable
-// SubscribeNewBlocks channel.
-type mockBSVClientWithSub struct {
-	blockCh  chan uint64
-	blockTxs map[uint64][]*BSVTransaction
-}
-
-func (m *mockBSVClientWithSub) GetTransaction(_ types.Hash) (*BSVTransaction, error) {
-	return nil, nil
-}
-
-func (m *mockBSVClientWithSub) GetBlockHeight() (uint64, error) {
-	return 0, nil
-}
-
-func (m *mockBSVClientWithSub) GetBlockTransactions(height uint64) ([]*BSVTransaction, error) {
-	if m.blockTxs == nil {
-		return nil, nil
-	}
-	return m.blockTxs[height], nil
-}
-
-func (m *mockBSVClientWithSub) SubscribeNewBlocks(_ context.Context) (<-chan uint64, error) {
-	return m.blockCh, nil
 }
 
 // --- TestWithdrawer_ProcessFinalizedWithdrawals ---

@@ -76,7 +76,7 @@ func TestBridgeMonitor_RetractDepositsAbove_Persisted(t *testing.T) {
 
 	// Re-load a fresh monitor from the same DB; only the height-200
 	// entry should survive.
-	m2 := NewBridgeMonitor(DefaultConfig(), &mockBSVClient{}, &mockOverlaySubmitter{}, store)
+	m2 := NewBridgeMonitor(DefaultConfig(), &mockOverlaySubmitter{}, store)
 	if err := m2.LoadProcessedDeposits(); err != nil {
 		t.Fatalf("LoadProcessedDeposits: %v", err)
 	}

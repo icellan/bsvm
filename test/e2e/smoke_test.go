@@ -192,7 +192,6 @@ func newSmokeHarness(t *testing.T, allocAddr types.Address, allocBal *uint256.In
 	//    invoked on the PersistDeposit path.
 	bridgeMon := bridge.NewBridgeMonitor(
 		bridge.DefaultConfig(),
-		nil, // no BSV client — block-scanning path stays dormant
 		overlayNode,
 		database,
 	)
