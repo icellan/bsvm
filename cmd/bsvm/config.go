@@ -60,11 +60,14 @@ type MetricsSection struct {
 	// who want their monitoring host to scrape directly can override
 	// to "0.0.0.0:9100" (and arrange firewalling via the host).
 	ListenAddr string `toml:"listen_addr"`
-	// Namespace is reserved for future use; currently the metric
-	// names are hard-coded with "bsvm_" / "bsvevm_" prefixes (see
-	// pkg/metrics). Setting this in TOML is accepted but ignored —
-	// kept on the section so operators can document their intended
-	// namespace once the package supports per-deployment overrides.
+	// Namespace overrides the metric-name prefix the Counters layer
+	// (pkg/metrics/counters.go) builds names under. Defaults to
+	// "bsvm" — yields bsvm_bridge_deposits_total, bsvm_arc_broadcast_*,
+	// etc. Set to e.g. "myshard" to brand every Counters-owned metric
+	// as myshard_*. The spec-17 NetworkMetrics layer (pkg/metrics/
+	// network.go) keeps its bsvevm_ prefix because those metric
+	// names are part of the public spec-17 surface and cannot be
+	// rebranded per deployment without breaking dashboards.
 	Namespace string `toml:"namespace"`
 }
 

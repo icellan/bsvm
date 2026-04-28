@@ -100,73 +100,81 @@ type Counters struct {
 // NewCounters registers every Counters collector against r and returns
 // the populated struct. Callers MUST keep the returned pointer alive
 // for the lifetime of the process — Counters owns the collectors.
+//
+// Metric names are composed from the registry's namespace (see
+// [metrics].namespace in cmd/bsvm config) so a deployment that sets
+// `namespace = "myshard"` exposes `myshard_bridge_deposits_total`
+// instead of the default `bsvm_bridge_deposits_total`. The const
+// labels (node_name, chain_id) and the help text are unaffected.
 func NewCounters(r *Registry) *Counters {
+	ns := r.Namespace()
+	name := func(suffix string) string { return ns + "_" + suffix }
 	return &Counters{
 		labels: r.labels,
 		BridgeDepositsTotal: r.Counter(
-			"bsvm_bridge_deposits_total",
+			name("bridge_deposits_total"),
 			"Total deposits credited to the bridge monitor's DB.",
 		),
 		BridgeWithdrawalsClaimedTotal: r.Counter(
-			"bsvm_bridge_withdrawals_claimed_total",
+			name("bridge_withdrawals_claimed_total"),
 			"Total withdrawal claims successfully broadcast to BSV.",
 		),
 		BridgeRetractsTotal: r.Counter(
-			"bsvm_bridge_retracts_total",
+			name("bridge_retracts_total"),
 			"Total RetractDepositsAbove calls on the bridge monitor (reorg-driven).",
 		),
 		OverlayBatchesAdvancedTotal: r.Counter(
-			"bsvm_overlay_batches_advanced_total",
+			name("overlay_batches_advanced_total"),
 			"Total successful covenant-advance broadcasts emitted by the overlay.",
 		),
 		OverlayStateRootMismatchTotal: r.Counter(
-			"bsvm_overlay_state_root_mismatch_total",
+			name("overlay_state_root_mismatch_total"),
 			"Dual-EVM (Go vs revm-in-SP1) post-state disagreements. Must stay 0.",
 		),
 		ProverProofDurationSeconds: r.Histogram(
-			"bsvm_prover_proof_duration_seconds",
+			name("prover_proof_duration_seconds"),
 			"Wall-clock time the SP1 prover takes per batch.",
 			[]float64{1, 2.5, 5, 10, 30, 60, 120, 300, 600},
 		),
 		ProverProofSizeBytes: r.Histogram(
-			"bsvm_prover_proof_size_bytes",
+			name("prover_proof_size_bytes"),
 			"Size of SP1 proof bytes returned by the host bridge.",
 			[]float64{1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216},
 		),
 		ChaintracksReorgsTotal: r.Counter(
-			"bsvm_chaintracks_reorgs_total",
+			name("chaintracks_reorgs_total"),
 			"Total reorg events emitted by the chaintracks stream hub.",
 		),
 		ChaintracksReconnectsTotal: r.Counter(
-			"bsvm_chaintracks_reconnects_total",
+			name("chaintracks_reconnects_total"),
 			"Total chaintracks WS reconnect attempts.",
 		),
 		ARCBroadcastAttemptsTotal: r.Counter(
-			"bsvm_arc_broadcast_attempts_total",
+			name("arc_broadcast_attempts_total"),
 			"Total ARC client Broadcast() invocations.",
 		),
 		ARCBroadcastFailedTotal: r.CounterVec(
-			"bsvm_arc_broadcast_failed_total",
+			name("arc_broadcast_failed_total"),
 			"Total ARC broadcast failures classified as transient or permanent.",
 			"class",
 		),
 		WoCCacheHitsTotal: r.CounterVec(
-			"bsvm_woc_cache_hits_total",
+			name("woc_cache_hits_total"),
 			"WhatsOnChain client in-process cache hits, by layer.",
 			"layer",
 		),
 		WoCCacheMissesTotal: r.CounterVec(
-			"bsvm_woc_cache_misses_total",
+			name("woc_cache_misses_total"),
 			"WhatsOnChain client in-process cache misses, by layer.",
 			"layer",
 		),
 		ClaimBroadcastTotal: r.CounterVec(
-			"bsvm_claim_broadcast_total",
+			name("claim_broadcast_total"),
 			"Withdrawal claim broadcast outcomes by result class.",
 			"result",
 		),
 		AnchorPendingTotal: r.Gauge(
-			"bsvm_anchor_pending_total",
+			name("anchor_pending_total"),
 			"Withdrawals deferred this pass because their covenant advance is not yet anchored/confirmed.",
 		),
 	}
