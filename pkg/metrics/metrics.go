@@ -54,24 +54,56 @@ func (l Labels) ToMap() prometheus.Labels {
 // constLabelNames is the fixed label set every BSVM metric carries.
 var constLabelNames = []string{"node_name", "chain_id"}
 
+// DefaultNamespace is the metric-name prefix used when the operator
+// does not configure a [metrics].namespace override. The trailing
+// underscore separator is added by the Counters factory so this value
+// is the bare namespace token.
+const DefaultNamespace = "bsvm"
+
 // Registry is the BSVM-scoped Prometheus registry. All metrics produced
 // by this package are registered here. Goroutines MUST read Registry()
 // rather than capturing a package-global so tests can reset the
 // registry between cases.
 type Registry struct {
-	reg    *prometheus.Registry
-	labels Labels
-	mu     sync.Mutex
+	reg       *prometheus.Registry
+	labels    Labels
+	namespace string
+	mu        sync.Mutex
 }
 
 // NewRegistry returns a fresh Registry scoped to the given labels. The
 // BSVM node creates exactly one of these at startup and passes it to
-// each subsystem.
+// each subsystem. The namespace defaults to DefaultNamespace; use
+// NewRegistryWithNamespace to override.
 func NewRegistry(labels Labels) *Registry {
-	return &Registry{
-		reg:    prometheus.NewRegistry(),
-		labels: labels,
+	return NewRegistryWithNamespace(labels, DefaultNamespace)
+}
+
+// NewRegistryWithNamespace is NewRegistry with an operator-supplied
+// metric-name prefix. The Counters factory consults this when building
+// names so [metrics].namespace can rebrand every collector under, e.g.
+// "myrollup_" without touching the call sites that .Inc() / .Observe()
+// the metrics. An empty namespace falls back to DefaultNamespace
+// rather than producing nameless metrics.
+func NewRegistryWithNamespace(labels Labels, namespace string) *Registry {
+	if namespace == "" {
+		namespace = DefaultNamespace
 	}
+	return &Registry{
+		reg:       prometheus.NewRegistry(),
+		labels:    labels,
+		namespace: namespace,
+	}
+}
+
+// Namespace returns the metric-name prefix this registry was built
+// with (e.g. "bsvm" or an operator-supplied override). Counters
+// consults this to compose its metric names.
+func (r *Registry) Namespace() string {
+	if r == nil || r.namespace == "" {
+		return DefaultNamespace
+	}
+	return r.namespace
 }
 
 // PromRegistry returns the underlying Prometheus registry. Exposed for

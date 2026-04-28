@@ -178,10 +178,13 @@ enabled = true
 # public internet. Switch to "0.0.0.0:9100" once the host firewall is
 # in place to let an external Prometheus instance scrape directly.
 listen_addr = "127.0.0.1:9100"
-# Reserved for future use; the metric-name prefixes are currently
-# hard-coded in pkg/metrics. Leaving the field documented so per-
-# deployment namespaces can land later without breaking existing
-# configs.
+# Metric-name prefix the Counters layer (pkg/metrics/counters.go) uses
+# for every collector it owns. Default "bsvm" yields names like
+# bsvm_bridge_deposits_total, bsvm_arc_broadcast_attempts_total, etc.
+# Override per deployment ("myshard") to brand every Counters-owned
+# metric without touching the call sites that .Inc() them. The spec-17
+# NetworkMetrics layer keeps its bsvevm_ prefix because those names
+# are part of the public spec-17 surface.
 namespace = "bsvm"
 
 # -----------------------------------------------------------------------------

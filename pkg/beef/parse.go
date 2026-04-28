@@ -1,6 +1,7 @@
 package beef
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -223,6 +224,86 @@ func ParseBEEF(body []byte) (*ParsedBEEF, error) {
 // above explicit; the real raw slice is computed via the consumed
 // counter only, so this returns zero.
 func bumpRefSize(_ byte, _ uint32) int { return 0 }
+
+// Encode serialises p back to its canonical BEEF wire form (BRC-62 /
+// BRC-96). The output is byte-identical to a body produced by ParseBEEF
+// when the input ranged inside the canonical encoding — i.e. fixed
+// varints, no trailing bytes, BUMP raw bytes preserved verbatim.
+//
+// Round-trip property held:
+//
+//	parsed, err := ParseBEEF(body)
+//	if err == nil {
+//	    re, _ := ParseBEEF(parsed.Encode())
+//	    // re is structurally equal to parsed.
+//	}
+//
+// Encode never fails on a well-formed *ParsedBEEF: BUMPs carry their
+// raw payload (parsed back into the structure on the next Parse), tx
+// raw bytes are taken straight from ParsedTx.RawTx, and the only
+// integers requiring varint encoding are BUMP / tx counts and BUMP
+// refs — all bounded by len() of the respective slices.
+func (p *ParsedBEEF) Encode() []byte {
+	if p == nil {
+		return nil
+	}
+	var buf bytes.Buffer
+	// 4-byte little-endian magic. Default to V1 when the field is unset
+	// so callers building a ParsedBEEF programmatically still produce
+	// parseable bytes.
+	magic := p.Version
+	if magic == 0 {
+		magic = beefMagicV1
+	}
+	binary.Write(&buf, binary.LittleEndian, magic)
+
+	writeVarInt(&buf, uint64(len(p.BUMPs)))
+	for _, b := range p.BUMPs {
+		// BUMP.Raw was sliced from the original wire body covering the
+		// block-height varint through the last leaf. Emit it verbatim.
+		buf.Write(b.Raw)
+	}
+
+	writeVarInt(&buf, uint64(len(p.Txs)))
+	for _, tx := range p.Txs {
+		buf.Write(tx.RawTx)
+		if tx.HasBUMP {
+			buf.WriteByte(0x01)
+			writeVarInt(&buf, uint64(tx.BUMPRef))
+		} else {
+			buf.WriteByte(0x00)
+		}
+	}
+	return buf.Bytes()
+}
+
+// writeVarInt writes the BSV compact-size encoding of v. Mirrors the
+// readVarInt convention: <0xfd one byte, <=0xffff three bytes (0xfd
+// + LE u16), <=0xffffffff five bytes (0xfe + LE u32), otherwise nine
+// bytes (0xff + LE u64). This canonical form is what readVarInt
+// expects on the inverse direction so a Parse-Encode-Parse round trip
+// produces byte-identical wire output.
+func writeVarInt(w *bytes.Buffer, v uint64) {
+	switch {
+	case v < 0xfd:
+		w.WriteByte(byte(v))
+	case v <= 0xffff:
+		w.WriteByte(0xfd)
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(v))
+		w.Write(b[:])
+	case v <= 0xffffffff:
+		w.WriteByte(0xfe)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], uint32(v))
+		w.Write(b[:])
+	default:
+		w.WriteByte(0xff)
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], v)
+		w.Write(b[:])
+	}
+}
 
 // readVarInt parses a BSV varint (Bitcoin compact size) from buf and
 // returns the value plus the number of bytes consumed.
