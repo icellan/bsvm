@@ -1509,7 +1509,8 @@ func TestWithdrawer_ProcessFinalizedWithdrawals(t *testing.T) {
 	scanner := &mockWithdrawalScanner{
 		withdrawals: []*PendingWithdrawal{
 			{
-				Nonce:          1,
+				// Producer (ApplyWithdrawTx) emits 0-indexed nonces.
+				Nonce:          0,
 				BSVAddress:     make([]byte, 20),
 				AmountSatoshis: 100_000_000, // 1 BSV
 				L2BlockNum:     10,
@@ -1525,13 +1526,12 @@ func TestWithdrawer_ProcessFinalizedWithdrawals(t *testing.T) {
 		},
 	}
 
-	bridgeUTXO := &BridgeUTXO{
-		TxID:             types.HexToHash("0xaaaa"),
-		Vout:             0,
-		Balance:          10_000_000_000, // 100 BSV
-		LastClaimedNonce: 0,
-		Script:           []byte{0x76, 0xa9},
-	}
+	bridgeUTXO := NewBridgeUTXO(
+		types.HexToHash("0xaaaa"),
+		0,
+		10_000_000_000, // 100 BSV
+		[]byte{0x76, 0xa9},
+	)
 
 	w := NewWithdrawer(
 		broadcaster,
@@ -1551,9 +1551,9 @@ func TestWithdrawer_ProcessFinalizedWithdrawals(t *testing.T) {
 		t.Fatalf("expected 1 broadcast, got %d", len(broadcaster.broadcasts))
 	}
 
-	// Verify bridge UTXO was updated.
-	if bridgeUTXO.LastClaimedNonce != 1 {
-		t.Errorf("LastClaimedNonce = %d, want 1", bridgeUTXO.LastClaimedNonce)
+	// Verify bridge UTXO was updated to the just-claimed nonce (0).
+	if bridgeUTXO.LastClaimedNonce != 0 {
+		t.Errorf("LastClaimedNonce = %d, want 0 (first claim)", bridgeUTXO.LastClaimedNonce)
 	}
 	if bridgeUTXO.Balance != 10_000_000_000-100_000_000 {
 		t.Errorf("Balance = %d, want %d", bridgeUTXO.Balance, 10_000_000_000-100_000_000)
@@ -1567,7 +1567,7 @@ func TestWithdrawer_InsufficientBalance(t *testing.T) {
 	scanner := &mockWithdrawalScanner{
 		withdrawals: []*PendingWithdrawal{
 			{
-				Nonce:          1,
+				Nonce:          0,
 				BSVAddress:     make([]byte, 20),
 				AmountSatoshis: 200_000_000_000, // more than balance
 				L2BlockNum:     10,
@@ -1575,13 +1575,12 @@ func TestWithdrawer_InsufficientBalance(t *testing.T) {
 		},
 	}
 
-	bridgeUTXO := &BridgeUTXO{
-		TxID:             types.HexToHash("0xaaaa"),
-		Vout:             0,
-		Balance:          100_000_000_000,
-		LastClaimedNonce: 0,
-		Script:           []byte{0x76, 0xa9},
-	}
+	bridgeUTXO := NewBridgeUTXO(
+		types.HexToHash("0xaaaa"),
+		0,
+		100_000_000_000,
+		[]byte{0x76, 0xa9},
+	)
 
 	w := NewWithdrawer(
 		broadcaster,
@@ -1601,9 +1600,9 @@ func TestWithdrawer_InsufficientBalance(t *testing.T) {
 		t.Errorf("expected 0 broadcasts, got %d", len(broadcaster.broadcasts))
 	}
 
-	// Nonce should not have advanced.
-	if bridgeUTXO.LastClaimedNonce != 0 {
-		t.Errorf("LastClaimedNonce should remain 0, got %d", bridgeUTXO.LastClaimedNonce)
+	// Nonce should not have advanced — still the unset sentinel.
+	if bridgeUTXO.LastClaimedNonce != LastClaimedNonceUnset {
+		t.Errorf("LastClaimedNonce should remain LastClaimedNonceUnset, got %d", bridgeUTXO.LastClaimedNonce)
 	}
 }
 

@@ -549,9 +549,12 @@ func TestWithdrawer_BuildsCompleteClaim(t *testing.T) {
 		bsvAddr[i] = byte(i + 1)
 	}
 
-	leaf := WithdrawalHash(bsvAddr, 100_000_000, 1)
+	// Producer (ApplyWithdrawTx) emits 0-indexed nonces: the first
+	// withdrawal carries nonce 0. NewBridgeUTXO initialises
+	// LastClaimedNonce to LastClaimedNonceUnset so the gate admits it.
+	leaf := WithdrawalHash(bsvAddr, 100_000_000, 0)
 	pending := []*PendingWithdrawal{{
-		Nonce:          1,
+		Nonce:          0,
 		BSVAddress:     bsvAddr,
 		AmountSatoshis: 100_000_000,
 		L2BlockNum:     10,
@@ -572,13 +575,12 @@ func TestWithdrawer_BuildsCompleteClaim(t *testing.T) {
 	}
 	finder := &mockAdvanceFinder{tx: advanceTx}
 
-	bridgeUTXO := &BridgeUTXO{
-		TxID:             types.HexToHash("0xaaaa"),
-		Vout:             0,
-		Balance:          1_000_000_000,
-		LastClaimedNonce: 0,
-		Script:           []byte{0x76, 0xa9, 0x14},
-	}
+	bridgeUTXO := NewBridgeUTXO(
+		types.HexToHash("0xaaaa"),
+		0,
+		1_000_000_000,
+		[]byte{0x76, 0xa9, 0x14},
+	)
 
 	bcaster := &flakyBroadcaster{txid: types.HexToHash("0xfeed")}
 	signer := &stubSigner{unlockHex: "11"}
@@ -595,16 +597,16 @@ func TestWithdrawer_BuildsCompleteClaim(t *testing.T) {
 	if bcaster.calls != 1 {
 		t.Errorf("broadcaster called %d times, want 1", bcaster.calls)
 	}
-	if bridgeUTXO.LastClaimedNonce != 1 {
-		t.Errorf("LastClaimedNonce = %d, want 1", bridgeUTXO.LastClaimedNonce)
+	if bridgeUTXO.LastClaimedNonce != 0 {
+		t.Errorf("LastClaimedNonce = %d, want 0 (first claim was nonce 0)", bridgeUTXO.LastClaimedNonce)
 	}
 }
 
 func TestWithdrawer_RetriesBroadcastFailure(t *testing.T) {
 	bsvAddr := make([]byte, 20)
-	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 0)
 	pending := []*PendingWithdrawal{{
-		Nonce:          1,
+		Nonce:          0,
 		BSVAddress:     bsvAddr,
 		AmountSatoshis: 50_000_000,
 		L2BlockNum:     10,
@@ -617,11 +619,12 @@ func TestWithdrawer_RetriesBroadcastFailure(t *testing.T) {
 		{Script: buildOpReturnWithRoot(leaf), Value: 0},
 	}}
 
-	bridgeUTXO := &BridgeUTXO{
-		TxID:    types.HexToHash("0xaaaa"),
-		Balance: 100_000_000_000,
-		Script:  []byte{0x76, 0xa9},
-	}
+	bridgeUTXO := NewBridgeUTXO(
+		types.HexToHash("0xaaaa"),
+		0,
+		100_000_000_000,
+		[]byte{0x76, 0xa9},
+	)
 	bcaster := &flakyBroadcaster{failures: 2, txid: types.HexToHash("0xfeed")}
 
 	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
@@ -634,16 +637,16 @@ func TestWithdrawer_RetriesBroadcastFailure(t *testing.T) {
 	if bcaster.calls != 3 {
 		t.Errorf("broadcaster calls = %d, want 3", bcaster.calls)
 	}
-	if bridgeUTXO.LastClaimedNonce != 1 {
-		t.Errorf("LastClaimedNonce = %d, want 1", bridgeUTXO.LastClaimedNonce)
+	if bridgeUTXO.LastClaimedNonce != 0 {
+		t.Errorf("LastClaimedNonce = %d, want 0 (first claim was nonce 0)", bridgeUTXO.LastClaimedNonce)
 	}
 }
 
 func TestWithdrawer_BroadcastExhausted(t *testing.T) {
 	bsvAddr := make([]byte, 20)
-	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 0)
 	pending := []*PendingWithdrawal{{
-		Nonce:          1,
+		Nonce:          0,
 		BSVAddress:     bsvAddr,
 		AmountSatoshis: 50_000_000,
 		L2BlockNum:     10,
@@ -656,11 +659,12 @@ func TestWithdrawer_BroadcastExhausted(t *testing.T) {
 		{Script: buildOpReturnWithRoot(leaf), Value: 0},
 	}}
 
-	bridgeUTXO := &BridgeUTXO{
-		TxID:    types.HexToHash("0xaaaa"),
-		Balance: 100_000_000_000,
-		Script:  []byte{0x76, 0xa9},
-	}
+	bridgeUTXO := NewBridgeUTXO(
+		types.HexToHash("0xaaaa"),
+		0,
+		100_000_000_000,
+		[]byte{0x76, 0xa9},
+	)
 	bcaster := &flakyBroadcaster{failures: 5}
 
 	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
@@ -671,17 +675,17 @@ func TestWithdrawer_BroadcastExhausted(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected broadcast exhaustion error")
 	}
-	if bridgeUTXO.LastClaimedNonce != 0 {
-		t.Errorf("LastClaimedNonce = %d, want 0 (claim must not advance on broadcast failure)",
+	if bridgeUTXO.LastClaimedNonce != LastClaimedNonceUnset {
+		t.Errorf("LastClaimedNonce = %d, want LastClaimedNonceUnset (claim must not advance on broadcast failure)",
 			bridgeUTXO.LastClaimedNonce)
 	}
 }
 
 func TestWithdrawer_RootMismatchSkips(t *testing.T) {
 	bsvAddr := make([]byte, 20)
-	leaf := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	leaf := WithdrawalHash(bsvAddr, 50_000_000, 0)
 	pending := []*PendingWithdrawal{{
-		Nonce:          1,
+		Nonce:          0,
 		BSVAddress:     bsvAddr,
 		AmountSatoshis: 50_000_000,
 		L2BlockNum:     10,
@@ -696,7 +700,7 @@ func TestWithdrawer_RootMismatchSkips(t *testing.T) {
 		{Script: buildOpReturnWithRoot(wrongRoot), Value: 0},
 	}}
 
-	bridgeUTXO := &BridgeUTXO{TxID: types.HexToHash("0xaa"), Balance: 1e9, Script: []byte{0x76}}
+	bridgeUTXO := NewBridgeUTXO(types.HexToHash("0xaa"), 0, 1e9, []byte{0x76})
 	bcaster := &flakyBroadcaster{}
 
 	w := NewWithdrawer(bcaster, bridgeUTXO, scanner,
@@ -708,8 +712,127 @@ func TestWithdrawer_RootMismatchSkips(t *testing.T) {
 	if bcaster.calls != 0 {
 		t.Errorf("broadcaster called %d times, want 0 (root mismatch should skip)", bcaster.calls)
 	}
-	if bridgeUTXO.LastClaimedNonce != 0 {
+	if bridgeUTXO.LastClaimedNonce != LastClaimedNonceUnset {
 		t.Error("LastClaimedNonce advanced despite root mismatch")
+	}
+}
+
+// TestWithdrawer_NonceConvention_FirstClaimZero pins the
+// producer-emits-0 / consumer-accepts-0 / replay-rejected /
+// next-1-accepted property chain. Guards against any regression of
+// the off-by-one between ApplyWithdrawTx (0-indexed) and
+// Withdrawer.ProcessFinalizedWithdrawals (gates on +1). See
+// docs/decisions/II-withdrawal-nonce-convention.md.
+func TestWithdrawer_NonceConvention_FirstClaimZero(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	for i := range bsvAddr {
+		bsvAddr[i] = byte(i + 0x10)
+	}
+
+	// 1. Fresh bridge UTXO uses the unset sentinel.
+	utxo := NewBridgeUTXO(types.HexToHash("0xa1"), 0, 1_000_000_000_000, []byte{0x76})
+	if utxo.LastClaimedNonce != LastClaimedNonceUnset {
+		t.Fatalf("NewBridgeUTXO LastClaimedNonce = %d, want LastClaimedNonceUnset (%d)",
+			utxo.LastClaimedNonce, LastClaimedNonceUnset)
+	}
+
+	// 2. The first canonical nonce (0) passes the gate via uint64 wraparound.
+	leaf0 := WithdrawalHash(bsvAddr, 100_000_000, 0)
+	scanner := &mockWithdrawalScanner{withdrawals: []*PendingWithdrawal{{
+		Nonce:          0,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 100_000_000,
+		L2BlockNum:     1,
+		BatchHashes:    []types.Hash{leaf0},
+		LeafIndex:      0,
+		WithdrawalHash: leaf0,
+	}}}
+	advance := &BSVTransaction{Outputs: []BSVOutput{
+		{Script: []byte{0x76}, Value: 1000},
+		{Script: buildOpReturnWithRoot(leaf0), Value: 0},
+	}}
+	bcaster := &flakyBroadcaster{txid: types.HexToHash("0xc1a1")}
+	w := NewWithdrawer(bcaster, utxo, scanner,
+		&mockAdvanceFinder{tx: advance}, DefaultWithdrawalConfig())
+
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("first claim (nonce 0): %v", err)
+	}
+	if bcaster.calls != 1 {
+		t.Errorf("first claim: broadcaster calls = %d, want 1 (nonce 0 must be admitted)", bcaster.calls)
+	}
+	if utxo.LastClaimedNonce != 0 {
+		t.Errorf("after first claim: LastClaimedNonce = %d, want 0", utxo.LastClaimedNonce)
+	}
+
+	// 3. Re-scanning with the same (already-claimed) nonce 0 must NOT
+	//    re-broadcast: the gate (LastClaimedNonce+1 == nonce) demands 1
+	//    next, so a stale nonce-0 entry is filtered.
+	scanner.withdrawals = []*PendingWithdrawal{{
+		Nonce:          0,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 100_000_000,
+		L2BlockNum:     1,
+		BatchHashes:    []types.Hash{leaf0},
+		LeafIndex:      0,
+		WithdrawalHash: leaf0,
+	}}
+	bcaster.calls = 0
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("replay scan: %v", err)
+	}
+	if bcaster.calls != 0 {
+		t.Errorf("replay scan: broadcaster calls = %d, want 0 (nonce 0 must be rejected as already claimed)", bcaster.calls)
+	}
+	if utxo.LastClaimedNonce != 0 {
+		t.Errorf("after replay: LastClaimedNonce = %d, want 0 (replay must not advance)", utxo.LastClaimedNonce)
+	}
+
+	// 4. The next sequential nonce (1) is admitted.
+	leaf1 := WithdrawalHash(bsvAddr, 50_000_000, 1)
+	scanner.withdrawals = []*PendingWithdrawal{{
+		Nonce:          1,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 50_000_000,
+		L2BlockNum:     2,
+		BatchHashes:    []types.Hash{leaf1},
+		LeafIndex:      0,
+		WithdrawalHash: leaf1,
+	}}
+	advance2 := &BSVTransaction{Outputs: []BSVOutput{
+		{Script: []byte{0x76}, Value: 1000},
+		{Script: buildOpReturnWithRoot(leaf1), Value: 0},
+	}}
+	w2 := NewWithdrawer(bcaster, utxo, scanner,
+		&mockAdvanceFinder{tx: advance2}, DefaultWithdrawalConfig())
+	bcaster.calls = 0
+	if err := w2.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("second claim (nonce 1): %v", err)
+	}
+	if bcaster.calls != 1 {
+		t.Errorf("second claim: broadcaster calls = %d, want 1", bcaster.calls)
+	}
+	if utxo.LastClaimedNonce != 1 {
+		t.Errorf("after second claim: LastClaimedNonce = %d, want 1", utxo.LastClaimedNonce)
+	}
+}
+
+// TestLastClaimedNonceUnset pins the sentinel value so a regression
+// changing it would fail loudly. The on-chain Rúnar bridge covenant's
+// lastClaimedNonce state must use the same sentinel at deployment.
+func TestLastClaimedNonceUnset(t *testing.T) {
+	if LastClaimedNonceUnset != ^uint64(0) {
+		t.Errorf("LastClaimedNonceUnset = %d, want ^uint64(0) = %d",
+			LastClaimedNonceUnset, ^uint64(0))
+	}
+	// First nonce admitted by the gate "nonce == LastClaimedNonceUnset+1"
+	// must be 0 (uint64 wraparound). Force runtime arithmetic by
+	// indirecting through a uint64 variable so the compiler doesn't
+	// reject the constant overflow.
+	var sentinel uint64 = LastClaimedNonceUnset
+	if sentinel+1 != 0 {
+		t.Errorf("LastClaimedNonceUnset+1 = %d, want 0 (gate must admit nonce 0 first)",
+			sentinel+1)
 	}
 }
 
