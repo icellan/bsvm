@@ -75,11 +75,15 @@ var (
 	// balances RTT-amortisation against burst-load on the WoC API.
 	wocBlockTxFanoutWorkers = 8
 	// wocBlockTxFanoutMax is the hard cap on per-block tx-fetches.
-	// Anything beyond this is anomalous (a normal BSV block fits
-	// comfortably under 10k txs); the surplus is logged + skipped so a
-	// pathological block can't single-handedly exhaust an operator's
+	// Pre-pagination this was set at 10k to match the WoC inline-tx
+	// threshold; with the paginated GetBlockTxIDs path the manifest can
+	// legitimately span past that, so we lift the cap to 1M (the same
+	// defensive ceiling pkg/whatsonchain enforces on the aggregated
+	// page result). The cap survives only as a runaway-fetch guard;
+	// anything beyond it is logged + skipped so a pathological or
+	// adversarial block can't single-handedly exhaust an operator's
 	// daily WoC quota.
-	wocBlockTxFanoutMax = 10000
+	wocBlockTxFanoutMax = 1_000_000
 )
 
 // ErrBlockFetchUnsupported is returned by GetBlockTransactions when

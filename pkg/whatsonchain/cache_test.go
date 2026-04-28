@@ -2,7 +2,12 @@ package whatsonchain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -247,6 +252,203 @@ func TestCachedClient_DisabledCachePassesThrough(t *testing.T) {
 	}
 	if calls := stub.callsFor(txid); calls != 3 {
 		t.Fatalf("disabled cache should pass through every call; got %d upstream calls", calls)
+	}
+}
+
+// TestCachedClient_GetBlockTxIDs_CacheHIT exercises the block-level
+// LRU. A first call drives the underlying *Client through the
+// paginated header→pages flow; a second call for the same block hash
+// must hit the cache and skip the upstream entirely (zero new HTTP
+// calls).
+func TestCachedClient_GetBlockTxIDs_CacheHIT(t *testing.T) {
+	pages := [][]string{
+		{makeTxIDHex(0), makeTxIDHex(1)},
+		{makeTxIDHex(2), makeTxIDHex(3)},
+	}
+
+	var headerHits, pageHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/page/") {
+			pageHits.Add(1)
+			for i := range pages {
+				if strings.HasSuffix(r.URL.Path, fmt.Sprintf("/page/%d", i+1)) {
+					_ = json.NewEncoder(w).Encode(pages[i])
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/block/hash/") {
+			headerHits.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tx":    []string{},
+				"pages": map[string]any{"uri": []string{"/block/hash/test/page/1", "/block/hash/test/page/2"}},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	upstream, err := NewClient(Config{URL: srv.URL, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	cached := NewCachedClient(upstream, DefaultCacheConfig())
+
+	var blockHash [32]byte
+	for i := range blockHash {
+		blockHash[i] = 0x77
+	}
+
+	// First call: cache MISS, full header + 2 page fetches.
+	got1, err := cached.GetBlockTxIDs(context.Background(), blockHash)
+	if err != nil {
+		t.Fatalf("first GetBlockTxIDs: %v", err)
+	}
+	if len(got1) != 4 {
+		t.Fatalf("first call returned %d txids, want 4", len(got1))
+	}
+	if h := headerHits.Load(); h != 1 {
+		t.Fatalf("first call: header hits = %d, want 1", h)
+	}
+	if p := pageHits.Load(); p != 2 {
+		t.Fatalf("first call: page hits = %d, want 2", p)
+	}
+
+	// Second call: cache HIT. No new server hits.
+	got2, err := cached.GetBlockTxIDs(context.Background(), blockHash)
+	if err != nil {
+		t.Fatalf("second GetBlockTxIDs: %v", err)
+	}
+	if len(got2) != len(got1) {
+		t.Fatalf("second call returned %d txids, want %d", len(got2), len(got1))
+	}
+	if h := headerHits.Load(); h != 1 {
+		t.Fatalf("cache MISS on second call: header hits = %d, want 1", h)
+	}
+	if p := pageHits.Load(); p != 2 {
+		t.Fatalf("cache MISS on second call: page hits = %d, want 2", p)
+	}
+
+	// Mutating got2 must not corrupt the cached value.
+	got2[0] = [32]byte{}
+	got3, _ := cached.GetBlockTxIDs(context.Background(), blockHash)
+	if got3[0] == ([32]byte{}) {
+		t.Fatalf("cache returned a shared slice; mutation leaked")
+	}
+}
+
+// TestCachedClient_GetBlockTxIDs_PageCacheReuse asserts that the
+// per-page LRU short-circuits page refetches across distinct block
+// lookups. We drive two block-hash requests whose headers reference
+// the same page URI (a synthetic but deterministic scenario) and
+// verify the page handler is only hit once.
+func TestCachedClient_GetBlockTxIDs_PageCacheReuse(t *testing.T) {
+	pageData := []string{makeTxIDHex(100), makeTxIDHex(101)}
+
+	var pageHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/shared-page") {
+			pageHits.Add(1)
+			_ = json.NewEncoder(w).Encode(pageData)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/block/hash/") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tx":    []string{},
+				"pages": map[string]any{"uri": []string{"/shared-page"}},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	upstream, err := NewClient(Config{URL: srv.URL, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	cached := NewCachedClient(upstream, DefaultCacheConfig())
+
+	var blockA, blockB [32]byte
+	for i := range blockA {
+		blockA[i] = 0x10
+		blockB[i] = 0x20
+	}
+
+	if _, err := cached.GetBlockTxIDs(context.Background(), blockA); err != nil {
+		t.Fatalf("blockA: %v", err)
+	}
+	if _, err := cached.GetBlockTxIDs(context.Background(), blockB); err != nil {
+		t.Fatalf("blockB: %v", err)
+	}
+	if got := pageHits.Load(); got != 1 {
+		t.Fatalf("expected 1 page fetch (page LRU should dedupe), got %d", got)
+	}
+}
+
+// stubBlockClient extends stubClient-style recording to GetBlockTxIDs
+// so we can verify cache HITs against arbitrary upstream interfaces
+// (not just *Client). The cache must fall back to upstream.GetBlockTxIDs
+// when the upstream is a stub, and still cache the aggregated result.
+type stubBlockClient struct {
+	mu     sync.Mutex
+	calls  int
+	result [][32]byte
+	err    error
+}
+
+func (s *stubBlockClient) GetTx(_ context.Context, _ [32]byte) ([]byte, error) {
+	return nil, ErrNotFound
+}
+func (s *stubBlockClient) GetUTXOs(_ context.Context, _ string) ([]UTXO, error) { return nil, nil }
+func (s *stubBlockClient) ChainInfo(_ context.Context) (*ChainInfo, error)      { return nil, nil }
+func (s *stubBlockClient) GetBlockTxIDs(_ context.Context, _ [32]byte) ([][32]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make([][32]byte, len(s.result))
+	copy(out, s.result)
+	return out, nil
+}
+func (s *stubBlockClient) Ping(_ context.Context) error { return nil }
+
+func (s *stubBlockClient) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestCachedClient_GetBlockTxIDs_UpstreamFallbackCachesResult(t *testing.T) {
+	stub := &stubBlockClient{
+		result: [][32]byte{
+			{0x01}, {0x02}, {0x03},
+		},
+	}
+	cached := NewCachedClient(stub, DefaultCacheConfig())
+	var blockHash [32]byte
+	for i := range blockHash {
+		blockHash[i] = 0x55
+	}
+
+	for i := 0; i < 4; i++ {
+		got, err := cached.GetBlockTxIDs(context.Background(), blockHash)
+		if err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("iter %d returned %d ids", i, len(got))
+		}
+	}
+	if stub.callCount() != 1 {
+		t.Fatalf("expected 1 upstream call (block-level cache), got %d", stub.callCount())
 	}
 }
 
