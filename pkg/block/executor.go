@@ -94,14 +94,22 @@ func (e *BlockExecutor) ProcessBatch(
 	statedb *state.StateDB,
 	chainCtx ChainContext,
 ) (*L2Block, []*types.Receipt, error) {
+	// EIP-4844: ExcessBlobGas for the new block is derived from the parent's
+	// excess + the parent's blob-gas-used, saturating at zero against the
+	// per-block target. BlobGasUsed starts at zero and is accumulated by
+	// ApplyTransaction as each type-3 transaction lands.
+	excessBlobGas := CalcExcessBlobGas(parentHeader.ExcessBlobGas, parentHeader.BlobGasUsed)
+
 	// Build the header for the new block.
 	header := &L2Header{
-		ParentHash: parentHeader.Hash(),
-		Coinbase:   coinbase,
-		Number:     new(big.Int).Add(parentHeader.Number, big.NewInt(1)),
-		GasLimit:   parentHeader.GasLimit,
-		Timestamp:  timestamp,
-		BaseFee:    new(big.Int), // BaseFee is always 0 for this L2.
+		ParentHash:    parentHeader.Hash(),
+		Coinbase:      coinbase,
+		Number:        new(big.Int).Add(parentHeader.Number, big.NewInt(1)),
+		GasLimit:      parentHeader.GasLimit,
+		Timestamp:     timestamp,
+		BaseFee:       new(big.Int), // BaseFee is always 0 for this L2.
+		ExcessBlobGas: excessBlobGas,
+		BlobGasUsed:   0,
 	}
 
 	gp := new(GasPool)
