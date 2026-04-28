@@ -364,5 +364,24 @@ func (p *RPCProvider) GetRawTransactionVerbose(txid string) (map[string]interfac
 	return tx, nil
 }
 
+// GetBlockHeader returns the verbose getblockheader response for the
+// given BSV block hash. It is the legacy-node fallback used by the
+// covenant package's TxStatusReader when getrawtransaction returns a
+// blockhash but no blockheight (older SV-Node builds, pre-Teranode).
+//
+// The returned map mirrors the bitcoind getblockheader verbose=1
+// schema; consumers typically read the "height" field as a JSON number.
+func (p *RPCProvider) GetBlockHeader(blockHash string) (map[string]interface{}, error) {
+	result, err := p.call("getblockheader", blockHash, true)
+	if err != nil {
+		return nil, fmt.Errorf("bsvclient: getblockheader: %w", err)
+	}
+	var hdr map[string]interface{}
+	if err := json.Unmarshal(result, &hdr); err != nil {
+		return nil, fmt.Errorf("bsvclient: getblockheader parse: %w", err)
+	}
+	return hdr, nil
+}
+
 // compile-time check that RPCProvider satisfies runar.Provider.
 var _ runar.Provider = (*RPCProvider)(nil)

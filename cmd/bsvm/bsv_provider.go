@@ -36,11 +36,15 @@ import (
 //     fee-wallet UTXO reconciler.
 //   - GetRawTransactionVerbose: covenant.ConfirmationSource. Used by
 //     the confirmation watcher.
+//   - GetBlockHeader: covenant.BlockHeaderSource. Used by the
+//     TxStatusReader's getblockheader fallback for legacy BSV nodes
+//     that don't populate blockheight on getrawtransaction.
 //   - Call: raw JSON-RPC escape hatch used by the regtest devnet
 //     funding helpers (importaddress / sendtoaddress / generatetoaddress).
 type BSVProviderClient interface {
 	runar.Provider
 	GetRawTransactionVerbose(txid string) (map[string]interface{}, error)
+	GetBlockHeader(blockHash string) (map[string]interface{}, error)
 	Call(method string, params ...interface{}) (json.RawMessage, error)
 }
 

@@ -15,7 +15,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -103,8 +102,15 @@ type RunarBroadcastClient struct {
 	provider      runar.Provider
 	signer        runar.Signer
 	confirmations ConfirmationSource
-	chainID       int64
-	mode          ProofMode
+	// statusReader handles getrawtransaction parsing AND the
+	// getblockheader fallback for legacy nodes. Configured via
+	// RunarBroadcastClientOpts.BlockHeaders; when nil at construction
+	// time, the reader still works on the fast path but skips the
+	// fallback (so legacy-node anchors stay at height=0 — same as
+	// pre-fallback behaviour).
+	statusReader *TxStatusReader
+	chainID      int64
+	mode         ProofMode
 
 	mu        sync.Mutex
 	confs     map[types.Hash]uint32
@@ -122,6 +128,18 @@ type RunarBroadcastClientOpts struct {
 	// production binary, pkg/bsvclient.RPCProvider satisfies both
 	// interfaces from a single instance. Required.
 	Confirmations ConfirmationSource
+	// BlockHeaders is the optional fallback used when getrawtransaction
+	// returns a blockhash but no blockheight (legacy SV-Node builds
+	// pre-Teranode). When set, the client issues a follow-up
+	// getblockheader RPC and surfaces the recovered height to the
+	// caller. The same pkg/bsvclient.RPCProvider /
+	// pkg/bsvclient.MultiRPCProvider satisfies both Confirmations and
+	// BlockHeaders.
+	//
+	// When nil the client retains pre-fallback behaviour: a confirmed
+	// tx whose getrawtransaction response omits blockheight surfaces
+	// height=0 to the watcher.
+	BlockHeaders BlockHeaderSource
 	// ChainID is the chain id embedded in the rollup contract's public-values
 	// binding. It MUST match the chainID constructor arg used at deploy time.
 	ChainID int64
@@ -150,6 +168,7 @@ func NewRunarBroadcastClient(opts RunarBroadcastClientOpts) (*RunarBroadcastClie
 		provider:      opts.Provider,
 		signer:        opts.Signer,
 		confirmations: opts.Confirmations,
+		statusReader:  NewTxStatusReader(opts.Confirmations, opts.BlockHeaders),
 		chainID:       opts.ChainID,
 		mode:          opts.Mode,
 		confs:         make(map[types.Hash]uint32),
@@ -242,65 +261,32 @@ func (c *RunarBroadcastClient) GetConfirmations(ctx context.Context, txid types.
 	return st.Confirmations, nil
 }
 
-// GetTransactionStatus implements TransactionStatusSource. It performs a
-// single getrawtransaction verbose=1 lookup and returns both the
-// confirmation count and the BSV block height containing the tx. The
-// height comes from the response's "blockheight" field when present;
-// if the BSV node only reports "blockhash", we look the height up via
-// a follow-up getblockheader call so the watcher can back-fill
-// AnchorRecord.BSVBlockHeight without another round-trip.
-func (c *RunarBroadcastClient) GetTransactionStatus(_ context.Context, txid types.Hash) (TxStatus, error) {
-	// getrawtransaction expects BSV's big-endian display form; txid is
-	// stored in chainhash little-endian bytes so reverse via BSVString.
-	txidHex := txid.BSVString()
-
-	raw, err := c.confirmations.GetRawTransactionVerbose(txidHex)
+// GetTransactionStatus implements TransactionStatusSource. It delegates
+// the getrawtransaction parsing AND the legacy-node getblockheader
+// fallback to the embedded TxStatusReader so the parsing logic stays
+// in exactly one place — see pkg/covenant/tx_status_reader.go.
+//
+// The fast path on modern BSV nodes (Teranode + recent SV-Node) is a
+// single getrawtransaction RPC. The fallback only fires when the
+// primary response contains a blockhash but no blockheight; that path
+// caches the resulting blockhash→height mapping in a 256-entry LRU so
+// a burst of confirmations referencing the same recent block only
+// pays one getblockheader RPC.
+func (c *RunarBroadcastClient) GetTransactionStatus(ctx context.Context, txid types.Hash) (TxStatus, error) {
+	st, err := c.statusReader.GetTransactionStatus(ctx, txid)
 	if err != nil {
-		return TxStatus{}, fmt.Errorf("getrawtransaction %s: %w", txidHex, err)
+		// The reader returns a partial TxStatus on getblockheader
+		// failures — propagate it (the watcher tolerates height=0)
+		// alongside the wrapped error so callers can log the cause.
+		c.mu.Lock()
+		c.confs[txid] = st.Confirmations
+		c.mu.Unlock()
+		return st, err
 	}
-
-	// getrawtransaction returns confirmations as a JSON number, decoded
-	// into interface{} as float64. It is absent (or null) while the tx
-	// is unconfirmed; treat that as zero confirmations.
-	var confs uint32
-	if v, ok := raw["confirmations"]; ok && v != nil {
-		switch n := v.(type) {
-		case float64:
-			if n > 0 {
-				confs = uint32(n)
-			}
-		case json.Number:
-			if f, cerr := n.Float64(); cerr == nil && f > 0 {
-				confs = uint32(f)
-			}
-		}
-	}
-
-	// getrawtransaction sometimes returns "blockheight" directly (Teranode,
-	// some SV-Node builds); when only "blockhash" is present we leave
-	// height = 0. The ConfirmationWatcher tolerates a zero height for an
-	// otherwise-confirmed tx — Confirmed is set on confirmations alone.
-	// Operators can run a one-time backfill via the chaindb-scan tooling
-	// if precise heights are required for old anchors.
-	var height uint64
-	if v, ok := raw["blockheight"]; ok && v != nil {
-		switch n := v.(type) {
-		case float64:
-			if n > 0 {
-				height = uint64(n)
-			}
-		case json.Number:
-			if f, cerr := n.Float64(); cerr == nil && f > 0 {
-				height = uint64(f)
-			}
-		}
-	}
-
 	c.mu.Lock()
-	c.confs[txid] = confs
+	c.confs[txid] = st.Confirmations
 	c.mu.Unlock()
-
-	return TxStatus{Confirmations: confs, BlockHeight: height}, nil
+	return st, nil
 }
 
 // Close is a no-op — the client holds no background resources.

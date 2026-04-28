@@ -172,11 +172,19 @@ func Build(cfg Config) (*Bundle, error) {
 		if !ok {
 			return nil, fmt.Errorf("regtestharness: cfg.Provider %T does not satisfy covenant.ConfirmationSource (needs GetRawTransactionVerbose)", cfg.Provider)
 		}
+		// BlockHeaders is optional — regtest providers that don't
+		// expose getblockheader still work; the broadcast client just
+		// skips the legacy-node height fallback.
+		var headerSrc covenant.BlockHeaderSource
+		if hs, hsOK := cfg.Provider.(covenant.BlockHeaderSource); hsOK {
+			headerSrc = hs
+		}
 		client, err = covenant.NewRunarBroadcastClient(covenant.RunarBroadcastClientOpts{
 			Contract:      cfg.Contract,
 			Provider:      cfg.Provider,
 			Signer:        cfg.Signer,
 			Confirmations: confSrc,
+			BlockHeaders:  headerSrc,
 			ChainID:       cfg.ChainID,
 			Mode:          cfg.ProofMode,
 		})

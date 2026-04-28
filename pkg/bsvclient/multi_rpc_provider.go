@@ -342,6 +342,22 @@ func (m *MultiRPCProvider) GetRawTransactionVerbose(txid string) (map[string]int
 	return out, err
 }
 
+// GetBlockHeader tries each provider in order. Used by the covenant
+// package's TxStatusReader to back-fill block heights for legacy BSV
+// nodes that don't populate getrawtransaction.blockheight.
+func (m *MultiRPCProvider) GetBlockHeader(blockHash string) (map[string]interface{}, error) {
+	var out map[string]interface{}
+	err := m.runWithFailover("GetBlockHeader", func(p *RPCProvider) error {
+		r, e := p.GetBlockHeader(blockHash)
+		if e != nil {
+			return e
+		}
+		out = r
+		return nil
+	})
+	return out, err
+}
+
 // compile-time interface checks — MultiRPCProvider must continue to
 // satisfy whatever surface RPCProvider satisfies.
 var (

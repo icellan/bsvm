@@ -181,8 +181,12 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 		Provider:      provider,
 		Signer:        signer,
 		Confirmations: provider,
-		ChainID:       opts.ChainID,
-		Mode:          covenant.ProofModeFRI,
+		// BlockHeaders is the legacy-node fallback (see
+		// pkg/covenant/tx_status_reader.go). Same provider satisfies
+		// it via the GetBlockHeader method we added in bsv_provider.go.
+		BlockHeaders: provider,
+		ChainID:      opts.ChainID,
+		Mode:         covenant.ProofModeFRI,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("broadcast client: %w", err)

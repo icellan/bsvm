@@ -1,6 +1,7 @@
 package block
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 
@@ -400,6 +401,48 @@ func (cdb *ChainDB) ReadAnchorRecord(blockNum uint64) *AnchorRecord {
 		return nil
 	}
 	return &record
+}
+
+// IterateAnchorRecords walks every persisted AnchorRecord in
+// L2-block-number order and invokes fn for each one. Iteration stops as
+// soon as fn returns false or the context is cancelled.
+//
+// The iteration relies on the underlying db.Database also implementing
+// db.Iteratee — every concrete backing in internal/db (LevelDB,
+// PebbleDB, MemoryDB) does. Returns an error if the database does not
+// support iteration, the iterator surfaces an error, or ctx is
+// cancelled mid-walk. RLP decode failures on individual records are
+// logged-via-error-return rather than silently skipped: a corrupted
+// record is an operational signal worth surfacing to the caller.
+func (cdb *ChainDB) IterateAnchorRecords(ctx context.Context, fn func(record *AnchorRecord) bool) error {
+	iteratee, ok := cdb.db.(db.Iteratee)
+	if !ok {
+		return fmt.Errorf("anchor iteration: database does not implement db.Iteratee")
+	}
+	iter := iteratee.NewIterator(anchorPrefix, nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		key := iter.Key()
+		// anchorKey is anchorPrefix(1) + blockNum(8); skip anything
+		// shorter than the expected length so a future co-located
+		// prefix can't trip the decoder.
+		if len(key) != len(anchorPrefix)+8 {
+			continue
+		}
+		var record AnchorRecord
+		if err := rlp.DecodeBytes(iter.Value(), &record); err != nil {
+			return fmt.Errorf("decoding anchor record at block %d: %w",
+				binary.BigEndian.Uint64(key[len(anchorPrefix):]), err)
+		}
+		if !fn(&record) {
+			break
+		}
+	}
+	return iter.Error()
 }
 
 // WriteCovenantTxID writes the current covenant UTXO transaction ID.

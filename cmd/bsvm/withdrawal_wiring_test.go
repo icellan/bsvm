@@ -372,5 +372,6 @@ func (stubProvider) GetRawTransaction(string) (string, error)              { ret
 func (stubProvider) GetRawTransactionVerbose(string) (map[string]interface{}, error) {
 	return nil, nil
 }
+func (stubProvider) GetBlockHeader(string) (map[string]interface{}, error) { return nil, nil }
 
 func (stubProvider) Call(string, ...interface{}) (json.RawMessage, error) { return nil, nil }
