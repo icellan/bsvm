@@ -94,8 +94,7 @@ func makeUnrelatedTx(txid types.Hash) *bridge.BSVTransaction {
 
 func newRecoveryMonitor(t *testing.T) *bridge.BridgeMonitor {
 	t.Helper()
-	memDB := db.NewMemoryDB()
-	return bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil, memDB)
+	return bridge.NewBridgeMonitor(bridge.DefaultConfig(), nil, nil)
 }
 
 // TestRecoverBridgeUTXOFromChain_ChainMatchNoHint pins the
