@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/types"
 )
 
@@ -471,34 +472,38 @@ var ErrBroadcastTransient = errors.New("withdrawal broadcast transient failure")
 // classifyBroadcastError partitions a broadcaster-returned error into
 // transient (retry) vs permanent (drop). Decision rules:
 //
-//   - HTTP 4xx (excluding 408 + 429): permanent. ARC reports invalid /
-//     malformed / double-spend / covenant-rejected with these codes.
-//   - HTTP 5xx, 408 (timeout), 429 (rate limit): transient.
-//   - network-level (i/o timeout, connection refused, EOF): transient.
-//   - context-cancelled: transient (caller cancelled, retry next pass).
-//   - everything else (unparseable error message): treat as transient
-//     by default — better to retry an unknown failure than drop a
-//     potentially-valid claim.
-//
-// The classifier is intentionally string-based: ARC and BSV-node RPC
-// errors arrive as opaque error strings, and ARC's structured response
-// is wrapped via fmt.Errorf("arc: broadcast status %d: %s", ...).
-// A future ARC SDK with a typed error type would let this logic
-// swap to errors.As; until then string matching is the pragmatic
-// surface area.
+//  1. *arc.ARCBroadcastError (via errors.As) — the canonical, typed
+//     surface. IsPermanent / IsTransient encapsulate the (HTTPStatus,
+//     TxStatus, Detail) decision matrix. This is the path production
+//     ARC client errors take.
+//  2. context.Canceled / context.DeadlineExceeded — transient (caller
+//     cancelled, retry next pass).
+//  3. Legacy string fallback — for non-ARC broadcasters (BSV-node RPC,
+//     bare net errors, test fakes). Mirrors the historical behaviour:
+//     extract HTTP status from the error message, pattern-match
+//     permanent-rejection keywords, default transient.
 func classifyBroadcastError(err error) error {
 	if err == nil {
 		return nil
 	}
-	msg := err.Error()
-	// Context cancellation is transient — the caller will start a new
-	// pass once the context is fresh.
+	// Path 1: typed ARC error. Preferred.
+	if arcErr := arc.AsBroadcastError(err); arcErr != nil {
+		switch {
+		case arcErr.IsPermanent():
+			return fmt.Errorf("%w: %v", ErrBroadcastPermanent, err)
+		case arcErr.IsTransient():
+			return fmt.Errorf("%w: %v", ErrBroadcastTransient, err)
+		}
+		// Typed error with no signal yet (e.g. HTTPStatus=0 + no
+		// underlying) — fall through to string heuristics so the
+		// classifier degrades gracefully rather than mis-classifying.
+	}
+	// Path 2: context signals.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %v", ErrBroadcastTransient, err)
 	}
-	// HTTP status detection. ARC errors land as "arc: broadcast status 4XX: ..."
-	// or "arc: status 4XX: ...". We extract the first 3-digit run that
-	// looks like a status code.
+	// Path 3: legacy string heuristics for non-ARC broadcasters.
+	msg := err.Error()
 	if status := extractHTTPStatus(msg); status > 0 {
 		switch {
 		case status == 408 || status == 429: // timeout / rate-limited
@@ -509,7 +514,6 @@ func classifyBroadcastError(err error) error {
 			return fmt.Errorf("%w: http %d: %v", ErrBroadcastPermanent, status, err)
 		}
 	}
-	// Pattern-match common permanent BSV-node rejections.
 	low := strings.ToLower(msg)
 	for _, kw := range []string{
 		"reject", "invalid", "double-spend", "double spend",

@@ -196,19 +196,55 @@ func (c *Client) Broadcast(ctx context.Context, txOrBeef []byte) (*BroadcastResp
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("arc: broadcast: %w", err)
+		// Pre-response transport failure (dial refused, EOF, timeout
+		// before a status was received). Surface as an ARCBroadcastError
+		// with HTTPStatus=0 so callers can classify via IsTransient
+		// without resorting to string matching.
+		return nil, &ARCBroadcastError{Underlying: err}
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("arc: read broadcast response: %w", err)
+		return nil, &ARCBroadcastError{
+			HTTPStatus: resp.StatusCode,
+			Underlying: err,
+			Detail:     "read response body",
+		}
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("arc: broadcast status %d: %s", resp.StatusCode, string(respBody))
+		// Parse the body opportunistically — ARC frequently returns the
+		// wireBroadcast shape on 4xx (txStatus=REJECTED + extraInfo) so
+		// IsPermanent / IsTransient can use the BSV-side TxStatus
+		// directly. Failure to parse is non-fatal: we fall back to the
+		// raw body in Detail.
+		var w wireBroadcast
+		txStatus := ""
+		_ = json.Unmarshal(respBody, &w)
+		txStatus = w.TxStatus
+		return nil, &ARCBroadcastError{
+			HTTPStatus: resp.StatusCode,
+			TxStatus:   txStatus,
+			Detail:     string(respBody),
+		}
 	}
 	var w wireBroadcast
 	if err := json.Unmarshal(respBody, &w); err != nil {
 		return nil, fmt.Errorf("arc: decode broadcast: %w", err)
+	}
+	// ARC may return 200 with a terminal-rejection txStatus
+	// (REJECTED, DOUBLE_SPEND_*, SEEN_IN_ORPHAN_MEMPOOL). Surface those
+	// as typed errors so the caller can drop the claim instead of
+	// treating it as a successful broadcast.
+	switch Status(w.TxStatus) {
+	case StatusRejected,
+		StatusDoubleSpendAttempted,
+		StatusDoubleSpendConfirmed,
+		StatusSeenInOrphanMempool:
+		return nil, &ARCBroadcastError{
+			HTTPStatus: resp.StatusCode,
+			TxStatus:   w.TxStatus,
+			Detail:     w.ExtraInfo,
+		}
 	}
 	return w.toBroadcastResponse()
 }
@@ -247,7 +283,13 @@ func (c *Client) Status(ctx context.Context, txid [32]byte) (*TxStatus, error) {
 		return &TxStatus{TxID: txid, Status: StatusUnknown}, nil
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("arc: status %d: %s", resp.StatusCode, string(respBody))
+		var w wireStatus
+		_ = json.Unmarshal(respBody, &w)
+		return nil, &ARCBroadcastError{
+			HTTPStatus: resp.StatusCode,
+			TxStatus:   w.TxStatus,
+			Detail:     string(respBody),
+		}
 	}
 	var w wireStatus
 	if err := json.Unmarshal(respBody, &w); err != nil {
