@@ -181,6 +181,40 @@ func (tx *Transaction) EncodeRLP(w io.Writer) error {
 	}
 }
 
+// UnmarshalBinary decodes a transaction from its EIP-2718 wire form.
+// For legacy transactions this is the plain RLP list (first byte >= 0xc0).
+// For typed transactions this is the type byte followed by the RLP-encoded
+// inner fields (e.g. 0x01||rlp(payload), 0x02||rlp(payload), 0x03||rlp(payload)).
+//
+// This is the canonical entrypoint for decoding wire-format bytes such as
+// those carried by eth_sendRawTransaction. Callers that already hold an
+// rlp.Stream should use DecodeRLP instead.
+func (tx *Transaction) UnmarshalBinary(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("rlp: empty transaction data")
+	}
+	if data[0] >= 0xc0 {
+		// Legacy transaction: plain RLP list. Reuse DecodeRLP via a stream
+		// constructed from the raw bytes so the legacy and typed paths
+		// both flow through a single canonical implementation.
+		return tx.DecodeRLP(rlp.NewStream(bytes.NewReader(data), uint64(len(data))))
+	}
+	if data[0] >= 0x80 {
+		return errors.New("rlp: typed transaction must not be wrapped in an RLP string at the wire layer")
+	}
+	return tx.decodeTyped(data)
+}
+
+// DecodeTx is a convenience constructor that decodes wire-format bytes into
+// a fresh *Transaction. See UnmarshalBinary for the accepted formats.
+func DecodeTx(data []byte) (*Transaction, error) {
+	tx := new(Transaction)
+	if err := tx.UnmarshalBinary(data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
 // DecodeRLP implements rlp.Decoder. If the first byte is >= 0xc0, it is
 // decoded as a legacy transaction (RLP list). If < 0x80, the first byte
 // is the transaction type.
