@@ -35,11 +35,26 @@ import (
 type CacheConfig struct {
 	// TxCacheSize bounds the GetTx cache. Default 1000.
 	TxCacheSize int
+	// BlockTxIDsCacheSize bounds the GetBlockTxIDs cache. Default 64.
+	// Each entry holds the full aggregated txid manifest for a block —
+	// content-addressed and immutable, so caching is safe and skips
+	// both the header roundtrip and (for paginated blocks) every page
+	// fetch on repeat lookups.
+	BlockTxIDsCacheSize int
+	// BlockPageCacheSize bounds the per-page LRU used by the paginated
+	// GetBlockTxIDs path. Each entry is a single page's flat slice of
+	// big-endian hex txid strings; pages are content-addressed by their
+	// URI so the cache is safe across blocks. Default 256.
+	BlockPageCacheSize int
 }
 
 // DefaultCacheConfig returns the standard cache bounds.
 func DefaultCacheConfig() CacheConfig {
-	return CacheConfig{TxCacheSize: 1000}
+	return CacheConfig{
+		TxCacheSize:         1000,
+		BlockTxIDsCacheSize: 64,
+		BlockPageCacheSize:  256,
+	}
 }
 
 // CachedClient wraps a WhatsOnChainClient with per-method LRU caches
@@ -50,6 +65,12 @@ type CachedClient struct {
 
 	txCache *lruCache
 	txGroup *singleflightGroup
+
+	blockTxIDsCache *lruCache
+	blockTxIDsGroup *singleflightGroup
+
+	blockPageCache *lruCache
+	blockPageGroup *singleflightGroup
 }
 
 // NewCachedClient wraps upstream with the cache configured by cfg.
@@ -61,6 +82,14 @@ func NewCachedClient(upstream WhatsOnChainClient, cfg CacheConfig) *CachedClient
 	if cfg.TxCacheSize > 0 {
 		c.txCache = newLRU(cfg.TxCacheSize)
 		c.txGroup = newSingleflightGroup()
+	}
+	if cfg.BlockTxIDsCacheSize > 0 {
+		c.blockTxIDsCache = newLRU(cfg.BlockTxIDsCacheSize)
+		c.blockTxIDsGroup = newSingleflightGroup()
+	}
+	if cfg.BlockPageCacheSize > 0 {
+		c.blockPageCache = newLRU(cfg.BlockPageCacheSize)
+		c.blockPageGroup = newSingleflightGroup()
 	}
 	return c
 }
@@ -112,15 +141,105 @@ func (c *CachedClient) GetUTXOs(ctx context.Context, address string) ([]UTXO, er
 	return c.upstream.GetUTXOs(ctx, address)
 }
 
-// GetBlockTxIDs passes through to upstream. The block→txids list is
-// content-addressed and could be cached, but the bridge scanner only
-// fetches each block's index once per height-event and a chaintracks-
-// only deployment will only fall back here on rare deposits, so the
-// LRU bookkeeping isn't worth the memory cost. The per-tx GetTx fan-
-// out IS cached (see GetTx), which is where the rate-limit pressure
-// actually lives.
+// GetBlockTxIDs returns the txid manifest for a block, with two layers
+// of caching:
+//
+//  1. A block-level LRU keyed on block-hash. The block→txids list is
+//     content-addressed (a sealed block's manifest never changes), so
+//     a HIT skips both the header roundtrip and any paginated page
+//     fetches the upstream would otherwise perform.
+//  2. A per-page LRU keyed on the page URI, used only when the upstream
+//     is a *Client (the canonical implementation). Pages are stable
+//     content-addressed lookups in their own right; caching them
+//     amortises the cost when the block-level cache misses (e.g. an
+//     adjacent block in a hot scan range that shares no pages with
+//     this one — the overhead is bounded by BlockPageCacheSize).
+//
+// Singleflight collapses concurrent requests for the same block into
+// a single upstream call, mirroring the GetTx posture.
 func (c *CachedClient) GetBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	if c.blockTxIDsCache == nil {
+		return c.upstream.GetBlockTxIDs(ctx, blockHash)
+	}
+	key := string(blockHash[:])
+	if v, ok := c.blockTxIDsCache.get(key); ok {
+		return cloneTxIDs(v.([][32]byte)), nil
+	}
+	v, err := c.blockTxIDsGroup.do(key, func() (any, error) {
+		// Re-check under the singleflight gate.
+		if cached, ok := c.blockTxIDsCache.get(key); ok {
+			return cached, nil
+		}
+		out, err := c.fetchBlockTxIDs(ctx, blockHash)
+		if err != nil {
+			return nil, err
+		}
+		// Store an immutable copy.
+		stored := cloneTxIDs(out)
+		c.blockTxIDsCache.put(key, stored)
+		return stored, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cloneTxIDs(v.([][32]byte)), nil
+}
+
+// fetchBlockTxIDs is the upstream-resolved fetch path used on a cache
+// MISS. When the upstream is a *Client we drive its paginated path
+// with a singleflight+LRU-backed page fetcher; otherwise we fall back
+// to the upstream's GetBlockTxIDs (which is what stub clients in tests
+// implement directly).
+func (c *CachedClient) fetchBlockTxIDs(ctx context.Context, blockHash [32]byte) ([][32]byte, error) {
+	if real, ok := c.upstream.(*Client); ok {
+		return real.getBlockTxIDsWithPageFetcher(ctx, blockHash, c.cachedPageFetch)
+	}
 	return c.upstream.GetBlockTxIDs(ctx, blockHash)
+}
+
+// cachedPageFetch wraps a single paginated-page fetch with the page
+// LRU + singleflight. Each page URI is a content-addressed lookup so
+// hits are always safe to serve from cache.
+func (c *CachedClient) cachedPageFetch(ctx context.Context, real *Client, pageURI string) ([]string, error) {
+	if c.blockPageCache == nil {
+		return fetchBlockPage(ctx, real, pageURI)
+	}
+	if v, ok := c.blockPageCache.get(pageURI); ok {
+		return cloneStrings(v.([]string)), nil
+	}
+	v, err := c.blockPageGroup.do(pageURI, func() (any, error) {
+		if cached, ok := c.blockPageCache.get(pageURI); ok {
+			return cached, nil
+		}
+		ids, err := fetchBlockPage(ctx, real, pageURI)
+		if err != nil {
+			return nil, err
+		}
+		stored := cloneStrings(ids)
+		c.blockPageCache.put(pageURI, stored)
+		return stored, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cloneStrings(v.([]string)), nil
+}
+
+// cloneTxIDs returns an independent copy of in. The cache stores
+// immutable canonical bytes; the wrapper hands callers their own copy
+// so they can sort/append without corrupting the cached value.
+func cloneTxIDs(in [][32]byte) [][32]byte {
+	out := make([][32]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneStrings returns an independent copy of in. Same rationale as
+// cloneTxIDs.
+func cloneStrings(in []string) []string {
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
 }
 
 // ChainInfo is intentionally NOT cached — the tip moves with each
