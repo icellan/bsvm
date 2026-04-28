@@ -30,6 +30,7 @@ import (
 
 	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/chaintracks"
+	"github.com/icellan/bsvm/pkg/covenant"
 )
 
 // defaultBridgeRecoveryWalkBound is the maximum number of BSV blocks
@@ -145,31 +146,30 @@ func recoverBridgeUTXOFromChain(
 
 	switch {
 	case found != nil && hint == nil:
+		applyHintNonceFallback(found, nil, logger)
 		logger.Info("bridge recovery: discovered live UTXO on chain (no operator hint)",
 			"txid", found.TxID.BSVString(),
 			"vout", found.Vout,
 			"balance_sat", found.Balance,
+			"last_claimed_nonce", found.LastClaimedNonce,
 		)
 		monitor.SetBridgeUTXO(found)
 		return nil
 
 	case found != nil && bridgeUTXOOutpointMatches(found, hint):
-		logger.Info("bridge recovery: chain-discovered UTXO agrees with operator hint",
-			"txid", found.TxID.BSVString(),
-			"vout", found.Vout,
-			"balance_sat", found.Balance,
-		)
-		// Preserve the hint's LastClaimedNonce — the chain walk has no
-		// view of it, but the operator does.
-		if hint != nil {
-			found.LastClaimedNonce = hint.LastClaimedNonce
-		}
+		// Outpoint agrees. Chain wins on nonce too: the on-chain
+		// BridgeState is the source of truth. If the hint disagrees
+		// with the chain-decoded nonce we WARN; if the chain script
+		// failed to parse we fall back to the hint's nonce.
+		applyHintNonceFallback(found, hint, logger)
+		logChainNonceDecision(found, hint, logger, "agrees with operator hint")
 		monitor.SetBridgeUTXO(found)
 		return nil
 
 	case found != nil:
-		// Chain disagrees with hint — chain wins, but make the
-		// discrepancy operator-visible so a config typo gets noticed.
+		// Chain disagrees with hint on the outpoint — chain wins.
+		// Make the discrepancy operator-visible so a config typo
+		// gets noticed.
 		logger.Warn("bridge recovery: chain-discovered UTXO disagrees with operator hint, preferring chain",
 			"chain_txid", found.TxID.BSVString(),
 			"chain_vout", found.Vout,
@@ -178,10 +178,8 @@ func recoverBridgeUTXOFromChain(
 			"hint_vout", hint.Vout,
 			"hint_balance_sat", hint.Balance,
 		)
-		// The hint's LastClaimedNonce may still be authoritative even
-		// when the outpoint differs — preserve it; otherwise the
-		// Withdrawer would re-attempt already-claimed nonces.
-		found.LastClaimedNonce = hint.LastClaimedNonce
+		applyHintNonceFallback(found, hint, logger)
+		logChainNonceDecision(found, hint, logger, "outpoint disagreed; chain wins")
 		monitor.SetBridgeUTXO(found)
 		return nil
 
@@ -190,6 +188,57 @@ func recoverBridgeUTXOFromChain(
 		return seedFromHint(monitor, hint, logger,
 			fmt.Sprintf("no bridge UTXO found within %d blocks of tip %d", walkBound, tip.Height))
 	}
+}
+
+// applyHintNonceFallback fills in found.LastClaimedNonce from the
+// hint when the chain script parse left it at the unset sentinel
+// (i.e. ParseBridgeStateFromScriptBytes failed or returned nonce 0).
+// When the chain decoded a real nonce, it stays — chain wins on
+// nonce per the round-7 follow-up policy.
+//
+// Two intentional asymmetries:
+//
+//   - chain WithdrawalNonce==0 maps to LastClaimedNonceUnset, which is
+//     also the unset-sentinel value. We can't disambiguate "nonce
+//     genuinely 0" from "parse failed" purely from the value; in both
+//     cases the hint's LastClaimedNonce (if any) is a better signal
+//     because an operator only sets the hint after a real claim.
+//
+//   - chain has a positive nonce: keep it, regardless of what the hint
+//     says. The hint may be stale; the chain is canonical.
+func applyHintNonceFallback(found, hint *bridge.BridgeUTXO, _ *slog.Logger) {
+	if found == nil {
+		return
+	}
+	if found.LastClaimedNonce == bridge.LastClaimedNonceUnset && hint != nil {
+		found.LastClaimedNonce = hint.LastClaimedNonce
+	}
+}
+
+// logChainNonceDecision emits an INFO log capturing the
+// chain-vs-hint nonce reconciliation outcome. WARN is used only when
+// the hint contradicted a successfully-parsed chain nonce.
+func logChainNonceDecision(found, hint *bridge.BridgeUTXO, logger *slog.Logger, outpointSummary string) {
+	if found == nil {
+		return
+	}
+	if hint != nil && hint.LastClaimedNonce != bridge.LastClaimedNonceUnset &&
+		found.LastClaimedNonce != bridge.LastClaimedNonceUnset &&
+		hint.LastClaimedNonce != found.LastClaimedNonce {
+		logger.Warn("bridge recovery: chain-decoded last_claimed_nonce disagrees with operator hint, preferring chain",
+			"chain_last_claimed_nonce", found.LastClaimedNonce,
+			"hint_last_claimed_nonce", hint.LastClaimedNonce,
+			"outpoint_summary", outpointSummary,
+		)
+		return
+	}
+	logger.Info("bridge recovery: chain-discovered UTXO accepted",
+		"txid", found.TxID.BSVString(),
+		"vout", found.Vout,
+		"balance_sat", found.Balance,
+		"last_claimed_nonce", found.LastClaimedNonce,
+		"outpoint_summary", outpointSummary,
+	)
 }
 
 // seedFromHint applies the operator hint to the monitor (or leaves the
@@ -300,6 +349,14 @@ func walkForBridgeUTXO(
 // covenant locking script). The chain may also carry a spec-12
 // "BSVM\x02" OP_RETURN in unrelated rollup-advance txs; those don't
 // pay the bridge script so they're skipped here.
+//
+// The found UTXO's LastClaimedNonce is decoded from the on-chain
+// BridgeState pushdata embedded in the locking script. The encoded
+// state's WithdrawalNonce is the next-claim nonce; LastClaimedNonce =
+// WithdrawalNonce - 1 (or LastClaimedNonceUnset for nonce 0). When
+// the state cannot be parsed (malformed script, no matching pushdata)
+// LastClaimedNonce stays at the unset sentinel and the caller falls
+// back to the operator hint with a WARN.
 func findBridgeOutputInBlock(txs []*bridge.BSVTransaction, bridgeScriptHash []byte, height uint64) *bridge.BridgeUTXO {
 	for _, tx := range txs {
 		if tx == nil {
@@ -310,16 +367,36 @@ func findBridgeOutputInBlock(txs []*bridge.BSVTransaction, bridgeScriptHash []by
 				continue
 			}
 			_ = height // logged by the caller
-			return &bridge.BridgeUTXO{
+			utxo := &bridge.BridgeUTXO{
 				TxID:             tx.TxID,
 				Vout:             uint32(vout),
 				Balance:          out.Value,
 				LastClaimedNonce: bridge.LastClaimedNonceUnset,
 				Script:           append([]byte(nil), bridgeScriptHash...),
 			}
+			// Decode on-chain BridgeState from the embedded pushdata
+			// to recover the canonical LastClaimedNonce. Parse failures
+			// surface back to the caller via the unset sentinel; the
+			// caller logs + falls back to the operator hint.
+			if state, err := covenant.ParseBridgeStateFromScriptBytes(out.Script); err == nil {
+				utxo.LastClaimedNonce = chainNonceToLastClaimed(state.WithdrawalNonce)
+			}
+			return utxo
 		}
 	}
 	return nil
+}
+
+// chainNonceToLastClaimed converts the on-chain BridgeState
+// WithdrawalNonce (the NEXT nonce to claim) into the BridgeUTXO
+// LastClaimedNonce convention (nonce of the LAST claim, or
+// LastClaimedNonceUnset when no claim has happened). See
+// pkg/bridge.LastClaimedNonceUnset for the rationale.
+func chainNonceToLastClaimed(withdrawalNonce uint64) uint64 {
+	if withdrawalNonce == 0 {
+		return bridge.LastClaimedNonceUnset
+	}
+	return withdrawalNonce - 1
 }
 
 // bridgeUTXOOutpointMatches reports whether two BridgeUTXO snapshots
@@ -332,4 +409,3 @@ func bridgeUTXOOutpointMatches(a, b *bridge.BridgeUTXO) bool {
 	}
 	return a.TxID == b.TxID && a.Vout == b.Vout && a.Balance == b.Balance
 }
-

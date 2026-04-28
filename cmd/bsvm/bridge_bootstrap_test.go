@@ -13,8 +13,34 @@ import (
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/chaintracks"
+	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// makeBridgeScriptWithState produces a synthetic bridge-covenant
+// locking script that embeds the given BridgeState as a 48-byte
+// pushdata so the cold-boot recovery's parser can decode the
+// canonical LastClaimedNonce. Non-state fragments around the
+// pushdata mirror the verifier preamble emitted by Rúnar codegen but
+// are not significant to the parser.
+func makeBridgeScriptWithState(withdrawalNonce uint64) []byte {
+	state := covenant.BridgeState{
+		Balance:               0, // not used by parser; output value carries balance
+		WithdrawalNonce:       withdrawalNonce,
+		WithdrawalsCommitment: types.Hash{},
+	}
+	encoded := state.Encode()
+	var script []byte
+	// 32-byte readonly slot first (StateCovenantScriptHash).
+	script = append(script, 0x20) // direct push of 32 bytes
+	script = append(script, make([]byte, 32)...)
+	// 48-byte BridgeState pushdata.
+	script = append(script, 0x30) // direct push of 48 bytes
+	script = append(script, encoded...)
+	// Non-push opcodes (mirror the preamble).
+	script = append(script, 0x76, 0xa9, 0x88)
+	return script
+}
 
 // fakeRecoveryBlockClient is the in-memory bridgeRecoveryBlockClient
 // the recovery tests drive. blocks maps height → tx slice; missing
@@ -619,6 +645,147 @@ func TestBootPath_BuildBridgeMonitorThenRecover(t *testing.T) {
 	}
 	if got.LastClaimedNonce != 5 {
 		t.Errorf("LastClaimedNonce = %d, want 5 (preserved from operator hint)", got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ChainNonceWinsOverHint pins the
+// round-7 follow-up policy: when the on-chain locking script encodes
+// a parseable BridgeState with WithdrawalNonce N, the recovery uses
+// N-1 as LastClaimedNonce regardless of what the operator hint says.
+// The hint becomes a fallback only for the unparseable-script case.
+func TestRecoverBridgeUTXOFromChain_ChainNonceWinsOverHint(t *testing.T) {
+	bridgeScript := makeBridgeScriptWithState(7) // chain says 7 claimed (next claim = 7)
+	chainTxID := hashAt(0xab)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 100}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			99: {makeBridgeOutputTx(chainTxID, bridgeScript, 5_000)},
+		},
+	}
+
+	// Hint claims a different (and stale) nonce.
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          5_000,
+		LastClaimedNonce: 3, // stale
+		Script:           bridgeScript,
+	}
+
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	// Chain says WithdrawalNonce=7 → LastClaimedNonce=6. Hint says 3.
+	if got.LastClaimedNonce != 6 {
+		t.Errorf("LastClaimedNonce = %d, want 6 (chain wins over stale hint)",
+			got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ParseFailureFallsBackToHintNonce
+// pins the fallback path: when the on-chain script does NOT contain a
+// parseable BridgeState pushdata, the recovery uses the hint's
+// LastClaimedNonce so an undecodable artifact doesn't reset the
+// Withdrawer to nonce 0.
+func TestRecoverBridgeUTXOFromChain_ParseFailureFallsBackToHintNonce(t *testing.T) {
+	bridgeScript := []byte{0x76, 0xa9, 0x14, 0x00, 0x88, 0xac} // P2PKH-shaped, no 48-byte push
+	chainTxID := hashAt(0xcd)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 50}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			49: {makeBridgeOutputTx(chainTxID, bridgeScript, 1_000)},
+		},
+	}
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          1_000,
+		LastClaimedNonce: 9,
+		Script:           bridgeScript,
+	}
+
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		10,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	if got.LastClaimedNonce != 9 {
+		t.Errorf("LastClaimedNonce = %d, want 9 (hint preserved on parse failure)",
+			got.LastClaimedNonce)
+	}
+}
+
+// TestRecoverBridgeUTXOFromChain_ChainNonceZeroPrefersHint pins the
+// asymmetry described in applyHintNonceFallback: an on-chain nonce
+// of 0 is indistinguishable from a parse failure in the
+// LastClaimedNonceUnset sentinel, so we prefer the hint when the
+// chain-decoded nonce sits at the unset sentinel and the hint has
+// real data.
+func TestRecoverBridgeUTXOFromChain_ChainNonceZeroPrefersHint(t *testing.T) {
+	bridgeScript := makeBridgeScriptWithState(0) // genuinely no claims yet
+	chainTxID := hashAt(0xef)
+
+	chainClient := &fakeRecoveryHeaderOracle{tip: 30}
+	blockClient := &fakeRecoveryBlockClient{
+		blocks: map[uint64][]*bridge.BSVTransaction{
+			29: {makeBridgeOutputTx(chainTxID, bridgeScript, 100)},
+		},
+	}
+	hint := &bridge.BridgeUTXO{
+		TxID:             chainTxID,
+		Vout:             0,
+		Balance:          100,
+		LastClaimedNonce: 4,
+		Script:           bridgeScript,
+	}
+	monitor := newRecoveryMonitor(t)
+	if err := recoverBridgeUTXOFromChain(
+		context.Background(),
+		chainClient,
+		blockClient,
+		monitor,
+		hint,
+		bridgeScript,
+		5,
+		silentLogger(),
+	); err != nil {
+		t.Fatalf("recoverBridgeUTXOFromChain: %v", err)
+	}
+	got := monitor.CurrentBridgeUTXO()
+	if got == nil {
+		t.Fatal("CurrentBridgeUTXO is nil")
+	}
+	if got.LastClaimedNonce != 4 {
+		t.Errorf("LastClaimedNonce = %d, want 4 (hint preferred when chain reports unset/0)",
+			got.LastClaimedNonce)
 	}
 }
 
