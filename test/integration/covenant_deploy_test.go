@@ -106,12 +106,12 @@ func TestCovenantDeploy_CompileFRI(t *testing.T) {
 	if len(res.RollupScript) == 0 {
 		t.Fatal("rollup script is empty")
 	}
-	// Bridge script is allowed to be empty today — see
-	// TODO(WW-bridge-compile) in deploy/covenant/compile.go. When
-	// the bridge contract refactor lands, flip this to a hard
-	// non-empty assertion.
+	// WW-bridge-compile (resolved): bridge.runar.go now hard-codes
+	// MerkleRootSha256's depth at 16 so the runar static checker
+	// accepts it, and the deploy pipeline emits a non-zero bridge
+	// script. A zero-length bridge here would be a regression.
 	if len(res.BridgeScript) == 0 {
-		t.Logf("bridge script is empty (expected today: WW-bridge-compile pending)")
+		t.Fatal("bridge script is empty (regression of WW-bridge-compile fix)")
 	}
 	rollupHex := hex.EncodeToString(res.RollupScript)
 	mode, err := covenant.DetectVerificationMode(rollupHex)

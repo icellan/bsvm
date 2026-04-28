@@ -280,31 +280,22 @@ func Compile(cfg *OperatorConfig) (*CompileResult, error) {
 	// is hash256 of the rollup's locking script — we have it now, so
 	// we can bake it deterministically.
 	//
-	// TODO(WW-bridge-compile): pkg/covenant/contracts/bridge.runar.go
-	// currently fails the runar-go static type-checker because
-	// (a) Refund's locktime parameter must be SigHashPreimage (fixed)
-	// and (b) Withdraw passes runtime Bigint values to
-	// MerkleRootSha256, which requires compile-time-constant index +
-	// depth. Until the contract is refactored to either bake the
-	// depth as a readonly or move MerkleRootSha256 inside a constant-
-	// depth loop, the deploy tool degrades to logging the error and
-	// emitting a zero-byte bridgeScript. The rollup half — which is
-	// the gating production artifact today — still ships. The e2e
-	// scaffold in test/e2e/regtest_claim_against_covenant_test.go
-	// already documents this as a precondition for full bridge
-	// integration.
+	// WW-bridge-compile (resolved): the previous round's TODO noted
+	// that bridge.runar.go failed the runar-go static checker because
+	// MerkleRootSha256's depth argument requires a compile-time
+	// integer literal. Withdraw now hard-codes the on-chain depth at
+	// 16 (spec 13's max) and the off-chain BridgeManager pads
+	// shallower trees up to that depth. The bridge script compiles
+	// cleanly to a non-zero byte string. The deploy tool now refuses
+	// to emit a zero-length bridge script — that condition is a hard
+	// failure rather than a warning.
 	rollupScriptDoubleHash := hash256(rollup.LockingScript)
 	bridgeScript, bridgeErr := compileBridge(rollupScriptDoubleHash[:])
 	if bridgeErr != nil {
-		// Log via a short stderr line so operators see WHICH known
-		// gap they're hitting; the JSON summary still emits a 0-byte
-		// bridge so downstream tooling can detect "bridge not yet
-		// available" without parsing a string.
-		fmt.Fprintf(os.Stderr,
-			"deploy-covenant: WARN bridge compile skipped: %v "+
-				"(see TODO WW-bridge-compile in deploy/covenant/compile.go)\n",
-			bridgeErr)
-		bridgeScript = nil
+		return nil, fmt.Errorf("bridge compile: %w", bridgeErr)
+	}
+	if len(bridgeScript) == 0 {
+		return nil, fmt.Errorf("bridge compile produced 0-byte script (regression of WW-bridge-compile)")
 	}
 
 	res := &CompileResult{

@@ -32,12 +32,25 @@ func sha256Sum(a, b []byte) []byte {
 	return h.Sum(nil)
 }
 
+// onChainBridgeMerkleDepth mirrors the const baked into bridge.runar.go.
+// The on-chain script always walks 16 sibling levels because runar's
+// MerkleRootSha256 requires its depth argument to be a compile-time
+// literal. Test helpers pad shallower trees up to this depth.
+const onChainBridgeMerkleDepth = 16
+
 // buildSha256MerkleProof builds a minimal full-binary SHA-256 Merkle
 // tree of fixed depth padded with the 32-byte zero hash, and returns
 // the root and the inclusion proof for the leaf at leafIndex.
 //
 // The proof is a depth*32 concatenated byte string of sibling hashes
 // from leaf upward, matching the runar.MerkleRootSha256 layout.
+//
+// When padToDepth16 is true, the returned (root, proof) describe the
+// SAME leaf inclusion against a padded depth-16 tree: the existing
+// depth-d subtree is treated as the all-left descent of a depth-16
+// tree, and the proof is extended with (16-d) zero-subtree-root
+// siblings (height d, d+1, ..., 15). This matches what the on-chain
+// bridge contract — which is hard-wired to walk depth 16 — expects.
 func buildSha256MerkleProof(leaves [][]byte, leafIndex int, depth int) (root []byte, proof []byte) {
 	zero := make([]byte, 32)
 	level := make([][]byte, 0, 1<<depth)
@@ -68,6 +81,39 @@ func buildSha256MerkleProof(leaves [][]byte, leafIndex int, depth int) (root []b
 		panic("merkle build: did not reduce to single root")
 	}
 	root = level[0]
+	return root, proof
+}
+
+// buildSha256MerkleProofPadded16 wraps buildSha256MerkleProof and pads
+// the result to the on-chain fixed depth of 16. The padded sibling at
+// each level above `depth` is the zero-subtree-root of that level.
+// The leaf index is unchanged because the bits at positions
+// >= depth are all zero (we append on the right).
+func buildSha256MerkleProofPadded16(leaves [][]byte, leafIndex int, depth int) (root []byte, proof []byte) {
+	if depth > onChainBridgeMerkleDepth {
+		panic("buildSha256MerkleProofPadded16: depth exceeds on-chain max 16")
+	}
+	root, proof = buildSha256MerkleProof(leaves, leafIndex, depth)
+
+	// Build the zero-subtree-root ladder. zeroRoot at iteration step k
+	// is the root of an all-zero binary tree of height (depth + k).
+	// The depth-d subtree of all zeros has root zeroRoot[depth] which
+	// we compute by repeatedly doubling from the 32-byte zero leaf.
+	zeroRoot := make([]byte, 32)
+	for h := 0; h < depth; h++ {
+		zeroRoot = sha256Sum(zeroRoot, zeroRoot)
+	}
+	// Now zeroRoot has height `depth`. Append (16-depth) sibling slots,
+	// each of which is the zero-subtree of the matching height, and
+	// fold them into the running root. The merkleIndex bits at these
+	// padded levels are zero (the leaf-side subtree always sits on the
+	// left of the appended zero-subtree), so the on-chain walk does
+	// `sha256(current || sibling)` at every padded step.
+	for h := depth; h < onChainBridgeMerkleDepth; h++ {
+		proof = append(proof, zeroRoot...)
+		root = sha256Sum(root, zeroRoot)
+		zeroRoot = sha256Sum(zeroRoot, zeroRoot)
+	}
 	return root, proof
 }
 
@@ -178,7 +224,7 @@ func callWithdraw(
 	t *testing.T,
 	cov *BridgeCovenant,
 	addr []byte,
-	amount, nonce, index, depth int64,
+	amount, nonce, index int64,
 	merkleProof, refScript, refOpReturn []byte,
 ) (ok bool, panicVal any) {
 	t.Helper()
@@ -194,7 +240,6 @@ func callWithdraw(
 		runar.Bigint(nonce),
 		runar.ByteString(merkleProof),
 		runar.Bigint(index),
-		runar.Bigint(depth),
 		runar.ByteString(refScript),
 		runar.ByteString(refOpReturn),
 	)
@@ -237,11 +282,11 @@ func TestBridgeWithdraw_HappyPath_Depth4(t *testing.T) {
 	leaf := withdrawalLeaf(addr, uint64(amount), uint64(nonce))
 	leaves[targetIndex] = leaf
 
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	batchData := []byte("batch-data-doesn't-matter-here")
 	refOpReturn := makeRefOpReturn(root, batchData)
 
-	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectAccept(t, ok, pv)
 
@@ -272,10 +317,10 @@ func TestBridgeWithdraw_HappyPath_Depth8(t *testing.T) {
 	leaf := withdrawalLeaf(addr, uint64(amount), uint64(nonce))
 	leaves[targetIndex] = leaf
 
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, []byte("d8"))
 
-	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectAccept(t, ok, pv)
 }
@@ -295,10 +340,10 @@ func TestBridgeWithdraw_HappyPath_Depth16(t *testing.T) {
 	leaf := withdrawalLeaf(addr, uint64(amount), uint64(nonce))
 	leaves[targetIndex] = leaf
 
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, []byte("d16"))
 
-	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectAccept(t, ok, pv)
 }
@@ -320,13 +365,13 @@ func TestBridgeWithdraw_BadProof_FlipSibling(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 
 	// Corrupt the first sibling.
 	proof[0] ^= 0xFF
 	refOpReturn := makeRefOpReturn(root, nil)
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -344,11 +389,11 @@ func TestBridgeWithdraw_WrongIndex(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, nil)
 
 	// Claim index 6 instead of 5.
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, 6, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, 6,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -367,7 +412,7 @@ func TestBridgeWithdraw_WrongRoot(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	_, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	_, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 
 	// Write a deliberately-wrong root into the OP_RETURN.
 	badRoot := make([]byte, 32)
@@ -376,7 +421,7 @@ func TestBridgeWithdraw_WrongRoot(t *testing.T) {
 	}
 	refOpReturn := makeRefOpReturn(badRoot, nil)
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -395,14 +440,14 @@ func TestBridgeWithdraw_WrongCrossCovScript(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, nil)
 
 	// Substitute a different script. Hash will not match the readonly
 	// StateCovenantScriptHash, so the cross-cov assertion fails.
 	otherScript := makeRefOutputScript("a-different-covenant")
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, otherScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -422,11 +467,11 @@ func TestBridgeWithdraw_ReplayedNonce(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), 0)
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, nil)
 
 	// First withdrawal with nonce=0 succeeds.
-	ok, pv := callWithdraw(t, bf.cov, addr, amount, 0, targetIndex, depth,
+	ok, pv := callWithdraw(t, bf.cov, addr, amount, 0, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectAccept(t, ok, pv)
 	if bf.cov.WithdrawalNonce != 1 {
@@ -434,7 +479,7 @@ func TestBridgeWithdraw_ReplayedNonce(t *testing.T) {
 	}
 
 	// Replay with nonce=0 must fail the nonce check.
-	ok, _ = callWithdraw(t, bf.cov, addr, amount, 0, targetIndex, depth,
+	ok, _ = callWithdraw(t, bf.cov, addr, amount, 0, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -453,7 +498,7 @@ func TestBridgeWithdraw_RejectZeroAmount(t *testing.T) {
 	leaf := withdrawalLeaf(addr, 0, 0)
 	refOpReturn := makeRefOpReturn(leaf, nil)
 
-	ok, _ := callWithdraw(t, bf.cov, addr, 0, 0, 0, 0,
+	ok, _ := callWithdraw(t, bf.cov, addr, 0, 0, 0,
 		nil, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -471,29 +516,41 @@ func TestBridgeWithdraw_RejectInsufficientBalance(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 	refOpReturn := makeRefOpReturn(root, nil)
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
 
-// TestBridgeWithdraw_RejectDepthOverMax pins the spec 13 max-depth-16
-// guard.
-func TestBridgeWithdraw_RejectDepthOverMax(t *testing.T) {
+// TestBridgeWithdraw_RejectShortProof pins the spec 13 fixed-depth-16
+// shape: the on-chain script always walks 16 sibling levels, so a
+// proof shorter than 16*32 = 512 bytes cannot satisfy the inclusion
+// check and the call rejects (the runar mock panics on the
+// out-of-range sibling slice, mirroring the OP_SUBSTR-at-out-of-range
+// failure on-chain).
+//
+// Before the WW-bridge-compile fix this test asserted runtime depth
+// was rejected when > 16; after the fix depth is no longer a
+// parameter — the on-chain walk is unconditionally 16 levels — so the
+// invariant moves to "proof must be 512 bytes."
+func TestBridgeWithdraw_RejectShortProof(t *testing.T) {
 	bf := newBridgeFixture(1_000_000)
 	addr := bytesAddr(0x03)
-	const amount, nonce, depth = 50_000, 0, 17 // > spec max
+	const amount, nonce = 50_000, 0
 	const targetIndex = 0
 
-	// Provide a proof of the right byte length (17*32) so we don't trip
-	// any earlier length check before reaching the depth assertion.
-	proof := make([]byte, depth*32)
+	// 17*32 = 544 bytes is irrelevant; what matters is that anything
+	// less than 16*32 = 512 bytes triggers an out-of-range slice in
+	// the mock and an OP_VERIFY failure on-chain. We pass 200 bytes —
+	// well under 512 — and use a deliberately-wrong root so we
+	// don't accidentally satisfy the merkle check.
+	proof := make([]byte, 200)
 	root := make([]byte, 32)
 	refOpReturn := makeRefOpReturn(root, nil)
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -518,12 +575,12 @@ func TestBridgeWithdraw_RefOpReturnTruncated(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	_, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	_, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 
 	// Truncated OP_RETURN — only the header, no payload.
 	tinyRefOpReturn := []byte{0x00, 0x6a, 0x4e, 0x00, 0x00, 0x00, 0x00}
 
-	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, _ := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, tinyRefOpReturn)
 	expectReject(t, ok, nil)
 }
@@ -552,7 +609,7 @@ func TestBridgeWithdraw_RefOpReturnWrongMagicNotEnforced(t *testing.T) {
 		leaves[i] = make([]byte, 32)
 	}
 	leaves[targetIndex] = withdrawalLeaf(addr, uint64(amount), uint64(nonce))
-	root, proof := buildSha256MerkleProof(leaves, targetIndex, depth)
+	root, proof := buildSha256MerkleProofPadded16(leaves, targetIndex, depth)
 
 	// Build a refOpReturn with a wrong magic but the root in the right
 	// slot. The bridge's offset-only extraction accepts.
@@ -560,7 +617,7 @@ func TestBridgeWithdraw_RefOpReturnWrongMagicNotEnforced(t *testing.T) {
 	refOpReturn := append([]byte{}, hdr...)
 	refOpReturn = append(refOpReturn, root...)
 
-	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex, depth,
+	ok, pv := callWithdraw(t, bf.cov, addr, amount, nonce, targetIndex,
 		proof, bf.refScript, refOpReturn)
 	expectAccept(t, ok, pv)
 }
