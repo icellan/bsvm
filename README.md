@@ -1,249 +1,115 @@
 # BSVM
 
-## NOTE: BSVM is still a work in progress. A lot of things still need to be tested and validated. DO NOT USE IN PRODUCTION.
+## What this is
 
-A validity-proven Ethereum Virtual Machine Layer 2 on BSV.
+BSVM is an Ethereum-compatible Layer 2 on BSV with SP1 STARK validity
+proofs. Users interact via standard Ethereum tooling (MetaMask,
+ethers.js, Hardhat, Foundry); deposits and withdrawals bridge BSV via
+covenant UTXOs. Every state advance is authorised on-chain by a STARK
+proof verified directly in Bitcoin Script — there is no sequencer key,
+no privileged operator on the advance path, and no challenge window.
 
-BSVM runs full EVM smart contracts on BSV, with every state transition proven correct by a STARK proof verified on-chain in Bitcoin Script. There is no sequencer key — the proof alone authorizes state advances. Anyone with a valid proof can advance the chain.
+## Architecture at a glance
 
-## Architecture
+- **Shards** — independent EVM instances on BSV. Each shard has its
+  own covenant UTXO chain, its own node network, its own contract
+  deployments, and its own bridge covenant. Shards do not share state.
+- **Nodes** — multiple independent nodes per shard. Nodes gossip
+  EVM transactions, execute deterministically, and race to advance the
+  covenant on BSV. The first valid advance wins; losers replay the
+  winner's batch. No leader election, no sequencer rotation.
+- **Prover (dual EVM)** — a Go EVM extracted from geth runs in the
+  overlay node for sub-millisecond execution and immediate (speculative)
+  receipts. A Rust `revm` running inside the SP1 zkVM produces a STARK
+  proof of full EVM execution. Both EVMs must produce identical state
+  roots; disagreement is a critical bug.
+- **Bridge covenant** — a BSV UTXO that locks deposits and releases
+  withdrawals. Deposits credit native L2 balance (no separately managed
+  wrapped token); withdrawals burn L2 balance and release BSV after
+  proof verification, gated by a Merkle root of finalised withdrawals.
+- **Three on-chain verification modes** — all three are mainnet-eligible
+  under VK pinning per spec 12 + 13:
+  - **Mode 1 `VerifyFRI`** — full SP1 STARK verifier in Bitcoin
+    Script (KoalaBear field, Poseidon2 KoalaBear Merkle, colinearity,
+    Fiat-Shamir transcript) via `runar.VerifySP1FRI`.
+  - **Mode 2 `VerifyGroth16`** — full BN254 multi-pairing of the
+    SP1-wrapped Groth16 proof, on-chain.
+  - **Mode 3 `VerifyGroth16WA`** — witness-assisted BN254 pairing
+    with the verifying key baked into the locking script.
 
-BSVM is an ecosystem of independent EVM instances (*shards*), each running as a BSV overlay network. Each shard has:
+BSV is the consensus layer. Nodes do not run their own consensus.
 
-- **A covenant UTXO chain on BSV** — a sequence of BSV transactions forming a chain of state commitments. Each transaction spends the previous covenant UTXO and creates a new one carrying the updated state root. The locking script is a Rúnar-compiled FRI verifier that validates STARK proofs in Bitcoin Script.
+## Quick start
 
-- **A node network** — multiple independent nodes that replicate state via peer-to-peer gossip. All nodes execute the same EVM transactions deterministically. Any node can generate a STARK proof and advance the covenant. BSV resolves races — if two nodes advance simultaneously, miners accept whichever propagated first. The winner earns gas fees; losers replay the winner's batch and continue.
-
-- **A bridge covenant** — BSV UTXOs that hold locked BSV backing the shard's native token (wBSV). Deposits lock BSV and mint wBSV on L2. Withdrawals burn wBSV and release BSV after proof verification.
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    BSV Network (L1)                       │
-│                                                          │
-│   Covenant chain A     Covenant chain B    Covenant C    │
-│   (DeFi shard)         (Identity shard)    (Social)      │
-│   UTXO→UTXO→UTXO→     UTXO→UTXO→UTXO→    UTXO→UTXO→   │
-└─────┬──────────────────────┬───────────────────┬─────────┘
-      │                      │                   │
-      ▼                      ▼                   ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Shard A Nodes│    │ Shard B Nodes│    │ Shard C Nodes│
-│  EVM+Prover  │    │  EVM+Prover  │    │  EVM+Prover  │
-│  RPC+Gossip  │    │  RPC+Gossip  │    │  RPC+Gossip  │
-└──────────────┘    └──────────────┘    └──────────────┘
-```
-
-## How It Works
-
-1. A user submits a signed EVM transaction via `eth_sendRawTransaction` (standard Ethereum RPC).
-2. The overlay node validates, executes through the Go EVM engine (sub-millisecond), and returns a receipt immediately.
-3. The node batches up to 128 transactions and generates a STARK proof via SP1 (a zkVM that proves RISC-V execution of the Rust EVM `revm`).
-4. The node builds a BSV transaction spending the covenant UTXO, with the STARK proof in the unlocking script and batch data in an OP_RETURN output.
-5. BSV miners validate the STARK proof via the FRI verifier in the covenant's locking script. If valid, the state advances. If invalid, the transaction is rejected.
-6. Users interact via MetaMask, ethers.js, Hardhat, or Foundry — standard Ethereum tooling with zero modifications.
-
-## Dual-EVM Proof Pipeline
-
-The system runs two EVM implementations that must produce identical results:
-
-| | Go EVM (geth extraction) | Rust EVM (revm inside SP1) |
-|---|---|---|
-| Purpose | Fast local execution | Proven execution |
-| Speed | Sub-millisecond | Seconds (proving) |
-| Output | State root + receipts | State root + STARK proof |
-| Where | Inside overlay node | External SP1 prover |
-
-Both pass the Ethereum test suite. The Go EVM returns receipts instantly. The STARK proof follows in seconds. The BSV covenant only accepts the proof.
-
-## EVM Compatibility
-
-BSVM is 100% Ethereum-compatible. Users deposit BSV via the bridge, receive wBSV (the native gas token), and interact via standard Ethereum tooling:
-
-- **Solidity contracts** deploy and execute unchanged
-- **MetaMask** connects and displays balances
-- **ethers.js / web3.js** send transactions and query state
-- **Hardhat / Foundry** run tests against a BSVM node
-- **ERC-20, ERC-721, Uniswap, Aave** — all standard contracts work
-
-Gas is paid in wBSV. 1 wBSV = 1 BSV = 10¹⁸ L2 wei (matching Ethereum's 18-decimal convention).
-
-## Fee Economics
-
-At BSV's fee rate of 100 sat/KB, a 128-transaction batch costs ~21,600 satoshis (~$0.0065) to post on-chain.
-
-| Batch | Gas | Revenue (1 gwei) | BSV cost | Margin |
-|---|---|---|---|---|
-| 128 simple transfers | 2.7M | 268,800 sats | 21,600 sats | 12× |
-| 128 ERC-20 transfers | 8.3M | 832,000 sats | 21,600 sats | 39× |
-| 128 Uniswap swaps | 19.2M | 1,920,000 sats | 21,600 sats | 89× |
-
-Per-transaction L1 cost: ~169 satoshis (~$0.00005). Break-even gas price: ~0.08 gwei — roughly 60× cheaper than Ethereum mainnet.
-
-## Security Model
-
-**State transition integrity**: The STARK proof guarantees full EVM execution correctness — every opcode, every balance transfer, every gas deduction. A forged proof would require breaking the hash function underlying the FRI protocol.
-
-**No sequencer key**: The proof is the sole authorization for state advances. No privileged party can advance state without a valid proof. This eliminates sequencer-level censorship and single points of failure.
-
-**Data availability**: Batch data is published in the OP_RETURN output of every covenant-advance transaction. The STARK proof commits to the batch data hash, and the covenant verifies this on-chain via `OP_HASH256`. Batch data is permanently available on BSV.
-
-**Censorship resistance**: The multi-node architecture provides first-order resistance (submit to any node). A forced-inclusion inbox covenant on BSV provides second-order resistance (submit directly to BSV, bypassing all nodes).
-
-**Bridge security**: Withdrawals are verified via STARK proof (no 7-day challenge period). Tiered CSV timelocks protect against BSV reorgs. Rate limiting caps withdrawals at 10% of TVL per period.
-
-**Governance**: Configurable per-shard at genesis. Three modes:
-- `none` — fully trustless, no recovery from bugs
-- `single_key` — one key can freeze/upgrade the shard
-- `multisig` — M-of-N keys required for governance operations
-
-Governance keys can freeze and upgrade the covenant but cannot advance state or access bridge funds.
-
-## Covenant Contract
-
-The state covenant is written in the Rúnar Go DSL and compiled to Bitcoin Script. It lives in `pkg/covenant/contracts/rollup.runar.go` and implements:
-
-- **advanceState** — verifies the STARK proof, checks pre/post state roots against public values, validates batch data hash binding via `OP_HASH256`, enforces strict block number increment, and verifies the chain ID for cross-shard replay prevention
-- **freeze** / **unfreeze** — governance key can pause and resume state advances
-- **upgrade** — governance key can replace the covenant script (must freeze first)
-
-The covenant has been validated on BSV regtest with 186 KB transactions (165 KB proof data + 20 KB batch data) executing at ~82ms per advance, with 25+ consecutive UTXO chain spends verified.
-
-## Project Structure
-
-```
-bsvm/
-├── cmd/
-│   ├── bsvm/                 # Shard node binary
-│   └── evm-cli/              # CLI debugging tool
-├── pkg/
-│   ├── vm/                   # Extracted EVM (from geth core/vm)
-│   ├── state/                # StateDB implementation (MPT + LevelDB)
-│   ├── mpt/                  # Merkle Patricia Trie
-│   ├── block/                # L2 block types and execution pipeline
-│   ├── overlay/              # Overlay node: execute, prove, broadcast
-│   ├── covenant/             # Rúnar covenant contracts + management
-│   │   └── contracts/        # rollup.go, bridge.go, sp1_verifier.go
-│   ├── prover/               # SP1 zkVM prover (revm guest + Go host)
-│   │   └── guest/            # Rust SP1 guest program
-│   ├── network/              # P2P gossip within a shard
-│   ├── shard/                # Shard lifecycle (genesis, join, discovery)
-│   ├── rpc/                  # Ethereum JSON-RPC gateway
-│   ├── bridge/               # BSV↔L2 bridge
-│   ├── bsv/                  # BSV client interface
-│   ├── types/                # Shared types (Address, Hash, Log, etc.)
-│   ├── crypto/               # Keccak, secp256k1, address derivation
-│   ├── rlp/                  # RLP encoding
-│   └── event/                # Typed event feeds
-├── internal/
-│   └── db/                   # LevelDB/Pebble database abstraction
-├── test/
-│   ├── integration/          # BSV regtest integration tests
-│   ├── evmtest/              # ethereum/tests runner
-│   └── e2e/                  # End-to-end tests
-├── spec/                     # Specifications (00-13)
-├── whitepaper/               # Academic whitepaper
-└── go.mod
-```
-
-## Specifications
-
-The `spec/` directory contains 14 specification documents covering the complete system design:
-
-| Spec | Topic |
-|------|-------|
-| 00 | Project overview and architecture |
-| 01 | EVM extraction from geth |
-| 02 | StateDB and Merkle Patricia Trie |
-| 03 | L2 block engine and execution pipeline |
-| 04 | (superseded by spec 10) |
-| 05 | Ethereum JSON-RPC gateway |
-| 06 | (superseded by spec 11) |
-| 07 | BSV↔L2 bridge (deposits and withdrawals) |
-| 08 | Genesis configuration and node startup |
-| 09 | Implementation order, milestones, and validation gates |
-| 10 | Deep BSV integration via Rúnar covenants |
-| 11 | Overlay node, multi-node model, and shard network |
-| 12 | Full EVM validity proofs via SP1 zkVM |
-| 13 | Rúnar compiler requirements and FRI verifier |
-
-Specs 10-13 are authoritative — where they conflict with specs 00-09, the later specs win.
-
-## Implementation Status
-
-| Component | Status |
-|-----------|--------|
-| Specifications (00-13) | Complete |
-| Whitepaper | Complete |
-| Covenant contract (Rúnar) | Complete — validated on BSV regtest |
-| Integration tests | Complete — 186 KB txs, 25-advance chains |
-| Gate 0a primitives | Confirmed — Baby Bear, Merkle depth 20, hash256 |
-| EVM extraction | Not started (Milestone 1) |
-| StateDB + MPT | Not started (Milestone 1) |
-| Block engine | Not started (Milestone 2) |
-| SP1 prover | Not started (Milestone 3) |
-| FRI verifier (full) | Not started (Gate 0b) |
-| Overlay node | Not started (Milestone 5) |
-| RPC gateway | Not started (Milestone 6) |
-| Network + replication | Not started (Milestone 7) |
-| Bridge | Not started (Milestone 9) |
-
-## Building
+Devnet (BSV regtest, dockerised):
 
 ```bash
-# Build the node binary
-go build -o bin/bsvm ./cmd/bsvm
+# Build the daemon binary
+make build                          # → bin/bsvm
 
-# Run unit tests
-go test ./pkg/... ./internal/... -race -count=1
+# Bring up the full devnet (BSV regtest + 3 BSVM nodes + prover)
+docker compose up
 
-# Run ethereum/tests suite
-go test ./test/evmtest/... -run TestVMTests -timeout 30m
+# Run the unit-test suite locally (no BSV needed)
+make test
 
-# Run integration tests (requires BSV regtest node)
-cd test/integration
-go test -tags integration -v -timeout 600s
-```
+# Run the ethereum/tests EVM oracle
+make test-vm
 
-## Traffic simulator (`bsvm-sim`)
-
-TUI-driven load generator for the devnet. Spins up a pool of users and
-a library of common EVM contracts (ERC-20, ERC-721, WETH, Uniswap V2-
-style AMM, multisig, storage, plain transfers), deploys them once, then
-runs continuous randomised traffic. Operators can add/remove users and
-start/stop workloads live via keybinds.
-
-```bash
-# Boot the devnet first (docker compose up), then:
+# Optional: traffic generator against a running devnet
 go run ./cmd/bsvm-sim
-
-# Headless mode (CI / logs to file):
-go run ./cmd/bsvm-sim --headless --duration 60s --tps 3
-
-# Limit workloads or target a single node:
-go run ./cmd/bsvm-sim --nodes http://localhost:8546 \
-    --workloads value-transfer,erc20-transfer,amm-swap
 ```
 
-TUI keybinds: `a`/`x` add/drop user, `w` toggle selected workload,
-`+`/`-` adjust rate, `]`/`[` adjust rate by 10, `p`/`r` pause/resume,
-`tab` cycle panels, `?` help, `q` quit.
+A single node can also be booted from a config file. Copy
+`cmd/bsvm/bsvm.example.toml` to `bsvm.toml`, fill in `[bsv].node_urls`
+and `[[bsv.chaintracks.providers]]`, and run `bin/bsvm --config
+bsvm.toml`. Devnet helpers live in `cmd/bsvm/dev.go` (`bsvm dev …`
+subcommands talk to the regtest node directly). For testnet, see
+`deploy/testnet/README.md`.
 
-Contract sources live in `contracts/src/` — regenerate bytecode via
-`contracts/README.md` after edits (pinned to solc 0.8.28, 200 runs).
+## Where to read next
 
-## Dependencies
+| Audience               | Start here                                                         |
+|------------------------|--------------------------------------------------------------------|
+| Operators              | `docs/operational-runbook.md` and `deploy/testnet/README.md`       |
+| Developers             | `spec/00-PROJECT-OVERVIEW.md` and `docs/INDEX.md`                  |
+| Decision history       | `docs/INDEX.md`                                                    |
+| Specifications         | `spec/` (00–17, with 10–17 authoritative on conflict)              |
+| Whitepaper             | `whitepaper/`                                                      |
 
-- Go 1.22+
-- `github.com/holiman/uint256` — 256-bit integer math
-- `github.com/syndtr/goleveldb` — LevelDB
-- `golang.org/x/crypto` — blake2b, ripemd160
-- `github.com/icellan/runar` — Rúnar Bitcoin Script compiler (Go DSL)
-- `github.com/decred/dcrd/dcrec/secp256k1/v4` — secp256k1 EC operations
-- `github.com/libp2p/go-libp2p` — P2P networking
-- SP1 v4.1.1 + Rust toolchain (for the prover guest program)
+## Repo layout
 
-No `github.com/ethereum/go-ethereum` in the final dependency tree. All geth code is copied and adapted.
+| Path             | Description                                                                  |
+|------------------|------------------------------------------------------------------------------|
+| `cmd/bsvm`       | Shard node daemon (config, boot, BSV wiring, bridge wiring, dev helpers).    |
+| `cmd/bsvm-sim`   | TUI traffic generator for the devnet.                                        |
+| `cmd/evm-cli`    | Standalone EVM/CLI debug tool.                                               |
+| `pkg/`           | All Go libraries (vm, state, mpt, block, overlay, prover, covenant, bridge, network, rpc, shard, arc, beef, bsv, chaintracks, whatsonchain, indexer, governance, metrics, types, crypto, rlp, event, tracing, regtestharness, sim, webui, proofmode). |
+| `prover/`        | SP1 host crates (`host`, `host-evm`, `host-bridge`, `host-revm`) and Rust guests (`guest`, `guest-evm`, `proof-verify-test`). |
+| `internal/db`    | LevelDB / Pebble database abstraction.                                       |
+| `spec/`          | Numbered specifications 00–17. Specs 10–17 win on conflict.                  |
+| `docs/`          | Operator runbook, gate-0 results, SP1 proof-format notes, decision archive. |
+| `deploy/`        | Operator boot harnesses (currently `deploy/testnet`).                        |
+| `test/`          | `evmtest` (ethereum/tests runner), `integration`, `e2e`, `multinode`, `devnet`, `cross_evm_diff`, `mpt_conformance`, `fuzz`. |
+| `contracts/`     | Solidity sources (and pinned bytecode) used by the simulator and tests.      |
+| `tools/`         | `create-bsvm-devnet`, `hardhat-bsvm` integration helpers.                    |
+| `web/`           | TypeScript explorer / admin UI.                                              |
+| `scripts/`       | Build helpers (e.g. `docker-build.sh`).                                      |
+| `whitepaper/`    | Academic whitepaper.                                                         |
 
 ## License
 
-LGPL-3.0 (matching go-ethereum's library license, since the EVM is derived from `core/vm`).
+MIT. See `LICENSE`.
+
+## Status
+
+Pre-mainnet. Active development. Not audited. Use at your own risk.
+
+All three verification modes (Mode 1 FRI, Mode 2 Groth16, Mode 3
+Groth16-WA) are mainnet-eligible under verifying-key pinning per spec
+12 + 13. The covenant has no sequencer signature on the advance path;
+optional governance keys can freeze and upgrade a shard but cannot
+advance state or access bridge funds. Implementation status of
+individual milestones evolves rapidly — check `docs/INDEX.md` and the
+recent decision docs in `docs/decisions/` for the current shape of each
+subsystem rather than relying on any per-package status table here.
