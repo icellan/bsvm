@@ -301,24 +301,22 @@ func (a *localSignerAdapter) SignInput(rawTxHex string, inputIndex int, prevScri
 }
 
 // feeWalletUTXOProvider adapts *overlay.FeeWallet to
-// bridge.FeeUTXOProvider so the Withdrawer can fund per-claim miner
-// fees from the prover's BSV UTXO float (spec 07 Input 1 / Output 2).
+// bridge.FeeUTXOProvider + bridge.MultiFeeUTXOProvider so the
+// Withdrawer can fund per-claim miner fees from the prover's BSV UTXO
+// float (spec 07 Input 1.. / Output 2).
 //
-// The adapter selects the smallest single UTXO that covers
-// minSatoshis using the wallet's largest-first SelectUTXOs API.
-// For now we accept multi-UTXO selection only when no single UTXO
-// suffices — the claim-tx builder currently handles a single fee
-// input, so we surface a clear error if the wallet's best candidate
-// is undersized. A multi-input fee UTXO path is a follow-up
-// (TODO(NN-followup)).
+// The adapter selects UTXOs greedily (largest-first) until the
+// accumulated sum covers minSatoshis. The Withdrawer prefers the
+// multi-UTXO path (ProvideClaimFeeUTXOs) and falls back to
+// ProvideClaimFeeUTXO only when the consumer cannot consume a slice.
 type feeWalletUTXOProvider struct {
 	wallet *overlay.FeeWallet
 }
 
-// ProvideClaimFeeUTXO returns the smallest single FeeWallet UTXO
-// covering minSatoshis. Errors out when the wallet is empty or every
-// available UTXO is undersized — both surfaces are loud-but-recoverable
-// because the Withdrawer logs + defers to the next pass on error.
+// ProvideClaimFeeUTXO returns the largest single FeeWallet UTXO
+// covering minSatoshis. Retained for backwards compatibility with the
+// single-UTXO FeeUTXOProvider interface; the Withdrawer prefers
+// ProvideClaimFeeUTXOs when available.
 func (p *feeWalletUTXOProvider) ProvideClaimFeeUTXO(minSatoshis uint64) (*bridge.FeeUTXO, error) {
 	if p == nil || p.wallet == nil {
 		return nil, errors.New("fee wallet: not configured")
@@ -330,21 +328,9 @@ func (p *feeWalletUTXOProvider) ProvideClaimFeeUTXO(minSatoshis uint64) (*bridge
 	if len(selected) == 0 {
 		return nil, errors.New("fee wallet: empty selection")
 	}
-	if len(selected) > 1 {
-		// Multi-input fee funding requires the claim-tx builder to
-		// accept a slice of fee UTXOs. Until that lands the
-		// largest-first selection still gives us a working path
-		// when at least ONE wallet UTXO covers the budget — log
-		// loudly so operators see we're picking only the first.
-		slog.Warn("fee wallet: multi-utxo selection not yet supported in claim tx, using largest only",
-			"selected_count", len(selected),
-			"budget_sats", minSatoshis,
-			"first_utxo_sats", selected[0].Satoshis,
-		)
-	}
 	u := selected[0]
 	if u.Satoshis < minSatoshis {
-		return nil, fmt.Errorf("fee wallet: largest utxo %d < min %d (multi-input fee funding is TODO(NN-followup))",
+		return nil, fmt.Errorf("fee wallet: largest utxo %d < min %d (single-utxo path)",
 			u.Satoshis, minSatoshis)
 	}
 	return &bridge.FeeUTXO{
@@ -353,6 +339,47 @@ func (p *feeWalletUTXOProvider) ProvideClaimFeeUTXO(minSatoshis uint64) (*bridge
 		Satoshis:      u.Satoshis,
 		LockingScript: append([]byte(nil), u.ScriptPubKey...),
 	}, nil
+}
+
+// ProvideClaimFeeUTXOs returns one or more FeeWallet UTXOs whose
+// satoshi total covers minSatoshis. Selection is largest-first: the
+// adapter walks SelectUTXOs's output and stops once the running sum
+// is sufficient. Returning a slice with len==1 is exactly what the
+// single-UTXO API would have returned. Returning len>1 produces the
+// multi-input claim-tx shape (Input 1, Input 2, ..., Output 2 carries
+// the combined change minus fee).
+func (p *feeWalletUTXOProvider) ProvideClaimFeeUTXOs(minSatoshis uint64) ([]*bridge.FeeUTXO, error) {
+	if p == nil || p.wallet == nil {
+		return nil, errors.New("fee wallet: not configured")
+	}
+	selected, total, err := p.wallet.SelectUTXOs(minSatoshis)
+	if err != nil {
+		return nil, fmt.Errorf("fee wallet: %w", err)
+	}
+	if len(selected) == 0 {
+		return nil, errors.New("fee wallet: empty selection")
+	}
+	if total < minSatoshis {
+		return nil, fmt.Errorf("fee wallet: selected %d utxos totalling %d sats < min %d",
+			len(selected), total, minSatoshis)
+	}
+	out := make([]*bridge.FeeUTXO, 0, len(selected))
+	for _, u := range selected {
+		out = append(out, &bridge.FeeUTXO{
+			TxID:          u.TxID,
+			Vout:          u.Vout,
+			Satoshis:      u.Satoshis,
+			LockingScript: append([]byte(nil), u.ScriptPubKey...),
+		})
+	}
+	if len(out) > 1 {
+		slog.Info("fee wallet: multi-utxo selection covers claim fee budget",
+			"selected_count", len(out),
+			"budget_sats", minSatoshis,
+			"total_sats", total,
+		)
+	}
+	return out, nil
 }
 
 // bsvTxFetcherAdapter satisfies bridge.BSVTxFetcher by translating the

@@ -374,11 +374,17 @@ func (s *staticScanner) ScanPendingWithdrawals(_ uint64) ([]*bridge.PendingWithd
 }
 
 // staticFeeUTXOProvider returns the same FeeUTXO for every claim. Used
-// to drive the spec-07 claim-tx shape (Input 1 + Output 2) without
+// to drive the spec-07 claim-tx shape (Input 1.. + Output 2) without
 // pulling in the full overlay.FeeWallet stack.
+//
+// When utxos is non-empty the provider implements MultiFeeUTXOProvider
+// and the Withdrawer takes the multi-input path; otherwise it falls
+// back to the singular FeeUTXOProvider.ProvideClaimFeeUTXO API. Tests
+// drive whichever shape they want to exercise.
 type staticFeeUTXOProvider struct {
-	utxo *bridge.FeeUTXO
-	err  error
+	utxo  *bridge.FeeUTXO
+	utxos []*bridge.FeeUTXO
+	err   error
 }
 
 func (p *staticFeeUTXOProvider) ProvideClaimFeeUTXO(_ uint64) (*bridge.FeeUTXO, error) {
@@ -386,6 +392,19 @@ func (p *staticFeeUTXOProvider) ProvideClaimFeeUTXO(_ uint64) (*bridge.FeeUTXO, 
 		return nil, p.err
 	}
 	return p.utxo, nil
+}
+
+func (p *staticFeeUTXOProvider) ProvideClaimFeeUTXOs(_ uint64) ([]*bridge.FeeUTXO, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	if len(p.utxos) > 0 {
+		return p.utxos, nil
+	}
+	if p.utxo != nil {
+		return []*bridge.FeeUTXO{p.utxo}, nil
+	}
+	return nil, errors.New("no fee utxos configured")
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,6 +1202,81 @@ func TestWithdrawalClaim_RootMismatch(t *testing.T) {
 	}
 	if bridgeUTXO.LastClaimedNonce != 0 {
 		t.Errorf("LastClaimedNonce advanced despite root mismatch: %d", bridgeUTXO.LastClaimedNonce)
+	}
+}
+
+// TestWithdrawalClaim_MultiInputFeeFunding exercises the spec-07
+// multi-input claim-tx shape: the fee provider supplies multiple
+// FeeUTXOs that collectively cover the miner fee, the builder emits
+// 1 + N inputs, and the signer is called once per input.
+func TestWithdrawalClaim_MultiInputFeeFunding(t *testing.T) {
+	bsvAddr := make([]byte, 20)
+	for i := range bsvAddr {
+		bsvAddr[i] = byte(0xa0 + i)
+	}
+	leaf := bridge.WithdrawalHash(bsvAddr, 50_000_000, 0)
+	pending := []*bridge.PendingWithdrawal{{
+		Nonce:          0,
+		BSVAddress:     bsvAddr,
+		AmountSatoshis: 50_000_000,
+		L2BlockNum:     10,
+		BatchHashes:    []types.Hash{leaf},
+		LeafIndex:      0,
+		WithdrawalHash: leaf,
+	}}
+	scanner := &staticScanner{withdrawals: pending}
+	finder := &staticAdvanceFinder{tx: buildSyntheticAdvanceTx(leaf)}
+
+	bridgeUTXO := &bridge.BridgeUTXO{
+		TxID:             types.HexToHash("0xb1"),
+		Vout:             0,
+		Balance:          10_000_000_000,
+		LastClaimedNonce: ^uint64(0),
+		Script:           []byte{0x76, 0xa9, 0x14, 0x00},
+	}
+	bcaster := &recorderBroadcaster{txid: types.HexToHash("0xc1a1")}
+	sgnr := &stubSigner{unlockHex: "5151"}
+
+	feeUTXOs := []*bridge.FeeUTXO{
+		{TxID: types.HexToHash("0xfee1"), Vout: 0, Satoshis: 4_000,
+			LockingScript: []byte{0x76, 0xa9, 0x14, 0x01}},
+		{TxID: types.HexToHash("0xfee2"), Vout: 1, Satoshis: 5_000,
+			LockingScript: []byte{0x76, 0xa9, 0x14, 0x02}},
+		{TxID: types.HexToHash("0xfee3"), Vout: 2, Satoshis: 6_000,
+			LockingScript: []byte{0x76, 0xa9, 0x14, 0x03}},
+	}
+	feeProvider := &staticFeeUTXOProvider{utxos: feeUTXOs}
+
+	w := bridge.NewWithdrawer(bcaster, bridgeUTXO, scanner, finder,
+		bridge.DefaultWithdrawalConfig()).
+		WithSigner(sgnr).
+		WithFeeUTXOProvider(feeProvider)
+
+	if err := w.ProcessFinalizedWithdrawals(); err != nil {
+		t.Fatalf("ProcessFinalizedWithdrawals: %v", err)
+	}
+	if bcaster.CallCount() != 1 {
+		t.Fatalf("broadcast count = %d, want 1", bcaster.CallCount())
+	}
+	// Multi-input shape signs 1 bridge + 3 fee = 4 inputs.
+	if sgnr.calls != 4 {
+		t.Fatalf("signer calls = %d, want 4 (bridge + 3 fee inputs)", sgnr.calls)
+	}
+
+	rawClaim := bcaster.LastBroadcast()
+	decoded, err := decodeBSVTx(rawClaim)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded.inputs) != 4 {
+		t.Fatalf("inputs = %d, want 4", len(decoded.inputs))
+	}
+	for i, fu := range feeUTXOs {
+		idx := i + 1
+		if !bytes.Equal(decoded.inputs[idx].prevTxID[:], fu.TxID[:]) {
+			t.Errorf("input %d prevTxID = %x, want %x",
+				idx, decoded.inputs[idx].prevTxID, fu.TxID)
+		}
 	}
 }
 
