@@ -88,6 +88,18 @@ func TestDefaultNodeConfig(t *testing.T) {
 	if cfg.BSV.Confirmations != 6 {
 		t.Errorf("BSV.Confirmations = %d, want %d", cfg.BSV.Confirmations, 6)
 	}
+
+	// Metrics defaults — operator runbook gap was "Prometheus not yet
+	// wired"; defaults must enable a loopback-only listener.
+	if !cfg.Metrics.Enabled {
+		t.Error("Metrics.Enabled default = false, want true")
+	}
+	if cfg.Metrics.ListenAddr != "127.0.0.1:9100" {
+		t.Errorf("Metrics.ListenAddr = %q, want %q", cfg.Metrics.ListenAddr, "127.0.0.1:9100")
+	}
+	if cfg.Metrics.Namespace != "bsvm" {
+		t.Errorf("Metrics.Namespace = %q, want %q", cfg.Metrics.Namespace, "bsvm")
+	}
 }
 
 func TestLoadNodeConfig(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/icellan/bsvm/pkg/chaintracks"
+	"github.com/icellan/bsvm/pkg/metrics"
 )
 
 // BuildChaintracksClient assembles a chaintracks.ChaintracksClient from
@@ -41,6 +42,16 @@ import (
 // The resulting client owns goroutines (per-provider streaming hubs);
 // the caller MUST defer Close() to free them on shutdown.
 func BuildChaintracksClient(_ context.Context, cfg ChaintracksSection, logger *slog.Logger) (chaintracks.ChaintracksClient, error) {
+	return BuildChaintracksClientWithMetrics(context.Background(), cfg, logger, nil)
+}
+
+// BuildChaintracksClientWithMetrics is BuildChaintracksClient with an
+// optional Prometheus counter set. Each per-provider RemoteClient
+// receives the counters via SetMetrics before being wrapped into the
+// MultiClient — this is the only call site at which the inner clients
+// are still typed concretely. Pass nil to keep the legacy "no metrics"
+// behaviour identical to BuildChaintracksClient.
+func BuildChaintracksClientWithMetrics(_ context.Context, cfg ChaintracksSection, logger *slog.Logger, counters *metrics.Counters) (chaintracks.ChaintracksClient, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -83,6 +94,12 @@ func BuildChaintracksClient(_ context.Context, cfg ChaintracksSection, logger *s
 		})
 		if err != nil {
 			return nil, fmt.Errorf("chaintracks provider %q: %w", p.Name, err)
+		}
+		// Wire metrics BEFORE the RemoteClient lazy-constructs its
+		// streaming hub on the first SubscribeReorgs call, so the
+		// reconnect / reorg counters fire from the very first event.
+		if counters != nil {
+			remote.SetMetrics(counters)
 		}
 		providers = append(providers, chaintracks.Provider{
 			Name:    providerName(p),
