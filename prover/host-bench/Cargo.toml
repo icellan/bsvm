@@ -1,0 +1,31 @@
+[package]
+name = "bsvm-host-bench"
+version = "0.1.0"
+edition = "2021"
+description = "SP1 circuit performance bench harness. Reads the same JSON HostInput envelope as bsvm-host-bridge, runs the production guest in EXECUTE mode (no proof) by default, and emits a JSON BenchOutput with cycle count, segment count, instruction count, public-values hash and wall-clock time. With --prove, also generates the real STARK proof and reports proof time + size + VK hash. Drives the Go-side bench in pkg/prover/bench_test.go."
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "bsvm-host-bench"
+path = "src/main.rs"
+
+[lib]
+name = "bsvm_host_bench"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned to the same SP1 release as the rest of the prover workspace
+# (host-bridge, host-evm, guest). Drift here would mean we benchmark a
+# different SP1 ELF than the production proving path actually runs.
+sp1-sdk = { version = "6.0.2", default-features = false }
+sp1-build = "6.0.2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+bincode = "1.3"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+sp1-build = "6.0.2"
