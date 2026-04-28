@@ -151,6 +151,22 @@ type BSVSigner interface {
 	SignInput(rawTxHex string, inputIndex int, prevScriptHex string, prevSatoshis uint64) (unlockHex string, err error)
 }
 
+// FeeUTXOProvider supplies the per-claim fee-funding UTXO required by
+// spec 07's claim-tx structure (Input 1 + Output 2). The Withdrawer
+// consults the provider once per claim before invoking
+// BuildWithdrawalClaimTx; returning a nil FeeUTXO falls back to the
+// legacy single-input shape (fee absorbed from the bridge change).
+//
+// minSatoshis hints at the minimum balance the FeeUTXO must carry to
+// cover the fee budget — the provider may return a larger UTXO and
+// the builder will emit the surplus as Output 2 change. When the
+// provider cannot satisfy the request (wallet empty / no eligible
+// UTXO) it returns an error; the Withdrawer surfaces this as a
+// transient failure so the loop retries on the next pass.
+type FeeUTXOProvider interface {
+	ProvideClaimFeeUTXO(minSatoshis uint64) (*FeeUTXO, error)
+}
+
 // Withdrawer orchestrates the complete withdrawal lifecycle:
 // scanning for finalized withdrawals on L2, building BSV claim
 // transactions, and broadcasting them.
@@ -179,6 +195,11 @@ type Withdrawer struct {
 	// Both are nil-safe; tests that don't need them leave them unset.
 	utxoProvider BridgeUTXOProvider
 	utxoSink     BridgeUTXOSink
+	// feeUTXOProvider, when set, supplies the per-claim fee-funding
+	// UTXO required by spec 07's claim-tx shape (Input 1 + Output 2).
+	// nil keeps the legacy single-input path (fee absorbed from the
+	// bridge change). See WithFeeUTXOProvider.
+	feeUTXOProvider FeeUTXOProvider
 }
 
 // NewWithdrawer creates a new Withdrawer with the given dependencies.
@@ -222,6 +243,16 @@ func (w *Withdrawer) WithSigner(s BSVSigner) *Withdrawer {
 func (w *Withdrawer) WithBridgeUTXOTracker(provider BridgeUTXOProvider, sink BridgeUTXOSink) *Withdrawer {
 	w.utxoProvider = provider
 	w.utxoSink = sink
+	return w
+}
+
+// WithFeeUTXOProvider registers a FeeUTXOProvider to enable spec 07's
+// claim-tx shape (Input 1 + Output 2). When the provider is nil the
+// Withdrawer falls back to the legacy single-input path with fee
+// absorbed from the bridge change. Returns the receiver for fluent
+// construction.
+func (w *Withdrawer) WithFeeUTXOProvider(p FeeUTXOProvider) *Withdrawer {
+	w.feeUTXOProvider = p
 	return w
 }
 
@@ -347,6 +378,26 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 
 		csvDelay := CSVDelayForAmount(wd.AmountSatoshis)
 
+		// Spec 07 claim-tx fee-funding UTXO. When a provider is wired
+		// the builder takes the spec-07 path (Input 1 + Output 2);
+		// when no provider is set or the wallet has no eligible UTXO
+		// we fall back to the legacy single-input path so existing
+		// deployments keep working. The minSatoshis hint is a coarse
+		// upper bound on the fee budget — len(claim tx) * sat/byte
+		// is well under 1 KB at typical 1 sat/byte rates, so we
+		// request 5 000 sats (≈ 5x worst-case headroom for retries).
+		var feeUTXO *FeeUTXO
+		if w.feeUTXOProvider != nil && w.config.ClaimFeeSatPerByte > 0 {
+			minSats := uint64(5000)
+			fu, ferr := w.feeUTXOProvider.ProvideClaimFeeUTXO(minSats)
+			if ferr != nil {
+				slog.Warn("withdrawal claim fee-UTXO unavailable, deferring to next pass",
+					"nonce", wd.Nonce, "error", ferr)
+				break
+			}
+			feeUTXO = fu
+		}
+
 		claim := &WithdrawalClaim{
 			BridgeTxID:      w.bridgeUTXO.TxID,
 			BridgeVout:      w.bridgeUTXO.Vout,
@@ -363,6 +414,7 @@ func (w *Withdrawer) ProcessFinalizedWithdrawals() error {
 			CSVDelay:        csvDelay,
 			Signer:          w.signer,
 			FeeSatPerByte:   w.config.ClaimFeeSatPerByte,
+			FeeUTXO:         feeUTXO,
 		}
 
 		claimTx, err := BuildWithdrawalClaimTx(claim)
@@ -725,6 +777,33 @@ func extractWithdrawalRootFromOpReturn(script []byte) types.Hash {
 	return root
 }
 
+// FeeUTXO describes a claimer-funded UTXO that pays the BSV miner fee
+// on a withdrawal claim transaction. Per spec 07 § "Claim transaction
+// structure", the claim tx carries this UTXO as Input 1 and emits the
+// claimer's change as Output 2 — the bridge UTXO (Input 0 / Output 0)
+// is conserved across claims modulo the withdrawal amount only, no
+// fee leakage.
+//
+// LockingScript is the prevout's scriptPubKey (typically a P2PKH
+// covering the claimer's wallet key — the same key that signs the
+// bridge input in production wiring). ChangeScript is the
+// scriptPubKey for Output 2 (claimer change); when omitted it
+// defaults to a P2PKH derived from the same locking-script hash160
+// the FeeUTXO unlocks (i.e. the claimer keeps change at the same
+// address). The Signer field is reused from WithdrawalClaim.Signer —
+// when production wiring uses a single FeeWallet for both inputs, no
+// separate signer is needed here.
+type FeeUTXO struct {
+	TxID          types.Hash
+	Vout          uint32
+	Satoshis      uint64
+	LockingScript []byte
+	// ChangeScript, when set, is used for Output 2. When nil the
+	// builder reuses LockingScript on the assumption the claimer
+	// recycles their own address.
+	ChangeScript []byte
+}
+
 // WithdrawalClaim holds the data needed to construct a BSV withdrawal
 // claim transaction against the bridge covenant.
 type WithdrawalClaim struct {
@@ -752,19 +831,29 @@ type WithdrawalClaim struct {
 	// CSVDelay is the OP_CSV delay in BSV blocks (from tiered confirmation table).
 	CSVDelay uint32
 
-	// Signer signs the bridge-covenant input. When nil the unlock
-	// script is left empty (the broadcasted tx is unsigned — only
-	// useful for tests inspecting tx structure).
+	// Signer signs the bridge-covenant input (and the FeeUTXO input
+	// when set). When nil the unlock script is left empty (the
+	// broadcasted tx is unsigned — only useful for tests inspecting
+	// tx structure).
 	Signer BSVSigner
 
 	// FeeSatPerByte sets the BSV miner fee rate, in satoshis per
-	// claim-tx byte. The fee is subtracted from the bridge UTXO change
-	// output (Output 0) — the user receives the full SatoshiAmount.
-	// Zero disables fee subtraction (test/hermetic builds only).
-	// Default in BuildWithdrawalClaimTx is 1 sat/byte when this field
-	// is left zero AND the build is being executed under production
-	// settings (operator-supplied via bridge config).
+	// claim-tx byte. When FeeUTXO is set the fee is subtracted from
+	// FeeUTXO.Satoshis (Output 2 = FeeUTXO.Satoshis - fee) and the
+	// bridge UTXO is conserved exactly (Output 0 = BridgeSats -
+	// SatoshiAmount). When FeeUTXO is nil the legacy single-input
+	// path is used and the fee is subtracted from the bridge change
+	// (Output 0); see "Fee policy" in BuildWithdrawalClaimTx for the
+	// migration plan. Zero disables fee subtraction (test only).
 	FeeSatPerByte int64
+
+	// FeeUTXO is the claimer-funded UTXO that pays the miner fee per
+	// spec 07 § "Claim transaction structure". When non-nil, the
+	// builder appends Input 1 (spending FeeUTXO) and Output 2
+	// (claimer change). When nil the builder falls back to the
+	// single-input path with fee absorbed from the bridge change
+	// output — preserved for backwards compatibility / migration.
+	FeeUTXO *FeeUTXO
 }
 
 // WithdrawalClaimTx holds the result of building a withdrawal claim transaction.
@@ -795,26 +884,43 @@ func CSVDelayForAmount(satoshis uint64) uint32 {
 // BuildWithdrawalClaimTx constructs the BSV transaction that claims a
 // withdrawal from the bridge covenant.
 //
-// The transaction structure:
+// Two transaction shapes are produced depending on whether
+// claim.FeeUTXO is set:
 //
-//	Input 0: Bridge covenant UTXO (unlock script supplied by Signer)
-//	Output 0: New bridge covenant UTXO (balance reduced + fee absorbed)
-//	Output 1: CSV-locked payment to user's BSV address (full amount)
+// (1) Spec 07 § "Claim transaction structure" — fee-funding UTXO path
+// (claim.FeeUTXO != nil):
+//
+//	Input 0:  Bridge covenant UTXO (unlock script supplied by Signer)
+//	Input 1:  Claimer fee-funding UTXO (P2PKH unlock signed by Signer)
+//	Output 0: New bridge covenant UTXO (balance = BridgeSats - SatoshiAmount, exact)
+//	Output 1: CSV-locked P2PKH payment to user's BSV address (full SatoshiAmount)
+//	Output 2: Claimer change (FeeUTXO.Satoshis - fee)
+//	Output 3: OP_RETURN withdrawal receipt
+//
+// In this shape the bridge balance is conserved exactly across claims
+// (no fee leakage). The miner fee is paid from the claimer's
+// fee-funding UTXO and any remainder lands in Output 2.
+//
+// (2) Legacy single-input path (claim.FeeUTXO == nil):
+//
+//	Input 0:  Bridge covenant UTXO
+//	Output 0: New bridge covenant UTXO (balance = BridgeSats - SatoshiAmount - fee)
+//	Output 1: CSV-locked P2PKH payment to user's BSV address (full SatoshiAmount)
 //	Output 2: OP_RETURN withdrawal receipt
 //
-// Fee policy: the BSV miner fee is computed as
-// FeeSatPerByte * len(serialized signed tx) and subtracted from
-// Output 0 (the bridge UTXO change). The user always receives the
-// full SatoshiAmount on Output 1; the bridge balance absorbs the fee.
-// Spec 07 § "Claim transaction structure" describes a separate
-// fee-funding input; the single-input simplification used here is
-// documented in S-withdrawal-and-rollback (Item 3) and tracked as a
-// follow-up. FeeSatPerByte=0 disables subtraction (test only).
+// This was the pragmatic shape EE shipped before spec-07 alignment.
+// It is preserved behind the FeeUTXO=nil seam so existing wirings and
+// the FF e2e harness keep working until they migrate to the new shape.
 //
-// When claim.Signer is non-nil the unlock script for input 0 is built
-// by serialising the unsigned tx, asking the signer to produce the
-// unlock-script hex, and splicing it into the final encoding. Without
-// a signer the tx is returned unsigned (only useful for tests).
+// Fee policy: the BSV miner fee is computed as
+// FeeSatPerByte * len(serialized signed tx) and subtracted from the
+// claimer-change output (path 1) or the bridge change output (path
+// 2). The user always receives the full SatoshiAmount on Output 1.
+// FeeSatPerByte=0 disables subtraction (test only).
+//
+// When claim.Signer is non-nil it signs both inputs (path 1) or just
+// the bridge input (path 2). Production wiring uses a single fee
+// wallet that funds the FeeUTXO and signs both inputs.
 func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) {
 	if claim == nil {
 		return nil, fmt.Errorf("withdrawal claim must not be nil")
@@ -833,6 +939,17 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 		return nil, fmt.Errorf("bridge script must not be empty")
 	}
 
+	if claim.FeeUTXO != nil {
+		return buildClaimTxWithFeeUTXO(claim)
+	}
+	return buildClaimTxLegacy(claim)
+}
+
+// buildClaimTxLegacy emits the single-input claim-tx shape EE shipped
+// before spec-07 alignment. Fee is absorbed from the bridge change.
+// Preserved as a backwards-compat seam — new wirings should populate
+// claim.FeeUTXO and take the spec-07 path.
+func buildClaimTxLegacy(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) {
 	csvDelay := claim.CSVDelay
 	if csvDelay == 0 {
 		csvDelay = CSVDelayForAmount(claim.SatoshiAmount)
@@ -840,7 +957,6 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 
 	newBalance := claim.BridgeSats - claim.SatoshiAmount
 
-	// Build transaction.
 	tx := &bsvTx{
 		version:  1,
 		lockTime: 0,
@@ -850,7 +966,7 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 	tx.inputs = append(tx.inputs, bsvInput{
 		prevTxID: claim.BridgeTxID,
 		prevVout: claim.BridgeVout,
-		script:   nil, // populated below by signer (if any)
+		script:   nil,
 		sequence: 0xffffffff,
 	})
 
@@ -874,11 +990,6 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 		script: receiptScript,
 	})
 
-	// Sign input 0 if a signer is configured. We follow the same
-	// skeleton-then-splice protocol the FeeWallet uses for covenant
-	// advances and consolidations: serialise the unsigned tx, ask the
-	// signer for the unlock-script hex, splice it back in, and
-	// re-serialise.
 	if claim.Signer != nil {
 		skeleton := tx.serialize()
 		skeletonHex := hex.EncodeToString(skeleton)
@@ -894,11 +1005,7 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 		tx.inputs[0].script = unlock
 	}
 
-	// Subtract the BSV miner fee from the bridge change output (Output
-	// 0). Fee = serialized-tx size * FeeSatPerByte. We compute against
-	// the post-signing size so the rate is honoured exactly; patching
-	// the output value doesn't change tx layout (it's a fixed-width
-	// uint64), so the size stays stable across the patch.
+	// Subtract fee from bridge change.
 	if claim.FeeSatPerByte > 0 {
 		serialized := tx.serialize()
 		fee := uint64(claim.FeeSatPerByte) * uint64(len(serialized))
@@ -917,6 +1024,145 @@ func BuildWithdrawalClaimTx(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) 
 		RawTx:      rawTx,
 		TxID:       txid,
 		NewBalance: newBalance,
+		CSVDelay:   csvDelay,
+	}, nil
+}
+
+// buildClaimTxWithFeeUTXO emits the spec-07 claim-tx shape: bridge
+// balance is conserved exactly, miner fee is paid from a separate
+// claimer-funded UTXO (Input 1) with the remainder going to claimer
+// change (Output 2).
+func buildClaimTxWithFeeUTXO(claim *WithdrawalClaim) (*WithdrawalClaimTx, error) {
+	fu := claim.FeeUTXO
+	if len(fu.LockingScript) == 0 {
+		return nil, fmt.Errorf("fee UTXO locking script must not be empty")
+	}
+	if fu.Satoshis == 0 {
+		return nil, fmt.Errorf("fee UTXO satoshis must be positive")
+	}
+
+	csvDelay := claim.CSVDelay
+	if csvDelay == 0 {
+		csvDelay = CSVDelayForAmount(claim.SatoshiAmount)
+	}
+
+	// Bridge change is the full balance minus the withdrawal amount.
+	// No fee leakage — the bridge UTXO is conserved across claims
+	// modulo the withdrawal amount only. This is the property the
+	// bridge covenant's Withdraw method enforces declaratively
+	// (c.Balance = c.Balance - satoshiAmount).
+	newBridgeBalance := claim.BridgeSats - claim.SatoshiAmount
+
+	tx := &bsvTx{
+		version:  1,
+		lockTime: 0,
+	}
+
+	// Input 0: bridge covenant UTXO.
+	tx.inputs = append(tx.inputs, bsvInput{
+		prevTxID: claim.BridgeTxID,
+		prevVout: claim.BridgeVout,
+		script:   nil,
+		sequence: 0xffffffff,
+	})
+
+	// Input 1: claimer fee-funding UTXO.
+	tx.inputs = append(tx.inputs, bsvInput{
+		prevTxID: fu.TxID,
+		prevVout: fu.Vout,
+		script:   nil,
+		sequence: 0xffffffff,
+	})
+
+	// Output 0: bridge continuation (exact, no fee).
+	tx.outputs = append(tx.outputs, bsvOutput{
+		value:  newBridgeBalance,
+		script: claim.BridgeScript,
+	})
+
+	// Output 1: CSV-locked P2PKH payment to user.
+	csvScript := buildCSVLockedP2PKH(csvDelay, claim.BSVAddress)
+	tx.outputs = append(tx.outputs, bsvOutput{
+		value:  claim.SatoshiAmount,
+		script: csvScript,
+	})
+
+	// Output 2: claimer change (placeholder value patched after fee
+	// computation; the script is fixed so the tx-byte size is stable
+	// across the patch).
+	changeScript := fu.ChangeScript
+	if len(changeScript) == 0 {
+		changeScript = fu.LockingScript
+	}
+	tx.outputs = append(tx.outputs, bsvOutput{
+		value:  fu.Satoshis, // patched below to fu.Satoshis - fee
+		script: changeScript,
+	})
+
+	// Output 3: OP_RETURN withdrawal receipt.
+	receiptScript := buildWithdrawalReceipt(claim.Nonce, claim.SatoshiAmount, claim.BSVAddress)
+	tx.outputs = append(tx.outputs, bsvOutput{
+		value:  0,
+		script: receiptScript,
+	})
+
+	// Sign both inputs if a signer is configured. The two-pass
+	// protocol mirrors fee_wallet_consolidate.go: serialise the
+	// unsigned skeleton, ask the signer for each input's unlock-hex
+	// (giving it the prevout's locking script + satoshi amount),
+	// splice each unlock back in. Same Signer covers both inputs in
+	// production (single FeeWallet key); the caller owns multi-key
+	// signing if they need it.
+	if claim.Signer != nil {
+		skeleton := tx.serialize()
+		skeletonHex := hex.EncodeToString(skeleton)
+
+		bridgeUnlockHex, err := claim.Signer.SignInput(skeletonHex, 0,
+			hex.EncodeToString(claim.BridgeScript), claim.BridgeSats)
+		if err != nil {
+			return nil, fmt.Errorf("sign bridge input: %w", err)
+		}
+		bridgeUnlock, err := hex.DecodeString(bridgeUnlockHex)
+		if err != nil {
+			return nil, fmt.Errorf("decode bridge unlock script: %w", err)
+		}
+		tx.inputs[0].script = bridgeUnlock
+
+		feeUnlockHex, err := claim.Signer.SignInput(skeletonHex, 1,
+			hex.EncodeToString(fu.LockingScript), fu.Satoshis)
+		if err != nil {
+			return nil, fmt.Errorf("sign fee-funding input: %w", err)
+		}
+		feeUnlock, err := hex.DecodeString(feeUnlockHex)
+		if err != nil {
+			return nil, fmt.Errorf("decode fee-funding unlock script: %w", err)
+		}
+		tx.inputs[1].script = feeUnlock
+	}
+
+	// Subtract the BSV miner fee from the claimer-change output
+	// (Output 2). The bridge UTXO (Output 0) stays exact. We compute
+	// against the post-signing size so the rate is honoured; patching
+	// a fixed-width uint64 doesn't change layout, so size is stable.
+	changeBalance := fu.Satoshis
+	if claim.FeeSatPerByte > 0 {
+		serialized := tx.serialize()
+		fee := uint64(claim.FeeSatPerByte) * uint64(len(serialized))
+		if fee > changeBalance {
+			return nil, fmt.Errorf("claim fee %d exceeds fee-UTXO balance %d (rate=%d sat/byte, size=%d)",
+				fee, changeBalance, claim.FeeSatPerByte, len(serialized))
+		}
+		changeBalance -= fee
+		tx.outputs[2].value = changeBalance
+	}
+
+	rawTx := tx.serialize()
+	txid := tx.txID()
+
+	return &WithdrawalClaimTx{
+		RawTx:      rawTx,
+		TxID:       txid,
+		NewBalance: newBridgeBalance,
 		CSVDelay:   csvDelay,
 	}, nil
 }

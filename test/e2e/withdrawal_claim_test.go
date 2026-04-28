@@ -374,6 +374,21 @@ func (s *staticScanner) ScanPendingWithdrawals(_ uint64) ([]*bridge.PendingWithd
 	return s.withdrawals, nil
 }
 
+// staticFeeUTXOProvider returns the same FeeUTXO for every claim. Used
+// to drive the spec-07 claim-tx shape (Input 1 + Output 2) without
+// pulling in the full overlay.FeeWallet stack.
+type staticFeeUTXOProvider struct {
+	utxo *bridge.FeeUTXO
+	err  error
+}
+
+func (p *staticFeeUTXOProvider) ProvideClaimFeeUTXO(_ uint64) (*bridge.FeeUTXO, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return p.utxo, nil
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — synthetic advance tx + claim assertions
 // ---------------------------------------------------------------------------
@@ -761,8 +776,21 @@ func TestWithdrawalClaim_E2E(t *testing.T) {
 	broadcaster := &recorderBroadcaster{txid: types.HexToHash("0xc1a1c1a1")}
 	sgnr := &stubSigner{unlockHex: "5151"} // OP_1 OP_1 placeholder
 
+	// Spec 07 fee-funding UTXO. Pre-funded with 100 000 sats — far
+	// above any plausible 1 sat/byte fee for a sub-1 KB claim tx, so
+	// the builder always succeeds with positive Output 2 change.
+	feeUTXO := &bridge.FeeUTXO{
+		TxID:          types.HexToHash("0xfee1"),
+		Vout:          0,
+		Satoshis:      100_000,
+		LockingScript: []byte{0x76, 0xa9, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x88, 0xac},
+	}
+	feeProvider := &staticFeeUTXOProvider{utxo: feeUTXO}
+
 	w := bridge.NewWithdrawer(broadcaster, bridgeUTXO, scanner, finder,
-		bridge.DefaultWithdrawalConfig()).WithSigner(sgnr)
+		bridge.DefaultWithdrawalConfig()).
+		WithSigner(sgnr).
+		WithFeeUTXOProvider(feeProvider)
 
 	// --- Step 4.  Run the claim flow. ---
 
@@ -772,8 +800,9 @@ func TestWithdrawalClaim_E2E(t *testing.T) {
 	if broadcaster.CallCount() != 1 {
 		t.Fatalf("broadcast count = %d, want 1", broadcaster.CallCount())
 	}
-	if sgnr.calls != 1 {
-		t.Fatalf("signer calls = %d, want 1", sgnr.calls)
+	// Spec-07 shape signs both inputs (bridge + fee-funding UTXO).
+	if sgnr.calls != 2 {
+		t.Fatalf("signer calls = %d, want 2 (bridge + fee-funding inputs)", sgnr.calls)
 	}
 
 	// --- Step 5.  Assert claim-tx structure. ---
@@ -789,35 +818,51 @@ func TestWithdrawalClaim_E2E(t *testing.T) {
 	if decoded.version != 1 {
 		t.Errorf("claim tx version = %d, want 1", decoded.version)
 	}
-	if len(decoded.inputs) != 1 {
-		t.Fatalf("claim inputs = %d, want 1", len(decoded.inputs))
+	// Spec-07 shape: Input 0 = bridge UTXO, Input 1 = fee-funding UTXO.
+	if len(decoded.inputs) != 2 {
+		t.Fatalf("claim inputs = %d, want 2 (bridge + fee-funding)", len(decoded.inputs))
 	}
-	// The claim spends the OLD bridge UTXO — bridgeUTXO.TxID has
+	// Input 0 spends the OLD bridge UTXO — bridgeUTXO.TxID has
 	// already been advanced to the broadcasted txid by
 	// UpdateAfterWithdrawal at this point, so compare against the
 	// pre-claim snapshot.
 	if !bytes.Equal(decoded.inputs[0].prevTxID[:], initialBridgeTxID[:]) {
-		t.Errorf("input prevTxID = %x, want %x", decoded.inputs[0].prevTxID, initialBridgeTxID[:])
+		t.Errorf("input 0 prevTxID = %x, want %x", decoded.inputs[0].prevTxID, initialBridgeTxID[:])
 	}
 	if decoded.inputs[0].prevVout != bridgeUTXO.Vout {
-		t.Errorf("input prevVout = %d, want %d", decoded.inputs[0].prevVout, bridgeUTXO.Vout)
+		t.Errorf("input 0 prevVout = %d, want %d", decoded.inputs[0].prevVout, bridgeUTXO.Vout)
 	}
-	// Unlock script comes from stubSigner (5151) — must be present.
+	// Input 1 spends the fee-funding UTXO.
+	if !bytes.Equal(decoded.inputs[1].prevTxID[:], feeUTXO.TxID[:]) {
+		t.Errorf("input 1 prevTxID = %x, want %x (fee UTXO)",
+			decoded.inputs[1].prevTxID, feeUTXO.TxID[:])
+	}
+	if decoded.inputs[1].prevVout != feeUTXO.Vout {
+		t.Errorf("input 1 prevVout = %d, want %d", decoded.inputs[1].prevVout, feeUTXO.Vout)
+	}
+	// Unlock script comes from stubSigner (5151) — must be present on
+	// both inputs since both were signed.
 	wantUnlock, _ := hex.DecodeString(sgnr.unlockHex)
 	if !bytes.Contains(decoded.inputs[0].script, wantUnlock) {
-		t.Errorf("input unlock script does not embed signer output: got=%x", decoded.inputs[0].script)
+		t.Errorf("input 0 unlock script does not embed signer output: got=%x", decoded.inputs[0].script)
+	}
+	if !bytes.Contains(decoded.inputs[1].script, wantUnlock) {
+		t.Errorf("input 1 unlock script does not embed signer output: got=%x", decoded.inputs[1].script)
 	}
 
-	// Outputs: [bridge-continuation, CSV-locked-payment, OP_RETURN-receipt].
-	if len(decoded.outputs) != 3 {
-		t.Fatalf("claim outputs = %d, want 3", len(decoded.outputs))
+	// Spec-07 outputs: [bridge-continuation, CSV-locked-payment,
+	// claimer-change, OP_RETURN-receipt].
+	if len(decoded.outputs) != 4 {
+		t.Fatalf("claim outputs = %d, want 4 (bridge + payee + claimer-change + OP_RETURN)",
+			len(decoded.outputs))
 	}
-	// Output 0 — new bridge UTXO with reduced balance.  Note that
-	// bridgeUTXO.Balance was already mutated by UpdateAfterWithdrawal
-	// at this point, so we use the snapshot constant for clarity.
-	wantNewBalance := initialBridgeBalance - withdrawSats
-	if decoded.outputs[0].value != wantNewBalance {
-		t.Errorf("bridge continuation value = %d, want %d", decoded.outputs[0].value, wantNewBalance)
+	// Output 0 — new bridge UTXO conserves the pre-claim balance
+	// minus the withdrawal amount EXACTLY (no fee leakage from the
+	// bridge UTXO).
+	wantBridgeContinuation := initialBridgeBalance - withdrawSats
+	if decoded.outputs[0].value != wantBridgeContinuation {
+		t.Errorf("bridge continuation value = %d, want %d (bridge balance MUST be conserved modulo withdrawal amount only)",
+			decoded.outputs[0].value, wantBridgeContinuation)
 	}
 	if !bytes.Equal(decoded.outputs[0].script, bridgeUTXO.Script) {
 		t.Errorf("bridge continuation script mismatch: got=%x want=%x",
@@ -838,31 +883,40 @@ func TestWithdrawalClaim_E2E(t *testing.T) {
 		t.Errorf("CSV recipient address = %x, want %x",
 			csvScript[addrPos+1:addrPos+1+20], bsvAddr20)
 	}
-	// Output 2 — OP_RETURN withdrawal receipt.
-	rcptScript := decoded.outputs[2].script
-	if decoded.outputs[2].value != 0 {
-		t.Errorf("receipt OP_RETURN value = %d, want 0", decoded.outputs[2].value)
+	// Output 2 — claimer change (FeeUTXO.Satoshis - tx_fee).
+	if decoded.outputs[2].value == 0 {
+		t.Errorf("claimer change = 0, expected positive (FeeUTXO sats=%d)", feeUTXO.Satoshis)
+	}
+	if decoded.outputs[2].value >= feeUTXO.Satoshis {
+		t.Errorf("claimer change = %d, want < %d (fee not deducted)",
+			decoded.outputs[2].value, feeUTXO.Satoshis)
+	}
+	// Output 3 — OP_RETURN withdrawal receipt.
+	rcptScript := decoded.outputs[3].script
+	if decoded.outputs[3].value != 0 {
+		t.Errorf("receipt OP_RETURN value = %d, want 0", decoded.outputs[3].value)
 	}
 	if len(rcptScript) < 4 || rcptScript[0] != 0x00 || rcptScript[1] != 0x6a {
 		t.Errorf("receipt script not OP_FALSE OP_RETURN: %x", rcptScript[:min(len(rcptScript), 4)])
 	}
-	// Magic + type byte (0x04 = withdrawal receipt) right after the
-	// push-length byte at index 2.
 	if !bytes.Contains(rcptScript, []byte("BSVM\x04")) {
 		t.Errorf("receipt missing BSVM\\x04 magic: %x", rcptScript)
 	}
 
-	// --- Step 6.  Conservation: input - outputs = (no fee in current build). ---
-
-	// Withdrawer's BuildWithdrawalClaimTx today does NOT subtract a fee
-	// from the bridge continuation; the fee model EE's wiring will add
-	// (`[bridge].claim_fee_sat_per_byte`) lives outside this test.  For
-	// now, assert the conservation that DOES hold: continuation +
-	// payment == bridge balance.
-	totalOut := decoded.outputs[0].value + decoded.outputs[1].value + decoded.outputs[2].value
-	if totalOut != initialBridgeBalance {
-		t.Errorf("output sum = %d, want pre-claim bridge balance %d (no fee model wired yet)",
-			totalOut, initialBridgeBalance)
+	// --- Step 6.  Conservation: bridge balance = inputs - withdraw - fee. ---
+	//
+	// Spec-07 shape: bridge UTXO is conserved exactly across claims
+	// (Output 0 = BridgeSats - WithdrawSats). The miner fee is paid
+	// from the fee-funding UTXO (Input 1) and the remainder lands in
+	// Output 2 (claimer change).
+	totalIn := initialBridgeBalance + feeUTXO.Satoshis
+	totalOut := decoded.outputs[0].value + decoded.outputs[1].value +
+		decoded.outputs[2].value + decoded.outputs[3].value
+	if totalIn-totalOut == 0 {
+		t.Errorf("expected non-zero fee, got in=%d out=%d", totalIn, totalOut)
+	}
+	if totalOut > totalIn {
+		t.Errorf("output sum %d exceeds input sum %d (impossible)", totalOut, totalIn)
 	}
 
 	// --- Step 7.  Bridge bookkeeping. ---
@@ -870,8 +924,8 @@ func TestWithdrawalClaim_E2E(t *testing.T) {
 	if bridgeUTXO.LastClaimedNonce != 0 {
 		t.Errorf("LastClaimedNonce = %d, want 0 (only nonce-0 was claimed)", bridgeUTXO.LastClaimedNonce)
 	}
-	if bridgeUTXO.Balance != wantNewBalance {
-		t.Errorf("bridge balance after claim = %d, want %d", bridgeUTXO.Balance, wantNewBalance)
+	if bridgeUTXO.Balance != wantBridgeContinuation {
+		t.Errorf("bridge balance after claim = %d, want %d", bridgeUTXO.Balance, wantBridgeContinuation)
 	}
 	if bridgeUTXO.TxID != broadcaster.txid {
 		t.Errorf("bridge UTXO txid not advanced to broadcast hash: got=%s want=%s",
