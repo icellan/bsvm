@@ -333,6 +333,19 @@ func (c *bigModExp) Run(input []byte) ([]byte, error) {
 	if baseLen == 0 && modLen == 0 {
 		return []byte{}, nil
 	}
+	// Defensive bound: reject lengths that would cause make([]byte, ...)
+	// to overflow or OOM. RequiredGas already drives MaxUint64-cost
+	// rejection through RunPrecompiledContract, but a direct Run call
+	// must not panic. modexpMaxLen mirrors geth's pattern of capping
+	// inputs at a value that fits comfortably in int on 32-bit targets.
+	const modexpMaxLen = uint64(1024 * 1024) // 1 MiB per length field
+	if baseLen > modexpMaxLen || expLen > modexpMaxLen || modLen > modexpMaxLen {
+		return nil, errors.New("modexp length parameter exceeds limit")
+	}
+	// Also guard the offset arithmetic against uint64 wraparound.
+	if 96+baseLen < baseLen || 96+baseLen+expLen < baseLen+expLen {
+		return nil, errors.New("modexp offset overflow")
+	}
 	base := new(big.Int).SetBytes(getData(input, 96, baseLen))
 	exp := new(big.Int).SetBytes(getData(input, 96+baseLen, expLen))
 	mod := new(big.Int).SetBytes(getData(input, 96+baseLen+expLen, modLen))

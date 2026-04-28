@@ -422,7 +422,17 @@ func opExtCodeHash(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext)
 }
 
 func opGasprice(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-	v, _ := uint256.FromBig(interpreter.evm.GasPrice)
+	// TxContext.GasPrice is *big.Int and may be nil for callers that
+	// don't supply it (fuzz harnesses, regtest scaffolding, raw-call
+	// helpers). uint256.FromBig(nil) returns nil; pushing nil onto the
+	// stack panics. Mirror the defensive zero-default applied to
+	// opDifficulty / opRandom / opBlobBaseFee.
+	v := new(uint256.Int)
+	if interpreter.evm.GasPrice != nil {
+		if w, _ := uint256.FromBig(interpreter.evm.GasPrice); w != nil {
+			v = w
+		}
+	}
 	scope.Stack.push(v)
 	return nil, nil
 }
