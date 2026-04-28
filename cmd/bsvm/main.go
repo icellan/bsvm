@@ -891,6 +891,45 @@ func cmdRun(ctx *cli.Context) error {
 	if wocErr != nil {
 		slog.Warn("bridge block scanner: WoC client construction failed", "err", wocErr)
 	}
+
+	// 8.1.0 Cold-boot recovery of the live bridge UTXO snapshot. Walk
+	// the chain backwards from the chaintracks tip looking for the
+	// most recent tx with an output paying to the bridge covenant. The
+	// chain-discovered UTXO is preferred over the operator hint
+	// (already applied by BuildBridgeMonitor::seedBridgeUTXO);
+	// mismatches are logged at WARN. If the walk yields nothing within
+	// defaultBridgeRecoveryWalkBound the hint stays in place. Recovery
+	// runs BEFORE startBridgeBlockScanner so the block scanner sees a
+	// trustworthy snapshot from the first event it processes.
+	if bridgeMonitor != nil && chaintracksClient != nil {
+		recoveryAdapter, recAdapterErr := newBridgeBSVClient(
+			chaintracksClient,
+			bridgeWoCClient,
+			bridgeBSVProviderForScan(bsvProvider),
+			nil, // no reorg retraction during cold boot
+			slog.Default(),
+		)
+		if recAdapterErr != nil {
+			slog.Warn("bridge recovery: failed to build BSV client adapter, skipping cold-boot scan",
+				"err", recAdapterErr,
+			)
+		} else {
+			hint := bridgeMonitor.CurrentBridgeUTXO()
+			if recErr := recoverBridgeUTXOFromChain(
+				bgCtx,
+				chaintracksClient,
+				recoveryAdapter,
+				bridgeMonitor,
+				hint,
+				bridgeScriptHash,
+				0, // 0 = use defaultBridgeRecoveryWalkBound
+				slog.Default(),
+			); recErr != nil {
+				return fmt.Errorf("bridge recovery: %w", recErr)
+			}
+		}
+	}
+
 	bridgeScannerClose, err := startBridgeBlockScanner(
 		bgCtx,
 		bridgeMonitor,
