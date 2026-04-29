@@ -11,3 +11,4 @@
 //! itself remains in `main.rs`.
 
 pub mod tx;
+pub mod wire_format;

@@ -62,12 +62,25 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/block"
+	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/crypto"
 	"github.com/icellan/bsvm/pkg/mpt"
 	"github.com/icellan/bsvm/pkg/state"
 	"github.com/icellan/bsvm/pkg/types"
 	"github.com/icellan/bsvm/pkg/vm"
 )
+
+// benchChainID matches the SP1 guest's hardcoded `CHAIN_ID` constant
+// (`prover/guest/src/main.rs::CHAIN_ID = 8453111`). The guest binds
+// every signed user-tx's recovered sender to this chain via
+// EIP-155, and commits the chain id at public-values offset
+// [136..144]. Using any other chain id here causes
+// `tx::decode_and_recover` to fail and the guest to commit
+// `commit_error(0x20, …)` instead of running revm — masking real
+// cycle counts. The dual-EVM equivalence test (`equivalence_test.go`)
+// uses a different chain id (1337) because it compares against
+// host-side revm directly, never going through the SP1 guest.
+const benchChainID = 8453111
 
 // benchOutput mirrors prover/host-bench/src/lib.rs::BenchOutput. Field
 // shape MUST stay in sync; mismatches surface as JSON unmarshal errors
@@ -184,7 +197,7 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	t.Helper()
 
 	database := db.NewMemoryDB()
-	chainConfig := vm.DefaultL2Config(equivalenceChainID)
+	chainConfig := vm.DefaultL2Config(benchChainID)
 
 	key, err := crypto.GenerateKey()
 	if err != nil {
@@ -196,7 +209,7 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	// Pre-fund 1000 ETH so any fixture has gas + value headroom. Same
 	// allocation the equivalence test uses; keeps cycle counts
 	// comparable between bench and equivalence runs.
-	genesis := block.DefaultGenesis(equivalenceChainID)
+	genesis := block.DefaultGenesis(benchChainID)
 	balance, _ := uint256.FromBig(new(big.Int).Mul(
 		big.NewInt(1000),
 		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
@@ -210,7 +223,7 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	}
 	preStateRoot := genesisHeader.StateRoot
 
-	signer := types.NewLondonSigner(big.NewInt(equivalenceChainID))
+	signer := types.NewLondonSigner(big.NewInt(benchChainID))
 	tx := fx.build(t, key, signer)
 	var encBuf bytes.Buffer
 	if err := tx.EncodeRLP(&encBuf); err != nil {
@@ -263,6 +276,8 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 		t.Fatalf("%s: SerializeExport: %v", fx.name, err)
 	}
 
+	emptyInbox := covenant.EmptyInboxState().TxQueueHash
+
 	proveInput := &ProveInput{
 		PreStateRoot: preStateRoot,
 		StateExport:  stateExportJSON,
@@ -274,11 +289,13 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 			GasLimit:  l2Block.GasLimit(),
 			BaseFee:   0,
 		},
+		InboxRootBefore: emptyInbox,
+		InboxRootAfter:  emptyInbox,
 		ExpectedResults: &ExpectedResults{
 			PostStateRoot: postStateRoot,
 			ReceiptsHash:  receiptsHash,
 			GasUsed:       gasUsed,
-			ChainID:       equivalenceChainID,
+			ChainID:       benchChainID,
 		},
 	}
 
@@ -337,6 +354,9 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 			fx.name, formatThousands(out.Instructions), out.Segments,
 			(len(out.PublicValues)-2)/2, // strip "0x", divide by 2
 			out.PublicValuesHash)
+		if os.Getenv("BSVM_BENCH_DUMP_PV") == "1" {
+			t.Logf("[bench] %s pv=%s", fx.name, out.PublicValues)
+		}
 	}
 }
 

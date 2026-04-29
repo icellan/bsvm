@@ -30,8 +30,10 @@ mod proof_verify;
 // `tx` lives in the crate's library facet (see `lib.rs`) so its pure-Rust
 // unit tests can run on the host with `cargo test --lib`. Re-exporting
 // here lets the binary use it via the same `tx::` path the rest of the
-// guest already uses.
-use bsvm_guest::tx;
+// guest already uses. `wire_format` is the same pattern — host-side
+// unit tests verify the bincode wire layout matches what
+// host-bridge/host-bench actually write.
+use bsvm_guest::{tx, wire_format};
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
@@ -77,9 +79,11 @@ const TOTAL_DEPOSITED_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
 pub struct BlockContext {
     pub number: u64,
     pub timestamp: u64,
+    #[serde(with = "wire_format::address_as_bytes")]
     pub coinbase: Address,
     pub gas_limit: u64,
     pub base_fee: u64,
+    #[serde(with = "wire_format::b256_as_bytes")]
     pub prev_randao: B256,
 }
 
@@ -108,12 +112,15 @@ pub struct EvmTransaction {
     /// Sender address. Trusted ONLY for deposit system txs (`tx_type=0x7E`);
     /// IGNORED for all signed user txs (the guest recovers the sender from
     /// `raw_bytes` instead).
+    #[serde(with = "wire_format::address_as_bytes")]
     pub from: Address,
     /// The destination address. For non-deposit txs, re-derived from
     /// `raw_bytes`; for deposits, used as-is. None for contract creation.
+    #[serde(with = "wire_format::option_address_as_bytes")]
     pub to: Option<Address>,
     /// The value to transfer in wei. Re-derived from `raw_bytes` for
     /// non-deposit txs; used as-is for deposits.
+    #[serde(with = "wire_format::u256_as_bytes")]
     pub value: U256,
     /// The transaction data (calldata or init code). Re-derived from
     /// `raw_bytes` for non-deposit txs; ignored for deposits.
@@ -153,6 +160,7 @@ impl EvmTransaction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountProofWitness {
     /// Account address being proved.
+    #[serde(with = "wire_format::address_as_bytes")]
     pub address: Address,
     /// RLP-encoded MPT nodes from the state root down to the account leaf
     /// (or down to the deepest unmatched node, for an exclusion proof).

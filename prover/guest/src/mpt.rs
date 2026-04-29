@@ -8,6 +8,7 @@
 //! This wrapper operates on RLP-encoded account data and produces roots
 //! that match Ethereum's world state trie specification.
 
+use bsvm_guest::wire_format;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_rlp::{Encodable, RlpEncodable};
 use alloy_trie::{HashBuilder, Nibbles};
@@ -26,9 +27,12 @@ struct AccountRlp {
 /// Represents an account's state for trie operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
+    #[serde(with = "wire_format::address_as_bytes")]
     pub address: Address,
     pub nonce: u64,
+    #[serde(with = "wire_format::u256_as_bytes")]
     pub balance: U256,
+    #[serde(with = "wire_format::b256_as_bytes")]
     pub code_hash: B256,
     pub code: Vec<u8>,
     pub storage: Vec<StorageSlot>,
@@ -37,7 +41,9 @@ pub struct AccountState {
 /// A single storage key-value pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSlot {
+    #[serde(with = "wire_format::u256_as_bytes")]
     pub key: U256,
+    #[serde(with = "wire_format::u256_as_bytes")]
     pub value: U256,
 }
 
