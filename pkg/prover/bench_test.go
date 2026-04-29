@@ -56,6 +56,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -303,6 +304,12 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	if err != nil {
 		t.Fatalf("%s: buildBridgeInput: %v", fx.name, err)
 	}
+	if dir := os.Getenv("BSVM_BENCH_DUMP_ENVELOPE_DIR"); dir != "" {
+		path := filepath.Join(dir, fx.name+".json")
+		if err := os.WriteFile(path, envelopeJSON, 0o644); err != nil {
+			t.Fatalf("%s: write envelope dump: %v", fx.name, err)
+		}
+	}
 	return envelopeJSON
 }
 
@@ -350,14 +357,81 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 			out.WallMs, hit)
 		// Also log instructions + segments + public-values shape so a
 		// regression in any of these is visible in CI output.
+		pvBytes := (len(out.PublicValues) - 2) / 2 // strip "0x", divide by 2
 		t.Logf("[bench] %s instructions=%s segments=%d pv_bytes=%d pv_hash=%s",
 			fx.name, formatThousands(out.Instructions), out.Segments,
-			(len(out.PublicValues)-2)/2, // strip "0x", divide by 2
-			out.PublicValuesHash)
+			pvBytes, out.PublicValuesHash)
 		if os.Getenv("BSVM_BENCH_DUMP_PV") == "1" {
 			t.Logf("[bench] %s pv=%s", fx.name, out.PublicValues)
 		}
+		// Wire-format canary: the production guest commits exactly 280
+		// bytes of public values (spec 12 — preStateRoot, postStateRoot,
+		// receiptsHash, gasUsed, batchDataHash, chainId,
+		// withdrawalRoot, inboxBefore, inboxAfter, migrateHash,
+		// blockNumber). A short-circuited guest (e.g., bincode wire-
+		// format mismatch panicking before the first commit) returns 0
+		// pv bytes with `pv_hash = SHA256("")`. Asserting the size here
+		// turns silent guest-side failures into test-time failures.
+		// See `prover/guest/src/wire_format.rs` and
+		// `docs/decisions/vk-rotation-wire-format-2026-04.md`.
+		if pvBytes != 280 {
+			t.Fatalf("[bench] %s short-pv (%d bytes); expected 280 — likely a "+
+				"wire-format regression between host-bench and the guest. "+
+				"Compare prover/host-bench/src/main.rs::GuestBatchInput "+
+				"with prover/guest/src/main.rs::BatchInput field-by-field, "+
+				"and run `cargo test --lib --release wire_format` in "+
+				"prover/guest/", fx.name, pvBytes)
+		}
+		emptyPVHash := "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		if out.PublicValuesHash == emptyPVHash {
+			t.Fatalf("[bench] %s pv_hash = SHA256(\"\") — guest committed "+
+				"nothing, almost certainly a wire-format regression. See "+
+				"docs/decisions/vk-rotation-wire-format-2026-04.md", fx.name)
+		}
+		// VK pin diagnostic: SP1 ELF compilation is non-deterministic
+		// across rebuilds (each `sp1_build::build_program` invocation
+		// produces a fresh ELF even from byte-identical source — the
+		// rebuilt ELF carries a different verifying-key hash). That
+		// makes `prover/guest/elf/SP1VerifyingKeyHash.txt` a snapshot
+		// of one specific reference build the operator chose, NOT a
+		// gate that test runs can enforce. We log the drift so a CI
+		// run can still surface it for review, but don't fail — a
+		// fresh local rebuild always disagrees with the pin until the
+		// operator restamps. See
+		// docs/decisions/vk-rotation-wire-format-2026-04.md for the
+		// reproducible-build follow-up.
+		pinned := loadPinnedVKHash(t)
+		if pinned != "" && !strings.EqualFold(out.VKHash, pinned) {
+			t.Logf("[bench] %s vk_hash drift (informational): bench=%s pinned=%s",
+				fx.name, out.VKHash, pinned)
+		}
 	}
+}
+
+// loadPinnedVKHash reads `prover/guest/elf/SP1VerifyingKeyHash.txt`
+// (relative to the repo root) and returns the trimmed hash string. Walks
+// upward from cwd to find the file so the helper works regardless of
+// which package directory `go test` runs from. Returns "" if the file
+// can't be located — the caller skips the pin check in that case so
+// out-of-tree consumers don't see a confusing failure.
+func loadPinnedVKHash(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for i := 0; i < 6; i++ {
+		path := filepath.Join(dir, "prover", "guest", "elf", "SP1VerifyingKeyHash.txt")
+		if data, err := os.ReadFile(path); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+	return ""
 }
 
 // formatThousands renders a uint64 with `_` thousand separators, e.g.
