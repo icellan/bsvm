@@ -25,7 +25,9 @@
 
 use bsvm_host_bench::{public_values_digest, to_hex, BenchOutput};
 use serde::{Deserialize, Serialize};
-use sp1_sdk::{include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, SP1Stdin};
+use sp1_sdk::{
+    include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Stdin,
+};
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::time::Instant;
