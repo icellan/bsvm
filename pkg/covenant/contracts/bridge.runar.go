@@ -111,13 +111,23 @@ func (c *BridgeCovenant) Deposit(depositAmount runar.Bigint) {
 //  3. The off-chain BridgeManager carries a process-level spent-
 //     nullifier set (see pkg/covenant/bridge_manager.go) that catches
 //     replay attempts before the tx is built.
+// MaxBridgeMerkleDepth is the fixed on-chain depth the bridge walks for every
+// withdrawal Merkle proof. Spec 13 caps the bridge withdrawal Merkle tree at
+// depth 16 (65536 leaves — far more than any realistic batch). The on-chain
+// script ALWAYS hashes 16 sibling levels because runar's MerkleRootSha256
+// requires its depth argument to be a compile-time constant. Off-chain
+// callers MUST pad shallower trees up to depth 16 by appending zero leaves
+// and computing the corresponding sibling hashes; see
+// bridge_withdraw_test.go's buildSha256MerkleProof which pads via the
+// 32-byte-zero "empty leaf" convention.
+const MaxBridgeMerkleDepth = 16
+
 func (c *BridgeCovenant) Withdraw(
 	bsvAddress runar.ByteString, // 20-byte BSV address (hash160 of pubkey)
 	satoshiAmount runar.Bigint, // amount to withdraw
 	nonce runar.Bigint, // must match current WithdrawalNonce
-	merkleProof runar.ByteString, // depth*32 concatenated SHA-256 sibling hashes
+	merkleProof runar.ByteString, // 16*32 = 512 byte concatenated SHA-256 sibling hashes (zero-padded to depth 16)
 	merkleIndex runar.Bigint, // leaf index (packed left/right bits per level)
-	merkleDepth runar.Bigint, // tree depth (max 16 per spec 13)
 	refOutputScript runar.ByteString, // state covenant output script of referenced advance tx
 	refOpReturn runar.ByteString, // spec-12 advance OP_RETURN script of the same tx
 ) {
@@ -127,10 +137,6 @@ func (c *BridgeCovenant) Withdraw(
 	// Balance bounds.
 	runar.Assert(satoshiAmount > 0)
 	runar.Assert(satoshiAmount <= c.Balance)
-
-	// Spec 13 caps the bridge withdrawal Merkle tree at depth 16.
-	runar.Assert(merkleDepth >= 0)
-	runar.Assert(merkleDepth <= 16)
 
 	// Compute the withdrawal hash (== nullifier == leaf):
 	//   leaf = hash256(bsvAddress || amount_be8 || nonce_be8)
@@ -173,7 +179,14 @@ func (c *BridgeCovenant) Withdraw(
 	// byte sibling at a time, hashing with single-block SHA-256 at
 	// each level (NOT keccak256, NOT hash256), with the bit at
 	// position i of merkleIndex selecting left/right at level i.
-	computedRoot := runar.MerkleRootSha256(nullifier, merkleProof, merkleIndex, merkleDepth)
+	//
+	// runar's static checker requires the depth argument to be a
+	// compile-time integer literal (see runar-compiler/passes/05-stack-
+	// lower.ts §lowerMerkleRoot). We hard-code 16 — the spec 13 cap —
+	// so the on-chain script has a fixed 16-level walk; off-chain
+	// callers pad shallower trees by appending zero leaves and
+	// computing the corresponding sibling hashes.
+	computedRoot := runar.MerkleRootSha256(nullifier, merkleProof, merkleIndex, 16)
 	runar.Assert(computedRoot == withdrawalRoot)
 
 	// Anti-replay (layer 2): fold the nullifier into the running

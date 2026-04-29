@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/icellan/bsvm/internal/db"
+	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/covenant"
+	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/shard"
 
@@ -50,6 +52,11 @@ type bsvWireOpts struct {
 	// *bsvclient.MultiRPCProvider — both satisfy BSVProviderClient and
 	// every consumer downstream is interface-typed accordingly.
 	Provider BSVProviderClient
+	// Counters is the daemon's shared metrics surface. Threaded into
+	// the ARC client construction so ARCBroadcastAttempts /
+	// ARCBroadcastFailed counters fire on every broadcast. Pass nil
+	// only in tests; production code uses overlayNode.Counters().
+	Counters *metrics.Counters
 }
 
 // bsvBroadcastResult captures the post-wiring artefacts callers may
@@ -73,6 +80,14 @@ type bsvBroadcastResult struct {
 	// 07 Input 1 / Output 2). Same wallet the covenant-advance path
 	// spends from — they share UTXOs.
 	FeeWallet *overlay.FeeWallet
+	// ARC is the production ARC broadcaster wired from the operator's
+	// [bsv].arc_url / [bsv].arc_endpoint config. Nil when no ARC
+	// endpoints are configured — downstream consumers (NetworkClient,
+	// the BEEF callback handler, bridge claim retries) treat nil as
+	// "ARC role disabled" and surface ErrProviderDisabled. Built with
+	// metrics already attached so ARCBroadcastAttempts /
+	// ARCBroadcastFailed{class} counters fire automatically.
+	ARC arc.ARCClient
 }
 
 // wireBSVBroadcast builds the full covenant-advance broadcast stack —
@@ -125,6 +140,35 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 	slog.Info("BSV RPC provider ready",
 		"endpoints", opts.NodeCfg.BSV.EffectiveNodeURLs(),
 		"network", bsvNet)
+
+	// 4b. ARC broadcast client. Built here (rather than at the cmdRun
+	// scope) so wireBSVBroadcast is the single shared bootstrap point
+	// for every BSV-side broadcast surface. Round-9 UU added the
+	// metrics counters but never built a production ARC client; this
+	// closes that gap. nil is a valid result — operators who haven't
+	// configured ARC see "arc client: not configured" in the logs and
+	// downstream callers (NetworkClient.Broadcast, the BEEF callback
+	// handler) surface ErrProviderDisabled at call time.
+	arcClient, err := BuildARCClient(opts.NodeCfg.BSV, opts.Counters)
+	if err != nil {
+		return nil, fmt.Errorf("arc client: %w", err)
+	}
+	if arcClient != nil {
+		if mc, ok := arcClient.(*arc.MultiClient); ok {
+			eps := mc.Endpoints()
+			urls := make([]string, 0, len(eps))
+			for _, e := range eps {
+				urls = append(urls, e.URL)
+			}
+			slog.Info("arc client ready",
+				"endpoints", urls,
+				"strategy", string(mc.Strategy()))
+		} else {
+			slog.Info("arc client ready", "type", "single")
+		}
+	} else {
+		slog.Info("arc client: not configured (no [bsv].arc_url or [bsv].arc_endpoint set)")
+	}
 
 	// 5. Rúnar signer from the fee-wallet key. Wrap LocalSigner in
 	// ExternalSigner so PrepareCall's GetUtxos(address) queries the
@@ -233,6 +277,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 		FeeAddress: feeAddr,
 		Provider:   provider,
 		FeeWallet:  feeWallet,
+		ARC:        arcClient,
 	}, nil
 }
 

@@ -105,3 +105,88 @@ func TestDisabledCounters_Independent(t *testing.T) {
 	// No panic on duplicate construction is the assertion. If a global
 	// registry were used, the second call would crash MustRegister.
 }
+
+// TestCounters_CustomNamespace asserts every Counters-owned metric
+// is rebranded under the operator-supplied prefix when the registry
+// is constructed via NewRegistryWithNamespace. Pins the contract that
+// [metrics].namespace works without per-call-site changes.
+func TestCounters_CustomNamespace(t *testing.T) {
+	const customNS = "myshard"
+
+	r := NewRegistryWithNamespace(Labels{NodeName: "n1", ChainID: "31337"}, customNS)
+	c := NewCounters(r)
+
+	// Touch every collector once so it shows up in the scrape.
+	c.BridgeDepositsTotal.Inc()
+	c.BridgeWithdrawalsClaimedTotal.Inc()
+	c.BridgeRetractsTotal.Inc()
+	c.OverlayBatchesAdvancedTotal.Inc()
+	c.OverlayStateRootMismatchTotal.Inc()
+	c.ProverProofDurationSeconds.Observe(0.5)
+	c.ProverProofSizeBytes.Observe(1024)
+	c.ChaintracksReorgsTotal.Inc()
+	c.ChaintracksReconnectsTotal.Inc()
+	c.ARCBroadcastAttemptsTotal.Inc()
+	c.IncARCBroadcastFailed("transient")
+	c.IncWoCCacheHit("tx")
+	c.IncWoCCacheMiss("tx")
+	c.IncClaimBroadcast("ok")
+	c.AnchorPendingTotal.Set(2)
+
+	rec := httptest.NewRecorder()
+	r.HTTPHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	// Every Counters metric must carry the new prefix.
+	wantPrefixed := []string{
+		"myshard_bridge_deposits_total",
+		"myshard_bridge_withdrawals_claimed_total",
+		"myshard_bridge_retracts_total",
+		"myshard_overlay_batches_advanced_total",
+		"myshard_overlay_state_root_mismatch_total",
+		"myshard_prover_proof_duration_seconds_count",
+		"myshard_prover_proof_size_bytes_count",
+		"myshard_chaintracks_reorgs_total",
+		"myshard_chaintracks_reconnects_total",
+		"myshard_arc_broadcast_attempts_total",
+		"myshard_arc_broadcast_failed_total",
+		"myshard_woc_cache_hits_total",
+		"myshard_woc_cache_misses_total",
+		"myshard_claim_broadcast_total",
+		"myshard_anchor_pending_total",
+	}
+	for _, want := range wantPrefixed {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in scrape, missing", want)
+		}
+	}
+
+	// And the default bsvm_ prefix must NOT appear for any Counters
+	// metric — operators expect the rebrand to be total.
+	bsvmLeaks := []string{
+		"bsvm_bridge_deposits_total",
+		"bsvm_overlay_batches_advanced_total",
+		"bsvm_arc_broadcast_attempts_total",
+	}
+	for _, leak := range bsvmLeaks {
+		if strings.Contains(body, leak) {
+			t.Errorf("bsvm_-prefixed metric leaked under custom namespace: %q", leak)
+		}
+	}
+}
+
+// TestCounters_EmptyNamespaceFallsBackToDefault asserts an empty
+// override leaves the default "bsvm" prefix in place — empty config
+// values must not produce nameless metrics.
+func TestCounters_EmptyNamespaceFallsBackToDefault(t *testing.T) {
+	r := NewRegistryWithNamespace(Labels{NodeName: "n1", ChainID: "31337"}, "")
+	c := NewCounters(r)
+	c.BridgeDepositsTotal.Inc()
+
+	rec := httptest.NewRecorder()
+	r.HTTPHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "bsvm_bridge_deposits_total") {
+		t.Errorf("empty namespace should fall back to default; missing bsvm_bridge_deposits_total")
+	}
+}

@@ -432,10 +432,10 @@ func cmdRun(ctx *cli.Context) error {
 		nodeName = "node"
 	}
 	chainIDStr := fmt.Sprintf("%d", nodeCfg.Shard.ChainID)
-	metricsRegistry := metrics.NewRegistry(metrics.Labels{
+	metricsRegistry := metrics.NewRegistryWithNamespace(metrics.Labels{
 		NodeName: nodeName,
 		ChainID:  chainIDStr,
-	})
+	}, nodeCfg.Metrics.Namespace)
 
 	// Standalone Prometheus /metrics HTTP listener. Kept separate
 	// from the JSON-RPC HTTP server so operators can firewall it
@@ -668,6 +668,7 @@ func cmdRun(ctx *cli.Context) error {
 			OverlayNode: overlayNode,
 			CovenantMgr: covenantMgr,
 			Provider:    bsvProvider,
+			Counters:    overlayNode.Counters(),
 		})
 		if err != nil {
 			return fmt.Errorf("BSV broadcast wiring failed: %w", err)

@@ -468,9 +468,21 @@ func (c *bn256PairingIstanbul) Run(input []byte) ([]byte, error) {
 // blake2F implements the Blake2F precompile at address 0x09.
 type blake2F struct{}
 
-// RequiredGas returns the gas required for Blake2F.
+// blake2FInputLength is the EIP-152 fixed input length: 4 bytes rounds +
+// 8*8 bytes h + 16*8 bytes m + 2*8 bytes t + 1 byte f flag.
+const blake2FInputLength = 213
+
+// RequiredGas returns the gas required for Blake2F. EIP-152 prices the
+// precompile at exactly one gas per round so the 4-byte big-endian
+// rounds parameter is a natural DoS bound — at the worst case
+// (rounds = 2^32 - 1) the call would burn ~4.3 billion gas, ~140x the
+// 30M block gas limit, so the EVM rejects the call with out-of-gas
+// long before it executes. We deliberately do NOT impose an additional
+// numeric cap on rounds: the spec is explicit that gas is the only
+// rate-limiter, and any tighter limit would diverge from mainnet
+// Ethereum and break consensus on edge-case calls.
 func (c *blake2F) RequiredGas(input []byte) uint64 {
-	if len(input) != 213 {
+	if len(input) != blake2FInputLength {
 		return 0
 	}
 	return uint64(binary.BigEndian.Uint32(input[0:4]))
@@ -478,10 +490,13 @@ func (c *blake2F) RequiredGas(input []byte) uint64 {
 
 // Run executes Blake2F.
 func (c *blake2F) Run(input []byte) ([]byte, error) {
-	if len(input) != 213 {
+	if len(input) != blake2FInputLength {
 		return nil, errors.New("invalid input length for blake2f")
 	}
-	// Parse input
+	// Parse input. Per EIP-152 the rounds parameter has no numeric cap
+	// — pricing is one gas per round so the EVM's gas accounting is the
+	// rate-limiter. RequiredGas() returns rounds verbatim; any caller
+	// without sufficient gas hits OOG before Run() is invoked.
 	rounds := binary.BigEndian.Uint32(input[0:4])
 	var h [8]uint64
 	for i := 0; i < 8; i++ {

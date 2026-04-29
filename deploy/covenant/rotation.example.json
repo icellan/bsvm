@@ -12,8 +12,12 @@
   "covenantTxId": "0000000000000000000000000000000000000000000000000000000000000000",
   "covenantVout": 0,
   "covenantSatsLive": 10000,
+  "currentStateRootHex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "currentBlockNumber": 0,
   "governanceSigsHex": ["REPLACE_WITH_64_BYTE_HEX_SIG"],
   "newVKHashFile": "prover/guest/elf/SP1VerifyingKeyHash.txt",
+  "proofBundlePath": "rotation.proof.json",
+  "partialSigOutPath": "rotate-vk.partial.json",
   "arcEndpoint": "https://arc-test.taal.com",
   "arcAuthToken": ""
 }
