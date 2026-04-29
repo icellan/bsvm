@@ -275,6 +275,37 @@ pub fn main() {
     // ── 1. Read inputs from the SP1 host ─────────────────────────────────
     let input: BatchInput = sp1_zkvm::io::read();
 
+    // ── 1a. Loud-failure canary against silent wire-format regressions ───
+    //
+    // If the host's bincode envelope is incompatible with the guest's
+    // BatchInput layout (e.g., a serde-attribute drift between
+    // `prover/host-bridge` / `prover/host-bench` and
+    // `prover/guest/src/wire_format.rs`), bincode tends to either panic
+    // (caught by SP1, reported as a guest-execution failure) OR
+    // silently produce a default-zeroed BatchInput. The latter slipped
+    // past every test in the suite for months: the bench reported
+    // `cycles=10_227 pv_bytes=0` for all five fixtures and was treated
+    // as in-budget because the budgets are upper bounds.
+    //
+    // No legitimate batch has all of {accounts, state_proofs,
+    // transactions, inbox_queue} empty AND `inbox_drain_count == 0`
+    // — even a do-nothing batch advancing past the
+    // forced-inclusion threshold would carry a non-empty
+    // `inbox_queue`. Fail loudly so a future serde regression
+    // surfaces as `commit_error(0x07, …)` rather than a zero-pv block.
+    //
+    // See `docs/decisions/vk-rotation-wire-format-2026-04.md` for the
+    // historical incident this guards against.
+    if input.accounts.is_empty()
+        && input.state_proofs.is_empty()
+        && input.transactions.is_empty()
+        && input.inbox_queue.is_empty()
+        && input.inbox_drain_count == 0
+    {
+        commit_error(0x07, &input.pre_state_root, &[0u8; 32]);
+        return;
+    }
+
     // ── 2. Load state into revm's CacheDB AND the MPT ────────────────────
     let mut db = CacheDB::new(EmptyDB::default());
     let mut mpt = EthMPT::new();
