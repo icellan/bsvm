@@ -23,8 +23,52 @@ ws_addr = "0.0.0.0:8546"
 cors_origins = ["*"]
 
 [prover]
+# Backend that runs the SP1 host. "mock" (default) returns synthetic
+# proofs without invoking any Rust subprocess — fine for unit tests
+# and Solidity-side dev. "local" launches the bsvm-host-bridge binary
+# as a subprocess (requires host_bridge_binary + guest_elf_path
+# below). "network" submits to the SP1 prover network (requires an
+# SP1 prover-network subscription; today the host returns an error
+# until the SDK subscription path lands).
 mode = "mock"
+# Maximum concurrent proving operations. Currently parsed but NOT
+# yet propagated to a ParallelProver in the daemon boot path — set >1
+# is a no-op today. Tracked as a follow-up in the spec-review triage
+# document (Claim 1, sub-bullet ParallelProver wiring).
 workers = 1
+# Absolute path to the bsvm-host-bridge Rust binary. Empty when
+# mode = "mock"; required when mode = "local" or "network". The
+# binary is built by the prover Cargo workspace; the build script
+# emits it under target/release/bsvm-host-bridge.
+# host_bridge_binary = "/abs/path/to/bsvm-host-bridge"
+# Absolute path to the compiled SP1 guest ELF. Empty when
+# mode = "mock"; required when mode = "local" or "network". Built
+# by `cd prover/guest && cargo prove build --release`; emitted under
+# elf/riscv32im-succinct-zkvm-elf.
+# guest_elf_path = "/abs/path/to/guest.elf"
+# SP1 prover-network endpoint (only consulted when mode = "network").
+# Empty defers to the SP1 SDK default. Override to point at a
+# self-hosted prover pool or a regional Succinct endpoint.
+# network_url = "https://rpc.succinct.xyz"
+# Per-Prove() wall-clock cap. Parsed via time.ParseDuration. Empty
+# inherits the prover package default (10 minutes). Set to "0s" to
+# disable the timeout entirely (offline batch proving).
+# timeout = "10m"
+# On-chain verification path the produced proof targets:
+# "fri" (Mode 1, on-chain SP1 STARK verifier — default for backwards
+# compatibility with the prover package), "groth16" (Mode 2, generic
+# BN254 multi-pairing) or "groth16-wa" (Mode 3, witness-assisted
+# Groth16, smallest on-chain footprint). Mock mode + Groth16 is
+# rejected at startup as contradictory — mock proofs cannot satisfy
+# a Groth16 on-chain verifier.
+# proof_mode = "fri"
+# SP1 proof envelope format the host bridge emits. "compressed"
+# (default) is the standard SP1 compressed proof; "core" is the raw
+# core proof; "groth16" is the BN254-wrapped Groth16 envelope used
+# by Mode 2/Mode 3 covenants; "execute" runs the SP1 guest in
+# execute mode without producing a STARK (used by spec 16's `execute`
+# devnet preset).
+# sp1_proof_mode = "compressed"
 
 [network]
 listen_addr = "/ip4/0.0.0.0/tcp/9945"

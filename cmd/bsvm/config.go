@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/icellan/bsvm/pkg/network"
 	"github.com/icellan/bsvm/pkg/overlay"
+	"github.com/icellan/bsvm/pkg/proofmode"
 	"github.com/icellan/bsvm/pkg/prover"
 	"github.com/icellan/bsvm/pkg/rpc"
 	"github.com/icellan/bsvm/pkg/types"
@@ -202,10 +204,185 @@ type RPCSection struct {
 	CORSOrigins []string `toml:"cors_origins"`
 }
 
-// ProverSection holds SP1 prover configuration.
+// ProverSection holds SP1 prover configuration. The fields fall into
+// two groups:
+//
+//  1. Backend selection (Mode, Workers, NetworkURL, Timeout) — picks
+//     where and how the SP1 prover runs.
+//  2. Proof shape (HostBridgeBinary, GuestELFPath, ProofMode,
+//     SP1ProofMode) — picks which artefacts the prover loads and which
+//     verification path the produced proof targets on-chain.
+//
+// All non-Mode/Workers fields default to empty so older configs that
+// only set [prover].mode + [prover].workers continue to load. The
+// downstream wiring in ToProverConfig() applies the prover package's
+// own defaults when fields are blank, and Validate() refuses
+// non-mock backends that lack the binary/ELF paths the host bridge
+// needs to actually run.
+//
+// The Workers field is parsed but currently not propagated to a
+// ParallelProver instance — see the gap note in
+// docs/decisions/spec-review-triage-2026-05.md (Claim 1) for the
+// follow-up that will wire it through.
 type ProverSection struct {
-	Mode    string `toml:"mode"` // "mock", "local", "network"
-	Workers int    `toml:"workers"`
+	// Mode picks the backend the SP1 host uses: "mock" (default;
+	// synthetic proof bytes, no Rust subprocess), "local" (invoke
+	// the host-bridge binary as a subprocess) or "network" (submit
+	// to the SP1 prover network — currently returns an error from
+	// the host until the SDK subscription path lands).
+	Mode string `toml:"mode"`
+	// Workers is the maximum number of concurrent proving operations.
+	// Stored on the section but NOT yet propagated into the runtime
+	// — the single-prover boot path in cmd/bsvm/main.go does not
+	// construct a ParallelProver. Tracked as a follow-up in the
+	// triage doc; setting >1 today is a no-op.
+	Workers int `toml:"workers"`
+	// HostBridgeBinary is the absolute path to the bsvm-host-bridge
+	// Rust binary the local-mode prover invokes as a subprocess.
+	// Empty falls back to the prover package default (currently
+	// empty — the build script's emitted path is consumed by tests
+	// directly). Required for Mode != "mock"; Validate() enforces.
+	HostBridgeBinary string `toml:"host_bridge_binary"`
+	// GuestELFPath is the absolute path to the compiled SP1 guest
+	// ELF the host bridge loads. Empty falls back to the in-tree
+	// path (or the docker-image rebuild per spec 16's Phase 2 logic).
+	// Required for Mode != "mock"; Validate() enforces.
+	GuestELFPath string `toml:"guest_elf_path"`
+	// NetworkURL is the SP1 prover-network endpoint used when
+	// Mode == "network". Empty defers to the SP1 SDK default
+	// (https://rpc.succinct.xyz at the time of writing). Required
+	// for Mode == "network".
+	NetworkURL string `toml:"network_url"`
+	// Timeout caps a single Prove() invocation. Parsed via
+	// time.ParseDuration. Empty leaves the prover package default
+	// (10 minutes) in place. Set to "0s" to disable the timeout
+	// entirely (only useful for offline batch proving).
+	Timeout string `toml:"timeout"`
+	// ProofMode selects the on-chain verification path the produced
+	// proof targets: "fri", "groth16", or "groth16-wa" (legacy
+	// "groth16-generic" / "groth16-witness" aliases also accepted by
+	// the proofmode parser). Empty defaults to "fri" for backward
+	// compatibility with the prover package's DefaultConfig. Mock
+	// mode ignores this field (mock proofs are not on-chain
+	// verifiable); a "groth16" / "groth16-wa" value combined with
+	// Mode == "mock" is rejected by Validate() as contradictory.
+	ProofMode string `toml:"proof_mode"`
+	// SP1ProofMode picks the SP1 proof envelope format the host
+	// bridge produces: "compressed" (default), "core", "groth16",
+	// or "execute" (no STARK — the bridge's execute branch). This is
+	// distinct from ProofMode: SP1ProofMode is the wire-format flag
+	// passed to the Rust subprocess, ProofMode is the on-chain
+	// verification contract. Empty falls back to the prover
+	// package's "compressed" default.
+	SP1ProofMode string `toml:"sp1_proof_mode"`
+}
+
+// validSP1ProofModes lists the SP1 proof envelope formats the host
+// bridge accepts. See pkg/prover/host.go's bridgeInput.Mode handling
+// — "execute" is the no-STARK execute branch, the rest map to SP1's
+// proof types.
+var validSP1ProofModes = map[string]bool{
+	"compressed": true,
+	"core":       true,
+	"groth16":    true,
+	"execute":    true,
+}
+
+// Validate checks the prover section for ill-formed combinations
+// before the node boots. It returns the first problem encountered
+// so the operator's error log doesn't have to be parsed top-down.
+//
+// Rules enforced:
+//   - Mode must be empty / "mock" / "local" / "network" (everything
+//     else falls through to mock today, but we want a loud error
+//     rather than silent fallback for typos like "Local" → already
+//     handled, "lcoal" → caught here).
+//   - Mode "local" requires HostBridgeBinary AND GuestELFPath; both
+//     must point at files that exist on disk.
+//   - Mode "network" requires NetworkURL OR an empty value (the SP1
+//     SDK has its own default endpoint); when set, the URL must be
+//     a parseable absolute URL. We don't try to dial it here — that
+//     would couple config validation to network reachability.
+//   - Mode "mock" combined with a non-FRI ProofMode is contradictory
+//     (mock proofs can't be on-chain verified by Groth16 contracts)
+//     and is rejected.
+//   - ProofMode must parse via proofmode.Parse if non-empty.
+//   - SP1ProofMode must be one of compressed/core/groth16/execute.
+//   - Timeout must parse via time.ParseDuration if non-empty.
+func (p ProverSection) Validate() error {
+	mode := strings.ToLower(strings.TrimSpace(p.Mode))
+	switch mode {
+	case "", "mock", "local", "network":
+		// ok
+	default:
+		return fmt.Errorf("[prover].mode = %q: expected mock, local, or network", p.Mode)
+	}
+
+	if p.Timeout != "" {
+		if _, err := time.ParseDuration(p.Timeout); err != nil {
+			return fmt.Errorf("[prover].timeout = %q: %w", p.Timeout, err)
+		}
+	}
+
+	if p.SP1ProofMode != "" {
+		key := strings.ToLower(strings.TrimSpace(p.SP1ProofMode))
+		if !validSP1ProofModes[key] {
+			return fmt.Errorf("[prover].sp1_proof_mode = %q: expected one of compressed, core, groth16, execute",
+				p.SP1ProofMode)
+		}
+	}
+
+	var parsedProofMode proofmode.ProofMode
+	if p.ProofMode != "" {
+		pm, err := proofmode.Parse(p.ProofMode)
+		if err != nil {
+			return fmt.Errorf("[prover].proof_mode = %q: %w", p.ProofMode, err)
+		}
+		parsedProofMode = pm
+	}
+
+	switch mode {
+	case "local":
+		if p.HostBridgeBinary == "" {
+			return fmt.Errorf("[prover].mode = %q requires [prover].host_bridge_binary to be set", p.Mode)
+		}
+		if p.GuestELFPath == "" {
+			return fmt.Errorf("[prover].mode = %q requires [prover].guest_elf_path to be set", p.Mode)
+		}
+		if _, err := os.Stat(p.HostBridgeBinary); err != nil {
+			return fmt.Errorf("[prover].host_bridge_binary %q: %w", p.HostBridgeBinary, err)
+		}
+		if _, err := os.Stat(p.GuestELFPath); err != nil {
+			return fmt.Errorf("[prover].guest_elf_path %q: %w", p.GuestELFPath, err)
+		}
+	case "network":
+		// The SP1 SDK supplies a default endpoint when NetworkURL is
+		// empty, so we don't insist on a value here. We only sanity-
+		// check format when one is supplied.
+		if p.NetworkURL != "" {
+			if u, err := url.Parse(p.NetworkURL); err != nil || !u.IsAbs() {
+				if err == nil {
+					err = fmt.Errorf("not an absolute URL")
+				}
+				return fmt.Errorf("[prover].network_url = %q: %w", p.NetworkURL, err)
+			}
+		}
+	case "", "mock":
+		// Mock mode never invokes the Rust subprocess; binary / ELF
+		// paths are accepted but not required. The contradictory
+		// combination is mock + Groth16 proof mode (mock proofs can't
+		// satisfy a Groth16 on-chain verifier).
+		if p.ProofMode != "" && parsedProofMode != proofmode.FRI {
+			return fmt.Errorf(
+				"[prover].mode = %q with [prover].proof_mode = %q is contradictory: "+
+					"mock proofs cannot satisfy a Groth16 on-chain verifier; "+
+					"either drop proof_mode or switch to mode = \"local\" / \"network\"",
+				p.Mode, p.ProofMode,
+			)
+		}
+	}
+
+	return nil
 }
 
 // NetworkSection holds P2P networking configuration.
@@ -576,6 +753,15 @@ func LoadNodeConfig(path string) (*NodeConfig, error) {
 	if err := cfg.EVM.ValidateFork(); err != nil {
 		return nil, err
 	}
+	// Validate the [prover] section so an operator who set
+	// mode = "local" without a host_bridge_binary path (or who
+	// combined mock with a Groth16 proof_mode) fails at startup
+	// rather than silently falling back to mock proving — see the
+	// "mainnet blast radius" note in
+	// docs/decisions/spec-review-triage-2026-05.md (Claim 1).
+	if err := cfg.Prover.Validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -629,17 +815,48 @@ func (c *NodeConfig) ToRPCConfig() rpc.RPCConfig {
 }
 
 // ToProverConfig converts the node config's prover section into a
-// prover.Config.
+// prover.Config. Empty TOML fields fall back to the values
+// prover.DefaultConfig() supplies; Validate() (called from
+// LoadNodeConfig) is responsible for rejecting ill-formed
+// combinations before this conversion runs.
 func (c *NodeConfig) ToProverConfig() prover.Config {
 	pc := prover.DefaultConfig()
 
-	switch strings.ToLower(c.Prover.Mode) {
+	switch strings.ToLower(strings.TrimSpace(c.Prover.Mode)) {
 	case "local":
 		pc.Mode = prover.ProverLocal
 	case "network":
 		pc.Mode = prover.ProverNetwork
 	default:
 		pc.Mode = prover.ProverMock
+	}
+
+	if c.Prover.HostBridgeBinary != "" {
+		pc.HostBridgeBinary = c.Prover.HostBridgeBinary
+	}
+	if c.Prover.GuestELFPath != "" {
+		pc.GuestELFPath = c.Prover.GuestELFPath
+	}
+	if c.Prover.NetworkURL != "" {
+		pc.NetworkURL = c.Prover.NetworkURL
+	}
+	if c.Prover.Timeout != "" {
+		// Validate() already proved this parses; ignore the residual
+		// error here so a programmatic caller that bypasses
+		// LoadNodeConfig + Validate still gets the default rather
+		// than a silent zero.
+		if d, err := time.ParseDuration(c.Prover.Timeout); err == nil {
+			pc.Timeout = d
+		}
+	}
+	if c.Prover.ProofMode != "" {
+		// Same rationale: Validate() already accepted this string.
+		if pm, err := proofmode.Parse(c.Prover.ProofMode); err == nil {
+			pc.ProofMode = pm
+		}
+	}
+	if c.Prover.SP1ProofMode != "" {
+		pc.SP1ProofMode = strings.ToLower(strings.TrimSpace(c.Prover.SP1ProofMode))
 	}
 
 	return pc

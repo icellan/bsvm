@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +108,18 @@ func TestLoadNodeConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 
+	// Stub host bridge + guest ELF so [prover].mode = "local" passes
+	// the new on-disk-path validation. The bytes are arbitrary; the
+	// validator only checks os.Stat, not the file contents.
+	hostBridgePath := filepath.Join(dir, "bsvm-host-bridge")
+	if err := os.WriteFile(hostBridgePath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("seed host bridge stub: %v", err)
+	}
+	guestELFPath := filepath.Join(dir, "guest.elf")
+	if err := os.WriteFile(guestELFPath, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatalf("seed guest ELF stub: %v", err)
+	}
+
 	tomlContent := `
 datadir = "/tmp/bsvm-test"
 log_level = "debug"
@@ -128,6 +141,11 @@ cors_origins = ["http://localhost:3000"]
 [prover]
 mode = "local"
 workers = 4
+host_bridge_binary = "` + hostBridgePath + `"
+guest_elf_path = "` + guestELFPath + `"
+proof_mode = "groth16-wa"
+sp1_proof_mode = "groth16"
+timeout = "5m"
 
 [network]
 listen_addr = "/ip4/0.0.0.0/tcp/9000"
@@ -176,6 +194,25 @@ threshold = 2
 	}
 	if loaded.Prover.Mode != "local" {
 		t.Errorf("Prover.Mode = %q, want %q", loaded.Prover.Mode, "local")
+	}
+	if loaded.Prover.HostBridgeBinary != hostBridgePath {
+		t.Errorf("Prover.HostBridgeBinary = %q, want %q",
+			loaded.Prover.HostBridgeBinary, hostBridgePath)
+	}
+	if loaded.Prover.GuestELFPath != guestELFPath {
+		t.Errorf("Prover.GuestELFPath = %q, want %q",
+			loaded.Prover.GuestELFPath, guestELFPath)
+	}
+	if loaded.Prover.ProofMode != "groth16-wa" {
+		t.Errorf("Prover.ProofMode = %q, want %q",
+			loaded.Prover.ProofMode, "groth16-wa")
+	}
+	if loaded.Prover.SP1ProofMode != "groth16" {
+		t.Errorf("Prover.SP1ProofMode = %q, want %q",
+			loaded.Prover.SP1ProofMode, "groth16")
+	}
+	if loaded.Prover.Timeout != "5m" {
+		t.Errorf("Prover.Timeout = %q, want %q", loaded.Prover.Timeout, "5m")
 	}
 	if loaded.Network.MaxPeers != 25 {
 		t.Errorf("Network.MaxPeers = %d, want %d", loaded.Network.MaxPeers, 25)
@@ -356,6 +393,257 @@ func TestNodeConfig_ToProverConfig(t *testing.T) {
 				t.Errorf("Mode = %v, want %v", pc.Mode, tt.want)
 			}
 		})
+	}
+}
+
+// TestNodeConfig_ToProverConfig_Plumbing exercises the new fields
+// introduced for the WW-prover-mode-wiring follow-up: every non-Mode
+// knob must round-trip from TOML into the prover.Config the daemon
+// actually hands to NewSP1Prover.
+func TestNodeConfig_ToProverConfig_Plumbing(t *testing.T) {
+	cfg := DefaultNodeConfig()
+	cfg.Prover.Mode = "local"
+	cfg.Prover.HostBridgeBinary = "/tmp/host-bridge"
+	cfg.Prover.GuestELFPath = "/tmp/guest.elf"
+	cfg.Prover.NetworkURL = "https://prover.example/sp1"
+	cfg.Prover.Timeout = "5m"
+	cfg.Prover.ProofMode = "groth16-wa"
+	cfg.Prover.SP1ProofMode = "groth16"
+
+	pc := cfg.ToProverConfig()
+	if pc.Mode != prover.ProverLocal {
+		t.Errorf("Mode = %v, want ProverLocal", pc.Mode)
+	}
+	if pc.HostBridgeBinary != "/tmp/host-bridge" {
+		t.Errorf("HostBridgeBinary = %q, want %q", pc.HostBridgeBinary, "/tmp/host-bridge")
+	}
+	if pc.GuestELFPath != "/tmp/guest.elf" {
+		t.Errorf("GuestELFPath = %q, want %q", pc.GuestELFPath, "/tmp/guest.elf")
+	}
+	if pc.NetworkURL != "https://prover.example/sp1" {
+		t.Errorf("NetworkURL = %q, want %q", pc.NetworkURL, "https://prover.example/sp1")
+	}
+	if pc.Timeout != 5*time.Minute {
+		t.Errorf("Timeout = %v, want 5m", pc.Timeout)
+	}
+	if pc.ProofMode != prover.ProofModeGroth16WA {
+		t.Errorf("ProofMode = %v, want Groth16WA", pc.ProofMode)
+	}
+	if pc.SP1ProofMode != "groth16" {
+		t.Errorf("SP1ProofMode = %q, want %q", pc.SP1ProofMode, "groth16")
+	}
+}
+
+// TestNodeConfig_ToProverConfig_DefaultsPreserved confirms that
+// blank TOML fields fall through to the prover package defaults
+// rather than zeroing them — older configs that only set
+// [prover].mode + [prover].workers must continue to load with the
+// 10-minute Timeout / "compressed" envelope / FRI ProofMode the
+// prover package supplies.
+func TestNodeConfig_ToProverConfig_DefaultsPreserved(t *testing.T) {
+	cfg := DefaultNodeConfig()
+	cfg.Prover.Mode = "mock"
+
+	pc := cfg.ToProverConfig()
+	def := prover.DefaultConfig()
+	if pc.Timeout != def.Timeout {
+		t.Errorf("Timeout = %v, want default %v", pc.Timeout, def.Timeout)
+	}
+	if pc.SP1ProofMode != def.SP1ProofMode {
+		t.Errorf("SP1ProofMode = %q, want default %q", pc.SP1ProofMode, def.SP1ProofMode)
+	}
+	if pc.ProofMode != def.ProofMode {
+		t.Errorf("ProofMode = %v, want default %v", pc.ProofMode, def.ProofMode)
+	}
+	if pc.HostBridgeBinary != "" {
+		t.Errorf("HostBridgeBinary = %q, want empty (mock mode)", pc.HostBridgeBinary)
+	}
+}
+
+// TestProverSection_Validate covers the ill-formed combinations
+// LoadNodeConfig must reject before the daemon boots.
+func TestProverSection_Validate(t *testing.T) {
+	// Two scratch files used by the local-mode happy-path case.
+	dir := t.TempDir()
+	hostPath := filepath.Join(dir, "host-bridge")
+	elfPath := filepath.Join(dir, "guest.elf")
+	if err := os.WriteFile(hostPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("seed host bridge: %v", err)
+	}
+	if err := os.WriteFile(elfPath, []byte{0x7f, 'E', 'L', 'F'}, 0o644); err != nil {
+		t.Fatalf("seed guest elf: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		section ProverSection
+		wantErr string // empty → expect success
+	}{
+		{
+			name:    "default_mock_ok",
+			section: ProverSection{Mode: "mock"},
+		},
+		{
+			name:    "empty_mode_ok",
+			section: ProverSection{},
+		},
+		{
+			name:    "unknown_mode_rejected",
+			section: ProverSection{Mode: "lcoal"}, // typo
+			wantErr: "expected mock, local, or network",
+		},
+		{
+			name: "local_without_paths_rejected",
+			section: ProverSection{
+				Mode: "local",
+			},
+			wantErr: "host_bridge_binary",
+		},
+		{
+			name: "local_without_elf_rejected",
+			section: ProverSection{
+				Mode:             "local",
+				HostBridgeBinary: hostPath,
+			},
+			wantErr: "guest_elf_path",
+		},
+		{
+			name: "local_missing_binary_on_disk",
+			section: ProverSection{
+				Mode:             "local",
+				HostBridgeBinary: filepath.Join(dir, "does-not-exist"),
+				GuestELFPath:     elfPath,
+			},
+			wantErr: "host_bridge_binary",
+		},
+		{
+			name: "local_happy_path",
+			section: ProverSection{
+				Mode:             "local",
+				HostBridgeBinary: hostPath,
+				GuestELFPath:     elfPath,
+				ProofMode:        "fri",
+				SP1ProofMode:     "compressed",
+				Timeout:          "30s",
+			},
+		},
+		{
+			name: "network_with_url_ok",
+			section: ProverSection{
+				Mode:       "network",
+				NetworkURL: "https://prover.example/sp1",
+			},
+		},
+		{
+			name: "network_without_url_ok",
+			section: ProverSection{
+				Mode: "network",
+			},
+		},
+		{
+			name: "network_with_garbage_url_rejected",
+			section: ProverSection{
+				Mode:       "network",
+				NetworkURL: "not a url",
+			},
+			wantErr: "network_url",
+		},
+		{
+			name: "mock_with_groth16_rejected",
+			section: ProverSection{
+				Mode:      "mock",
+				ProofMode: "groth16",
+			},
+			wantErr: "contradictory",
+		},
+		{
+			name: "mock_with_groth16_wa_rejected",
+			section: ProverSection{
+				Mode:      "mock",
+				ProofMode: "groth16-wa",
+			},
+			wantErr: "contradictory",
+		},
+		{
+			name: "mock_with_fri_ok",
+			section: ProverSection{
+				Mode:      "mock",
+				ProofMode: "fri",
+			},
+		},
+		{
+			name: "bad_proof_mode_rejected",
+			section: ProverSection{
+				Mode:      "mock",
+				ProofMode: "plonk",
+			},
+			wantErr: "proof_mode",
+		},
+		{
+			name: "bad_sp1_proof_mode_rejected",
+			section: ProverSection{
+				Mode:         "mock",
+				SP1ProofMode: "starky",
+			},
+			wantErr: "sp1_proof_mode",
+		},
+		{
+			name: "bad_timeout_rejected",
+			section: ProverSection{
+				Mode:    "mock",
+				Timeout: "five minutes",
+			},
+			wantErr: "timeout",
+		},
+		{
+			name: "legacy_groth16_witness_alias_ok_with_local",
+			section: ProverSection{
+				Mode:             "local",
+				HostBridgeBinary: hostPath,
+				GuestELFPath:     elfPath,
+				ProofMode:        "groth16-witness", // legacy alias for groth16-wa
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.section.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadNodeConfig_RejectsBadProverSection confirms that
+// LoadNodeConfig surfaces ProverSection.Validate errors so an
+// operator who fat-fingers their TOML doesn't silently boot a
+// degraded prover.
+func TestLoadNodeConfig_RejectsBadProverSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.toml")
+	body := `
+[prover]
+mode = "mock"
+proof_mode = "groth16"
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadNodeConfig(path); err == nil {
+		t.Fatalf("LoadNodeConfig accepted mock + groth16, want rejection")
+	} else if !strings.Contains(err.Error(), "contradictory") {
+		t.Fatalf("LoadNodeConfig err = %v, want 'contradictory'", err)
 	}
 }
 

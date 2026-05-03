@@ -85,7 +85,41 @@ validation that refuses `Mode=ProverLocal` without
 `HostBridgeBinary` + `GuestELFPath` set would catch this loudly.
 
 **Recommended path**:
-- [ ] Open a tracked TODO with named hook `WW-prover-mode-wiring`
+- [x] **DONE** (2026-05-03): TOML key list agreed and shipped on
+      `ProverSection` in `cmd/bsvm/config.go`:
+      - `[prover].host_bridge_binary` (string, required when mode=local)
+      - `[prover].guest_elf_path` (string, required when mode=local)
+      - `[prover].network_url` (string, optional when mode=network —
+        empty defers to the SP1 SDK default endpoint)
+      - `[prover].timeout` (duration string; empty inherits the prover
+        package's 10-minute default)
+      - `[prover].sp1_proof_mode` (string: "compressed" / "core" /
+        "groth16" / "execute")
+      - `[prover].proof_mode` (string: "fri" / "groth16" / "groth16-wa";
+        legacy "groth16-generic" / "groth16-witness" aliases accepted)
+      - `[prover].workers` — STILL UNWIRED, see TODO below
+      Each new field is round-tripped to `prover.Config` by
+      `ToProverConfig` and exercised by
+      `TestNodeConfig_ToProverConfig_Plumbing` /
+      `TestNodeConfig_ToProverConfig_DefaultsPreserved` in
+      `cmd/bsvm/config_test.go`. The example TOML
+      (`cmd/bsvm/bsvm.example.toml`) documents every knob inline.
+- [x] **DONE** (2026-05-03): Startup-time validation lives in
+      `ProverSection.Validate()` and is invoked from `LoadNodeConfig`.
+      It rejects:
+      - unknown mode strings (typos like "lcoal" no longer fall
+        through silently to mock),
+      - `mode = "local"` without `host_bridge_binary` /
+        `guest_elf_path` set, or with paths that don't exist on disk,
+      - `mode = "network"` with a malformed `network_url`,
+      - `mode = "mock"` combined with a Groth16 `proof_mode` (mock
+        proofs cannot satisfy a Groth16 on-chain verifier — this is
+        the contradiction guard the "mainnet blast radius" note
+        called out),
+      - unparseable `timeout` strings,
+      - unrecognised `proof_mode` / `sp1_proof_mode` values.
+      Coverage is in `TestProverSection_Validate` (17 sub-tests) plus
+      `TestLoadNodeConfig_RejectsBadProverSection`.
 - [x] Push back partially: the spec defines the *shape* of
       `SP1ProverConfig` but does not pin which TOML keys must exist.
       Before implementation, agree on:
@@ -96,10 +130,23 @@ validation that refuses `Mode=ProverLocal` without
       - `[prover].sp1_proof_mode` (string: "compressed" / "core" / "groth16")
       - `[prover].proof_mode` (string: "fri" / "groth16" / "groth16-wa")
       - `[prover].workers` (already exists in struct, unused) — propagate
-- [ ] Add startup-time validation that `Mode != ProverMock` requires
-      the `host_bridge_binary` + `guest_elf_path` to exist on disk.
-- [ ] Add an `execute` proving sub-mode to the host bridge (separate
-      from `local` / `network`) — see `pkg/prover/host.go:199-203`.
+- [ ] **TODO (`WW-prover-mode-wiring-workers`)**: propagate
+      `[prover].workers` into a `prover.NewParallelProver(...)`
+      construction in `cmd/bsvm/main.go`. The single-prover boot path
+      currently calls `prover.NewSP1Prover(proverCfg)` directly and
+      never builds a `ParallelProver`, so the TOML knob is parsed but
+      not consumed. The `ParallelProver` type already exists at
+      `pkg/prover/parallel.go:91`; this is purely a wiring change in
+      `main.go` plus a callsite update on whoever currently invokes
+      `Prove(...)` against the bare `*SP1Prover`.
+- [ ] **TODO (`WW-prover-mode-wiring-execute`)**: add an `execute`
+      proving sub-mode to the host bridge (separate from `local` /
+      `network`) — see `pkg/prover/host.go:199-203`. Today
+      `[prover].sp1_proof_mode = "execute"` is accepted by the config
+      validator and reaches `bridgeInput.Mode`, but the prover's
+      `Mode` switch only branches on local/network/mock. Spec 16's
+      `execute` devnet preset will not actually exercise revm-in-SP1
+      until this branch lands.
 
 **Notes for the operator**: Today the only way an operator can
 actually use a non-mock prover is to construct a `prover.Config` in
