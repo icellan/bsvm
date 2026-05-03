@@ -1,8 +1,16 @@
 package covenant
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -242,6 +250,134 @@ func TestBuildUpgradeUnlockScript_RejectsMalformedRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHostBridgeUpgradeProof_MatchesGoEncoder is the Rust-vs-Go
+// cross-check for the spec-12 upgrade publicValues blob. The Rust
+// `bsvm-host-bridge mode=upgrade-proof` and the Go
+// `EncodeUpgradePublicValues` MUST produce byte-identical
+// publicValues for the same inputs, otherwise rotations assembled by
+// host-bridge get rejected by the on-chain Substr offsets in
+// rollup_fri.runar.go's Upgrade* methods.
+//
+// The test is opportunistic: if the host-bridge binary hasn't been
+// built (e.g., a pure-Go CI run with no Rust toolchain), the test
+// skips. Set BSVM_HOST_BRIDGE_BIN to a custom binary path to override
+// the default lookup at prover/host-bridge/target/release/bsvm-host-bridge.
+func TestHostBridgeUpgradeProof_MatchesGoEncoder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping host-bridge cross-check in short mode")
+	}
+	bin := locateHostBridge(t)
+	if bin == "" {
+		t.Skip("bsvm-host-bridge binary not built; run `cargo build --release --locked` " +
+			"in prover/host-bridge to enable this cross-check")
+	}
+
+	// Pick an arbitrary but deterministic rotation fixture.
+	var preState [32]byte
+	for i := range preState {
+		preState[i] = byte(i + 1)
+	}
+	newScript := []byte{0x76, 0xa9, 0x14, 0xde, 0xad, 0xbe, 0xef}
+	const (
+		blockNumber uint64 = 12_847
+		chainID     uint64 = 8_453_111
+	)
+
+	stdinJSON := fmt.Sprintf(`{
+		"mode": "upgrade-proof",
+		"pre_state_root": "%s",
+		"new_covenant_script_hex": "%s",
+		"block_number": %d,
+		"chain_id": %d
+	}`,
+		hex.EncodeToString(preState[:]),
+		hex.EncodeToString(newScript),
+		blockNumber, chainID)
+
+	cmd := exec.Command(bin)
+	cmd.Stdin = strings.NewReader(stdinJSON)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("host-bridge invocation failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	var bundle struct {
+		PublicValuesHex string `json:"publicValuesHex"`
+		BatchDataHex    string `json:"batchDataHex"`
+		ProofBlobHex    string `json:"proofBlobHex"`
+		Error           string `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &bundle); err != nil {
+		t.Fatalf("parse host-bridge stdout: %v\nstdout: %s", err, stdout.String())
+	}
+	if bundle.Error != "" {
+		t.Fatalf("host-bridge reported error: %s", bundle.Error)
+	}
+
+	gotPV, err := hex.DecodeString(strings.TrimPrefix(bundle.PublicValuesHex, "0x"))
+	if err != nil {
+		t.Fatalf("decode publicValuesHex: %v", err)
+	}
+	gotBatch, err := hex.DecodeString(strings.TrimPrefix(bundle.BatchDataHex, "0x"))
+	if err != nil {
+		t.Fatalf("decode batchDataHex: %v", err)
+	}
+	gotProof, err := hex.DecodeString(strings.TrimPrefix(bundle.ProofBlobHex, "0x"))
+	if err != nil {
+		t.Fatalf("decode proofBlobHex: %v", err)
+	}
+
+	if len(gotPV) != 280 {
+		t.Fatalf("publicValues must be 280 bytes, got %d", len(gotPV))
+	}
+
+	// The Go-side encoder MUST produce identical publicValues bytes
+	// when fed the same batch + proof + script + block + chain.
+	wantPV := EncodeUpgradePublicValues(
+		preState, preState,
+		gotBatch, gotProof, newScript,
+		chainID, blockNumber+1,
+	)
+	if !bytesEqual(gotPV, wantPV) {
+		t.Fatalf("publicValues drift between Rust host-bridge and Go EncodeUpgradePublicValues:\n"+
+			"  rust = %s\n  go   = %s", hex.EncodeToString(gotPV), hex.EncodeToString(wantPV))
+	}
+}
+
+// locateHostBridge resolves the bsvm-host-bridge binary path. Honours
+// the BSVM_HOST_BRIDGE_BIN env override; otherwise probes the
+// in-repo release-build path. Returns "" when nothing is found so the
+// caller can `t.Skip`.
+func locateHostBridge(t *testing.T) string {
+	t.Helper()
+	if env := os.Getenv("BSVM_HOST_BRIDGE_BIN"); env != "" {
+		return env
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	// Walk up from the package dir to the repo root by looking for go.mod.
+	dir := wd
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			cand := filepath.Join(dir, "prover", "host-bridge", "target", "release", "bsvm-host-bridge")
+			if _, err := os.Stat(cand); err == nil {
+				return cand
+			}
+			return ""
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
 }
 
 // dh256 is sha256(sha256(b)) inlined for the test so it doesn't depend

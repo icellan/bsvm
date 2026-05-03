@@ -94,26 +94,57 @@ You will need:
    (preStateRoot → preStateRoot, blockNumber+1, new covenant script
    bound).
 
-   **TODO(WW-upgrade-proof-bridge)**: `bsvm-host-bridge` exposes
-   `mode = "execute"|"core"|"compressed"|"groth16"` (per
-   `prover/host-bridge/src/main.rs::129`) but does not yet have an
-   `upgrade-proof` mode that takes `pre_state_root +
-   new_covenant_script + block_number` and produces the JSON shape
-   `RotateVKConfig.proofBundlePath` consumes. As a workaround:
+   `bsvm-host-bridge` exposes `mode = "upgrade-proof"` for this. It
+   takes the rotation inputs on stdin and emits the JSON shape
+   `RotateVKConfig.proofBundlePath` consumes directly:
 
-   * For testnet/staging rotations, use the synthetic stand-in
-     (`proofBundlePath` empty in the config). `rotate-vk` will fall
-     back to `covenant.SyntheticUpgradeProofBundle` (per
-     `rotate-vk.go::resolveProofBundle`); the on-chain SP1 verifier
-     rejects this proof, so the broadcast tx will fail in
-     `verifyScript` — useful only for assembly testing.
-   * For real rotations, build and prove the upgrade-input
-     manually: write a small Rust binary that imports the same
-     `bsvm-guest` ELF, populates the upgrade transition's
-     `BatchInput`, calls `prover.prove(&pk, stdin)` from
-     `sp1-sdk`, and writes the JSON shape rotate-vk reads. The
-     integration test `rotate_vk_test.go` shows the required JSON
-     shape.
+   ```bash
+   cat <<EOF | ./prover/host-bridge/target/release/bsvm-host-bridge \
+     > rotation-upgrade-proof.json
+   {
+     "mode": "upgrade-proof",
+     "pre_state_root":         "$CURRENT_STATE_ROOT_HEX",
+     "new_covenant_script_hex": "$NEW_ROLLUP_SCRIPT_HEX",
+     "block_number":           $CURRENT_BLOCK_NUMBER,
+     "chain_id":               $CHAIN_ID
+   }
+   EOF
+   ```
+
+   Where:
+
+   * `$CURRENT_STATE_ROOT_HEX` is the live covenant's `StateRoot`
+     readonly (32 bytes hex, with or without `0x` prefix).
+   * `$NEW_ROLLUP_SCRIPT_HEX` is the dry-run summary's
+     `newRollupScriptHex` (the rebuilt rollup locking script bytes).
+   * `$CURRENT_BLOCK_NUMBER` is the live covenant's `BlockNumber`
+     readonly (the upgrade tx advances this to `+1`).
+   * `$CHAIN_ID` is the EIP-155 chain id from the OperatorConfig.
+
+   The output JSON has fields `publicValuesHex` (always 280 bytes per
+   spec 12), `batchDataHex`, `proofBlobHex`, `vkHash`, `real_proof`,
+   and `note`. Wire it into the rotation config as
+   `proofBundlePath: "rotation-upgrade-proof.json"`.
+
+   > **Synthetic-proof caveat**: the bundle that `mode=upgrade-proof`
+   > emits today is **shape-correct but not cryptographically valid**
+   > (`real_proof: false`). The on-chain `runar.VerifySP1FRI`
+   > assertion in the `Upgrade*` methods rejects it. This is useful
+   > for assembly + multisig partial-sig coordination + dry-run
+   > broadcast against a testnet ARC instance, BUT a real mainnet
+   > rotation requires a real STARK proof. Generating a real proof
+   > requires a guest entry point that commits the spec-12 upgrade
+   > publicValues layout — that entry point doesn't exist yet (the
+   > production `prover/guest/src/main.rs::main` commits a different
+   > layout: receiptsHash at pv[64..96), withdrawalRoot at
+   > pv[144..176), migrateScriptHash hard-coded to zeros, and
+   > big-endian chainId/blockNumber instead of little-endian).
+   > Adding it would rotate the SP1 verifying key (the very thing
+   > this runbook coordinates), so the migration path is:
+   > (1) ship the guest entry point in a regular SP1 build cycle
+   > (which itself requires a VK rotation against the synthetic
+   > stand-in path on testnet), then (2) point this command at the
+   > new entry point. Tracked alongside `WW-upgrade-proof-real-stark`.
 
 5. **Governance signatures.** What you need depends on the shard's
    governance mode:
@@ -391,11 +422,16 @@ The cross-cutting helper gaps surfaced above:
   `pkg/covenant.DecodeCovenantState`) plus a
   `getrawtransaction verbose=1` round-trip for the live UTXO's
   script + sats. See `cmd/bsvm/covenant.go`.
-* **`bsvm-host-bridge --mode upgrade-proof`** — produces the
-  upgrade-input proof bundle (`publicValuesHex`, `batchDataHex`,
-  `proofBlobHex`) given `pre_state_root`, `new_covenant_script`,
-  `block_number`. Eliminates the "write a one-off Rust binary" step
-  in §1.
+* ~~**`bsvm-host-bridge --mode upgrade-proof`**~~ — **shipped
+  (synthetic-proof phase).** Produces the upgrade-input proof bundle
+  (`publicValuesHex`, `batchDataHex`, `proofBlobHex`, `vkHash`)
+  given `pre_state_root`, `new_covenant_script_hex`, `block_number`,
+  `chain_id` on stdin. Today the bundle is shape-correct but the
+  STARK proof bytes are synthetic (`real_proof: false`); the
+  follow-up `WW-upgrade-proof-real-stark` work adds a guest entry
+  point that commits the spec-12 upgrade publicValues layout so the
+  on-chain `VerifySP1FRI` accepts the proof. See
+  `prover/host-bridge/src/main.rs::run_upgrade_proof`.
 * **`bsvm dev sign-rotation`** — signs the upgrade tx's input-0
   sighash with the supplied governance WIF. Either standalone or
   takes the `rotate-vk.partial.json` and emits the signature hex.

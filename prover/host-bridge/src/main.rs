@@ -4,12 +4,14 @@
 //! 1. Reads JSON input on stdin (from the Go host)
 //! 2. Converts the input to SP1Stdin
 //! 3. Invokes the SP1 prover (execute, core, compressed, or groth16)
+//!    OR builds a spec-12 upgrade-transition proof bundle for VK rotations.
 //! 4. Returns JSON output on stdout (proof + public values)
 //!
 //! The Go host calls this binary via exec.Command and communicates
 //! via stdin/stdout JSON.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sp1_sdk::{
     include_elf, Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Stdin,
 };
@@ -22,12 +24,21 @@ const GUEST_ELF: Elf = include_elf!("bsvm-guest");
 // ─── Input types (JSON from Go host) ─────────────────────────────────────────
 
 /// Block context for EVM execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Default values are zeros / empty so the upgrade-proof mode (which
+/// has no execution context) can omit the field entirely from its
+/// stdin envelope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BlockContext {
+    #[serde(default)]
     number: u64,
+    #[serde(default)]
     timestamp: u64,
+    #[serde(default)]
     coinbase: String,
+    #[serde(default)]
     gas_limit: u64,
+    #[serde(default)]
     base_fee: u64,
     #[serde(default)]
     prev_randao: String,
@@ -100,11 +111,30 @@ struct InboxQueuedTxExport {
 }
 
 /// Complete input from the Go host.
+///
+/// The `mode` field selects the dispatch path. Most fields are only
+/// consumed by the EVM-execution modes (`execute` / `core` /
+/// `compressed`); the `upgrade-proof` mode reads only `pre_state_root`,
+/// `chain_id`, `block_number`, and `new_covenant_script_hex`. The
+/// EVM-execution modes leave `chain_id` / `block_number` /
+/// `new_covenant_script_hex` unset; the upgrade mode leaves
+/// `accounts` / `transactions` / `inbox_*` empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostInput {
     pre_state_root: String,
+    /// EVM accounts. Required for execute/core/compressed; ignored by
+    /// upgrade-proof. Defaults to empty so an upgrade-mode JSON
+    /// envelope doesn't have to carry the field.
+    #[serde(default)]
     accounts: Vec<AccountExport>,
+    /// EVM transactions. Required for execute/core/compressed; ignored
+    /// by upgrade-proof.
+    #[serde(default)]
     transactions: Vec<TransactionExport>,
+    /// Block context. Required for execute/core/compressed; ignored by
+    /// upgrade-proof (which derives blockNumber from the dedicated
+    /// `block_number` field).
+    #[serde(default)]
     block_context: BlockContext,
     /// Inbox queue hash before draining (hex, optional — defaults to zeros).
     #[serde(default)]
@@ -126,8 +156,29 @@ struct HostInput {
     /// the carry-forward remainder is non-empty.
     #[serde(default)]
     inbox_must_drain_all: bool,
-    /// Proving mode: "execute" (no proof), "core", "compressed", or "groth16".
+    /// Proving mode: "execute" (no proof), "core", "compressed", or
+    /// "upgrade-proof" (covenant VK rotation).
     mode: String,
+
+    // ── upgrade-proof mode inputs (ignored by other modes) ───────────────
+
+    /// Hex-encoded new covenant locking-script bytes. Required for
+    /// `upgrade-proof`; the script's hash256 is committed at
+    /// pv[240..272) so the on-chain `Upgrade*` method can verify the
+    /// rotation target.
+    #[serde(default)]
+    new_covenant_script_hex: String,
+    /// Pre-upgrade covenant `BlockNumber` readonly value. The upgrade
+    /// transition advances this to `block_number + 1`, encoded
+    /// little-endian into pv[272..280) so the on-chain assertion
+    /// `pvBlockNumber == Num2Bin(c.BlockNumber+1, 8)` passes.
+    #[serde(default)]
+    block_number: u64,
+    /// EIP-155 chain id, copied little-endian into pv[136..144). MUST
+    /// match the live covenant's `ChainId` readonly. Required for
+    /// `upgrade-proof`.
+    #[serde(default)]
+    chain_id: u64,
 }
 
 // ─── Guest-compatible types (must match guest's serde deserialization) ────────
@@ -454,6 +505,19 @@ async fn main() {
         }
     };
 
+    // ── upgrade-proof: dispatch BEFORE the EVM conversion ────────────────
+    //
+    // The upgrade transition is a no-op from the EVM's perspective
+    // (preStateRoot == postStateRoot, no transactions, no state
+    // touched), so the EVM-batch conversion + W4-1 witness checks do
+    // not apply. We assemble the spec-12 publicValues blob directly
+    // from the rotation inputs and emit it in the rotate-vk JSON shape
+    // (publicValuesHex / batchDataHex / proofBlobHex).
+    if host_input.mode == "upgrade-proof" {
+        run_upgrade_proof(&host_input).await;
+        return;
+    }
+
     // Convert to guest-compatible format. Rejects envelopes lacking the
     // W4-1 / Gate-0 Merkle witnesses (mainnet hardening) — the previous
     // legacy host-trusted fallback has been removed from the guest.
@@ -598,11 +662,418 @@ async fn main() {
                 proving_time_ms: 0,
                 sp1_version: String::new(),
                 error: Some(format!(
-                    "unsupported proving mode: '{}' (use 'execute', 'core', or 'compressed')",
+                    "unsupported proving mode: '{}' (use 'execute', 'core', 'compressed', or 'upgrade-proof')",
                     other
                 )),
             };
             println!("{}", serde_json::to_string(&output).unwrap());
         }
+    }
+}
+
+// ─── upgrade-proof mode ──────────────────────────────────────────────────────
+
+/// Output shape for `mode = "upgrade-proof"`. Field names match
+/// `RotateVKConfig.proofBundlePath`'s on-disk JSON shape (see
+/// `deploy/covenant/rotate-vk.go::proofBundle`) so the operator can
+/// pipe this directly into the rotation config without re-shaping.
+#[derive(Debug, Serialize)]
+struct UpgradeProofBundle {
+    /// Hex-encoded 280-byte spec-12 publicValues blob with the upgrade
+    /// layout (preStateRoot, postStateRoot=preStateRoot, batchDataHash,
+    /// chainId LE, migrationHash = hash256(newCovenantScript),
+    /// blockNumber LE).
+    #[serde(rename = "publicValuesHex")]
+    public_values_hex: String,
+    /// Hex-encoded canonical batch-data blob the proof commits to.
+    #[serde(rename = "batchDataHex")]
+    batch_data_hex: String,
+    /// Hex-encoded SP1 STARK proof bytes. The on-chain `VerifySP1FRI`
+    /// replays the FRI argument against this blob + publicValues +
+    /// pinned VK hash.
+    #[serde(rename = "proofBlobHex")]
+    proof_blob_hex: String,
+    /// Hex-encoded `SP1VerifyingKeyHash` the proof was generated
+    /// against. The on-chain covenant pins this in its
+    /// `SP1VerifyingKeyHash` readonly slot; a mismatch means the
+    /// rotation targets a covenant compiled against a different VK.
+    #[serde(rename = "vkHash")]
+    vk_hash: String,
+    /// True when the proof bytes are a real SP1 STARK; false when the
+    /// host-bridge fell back to the spec-shape-correct synthetic stand-
+    /// in. Synthetic bundles fail `runar.VerifySP1FRI` on-chain — they
+    /// are useful for assembly-and-signing dry runs only.
+    real_proof: bool,
+    /// Human-readable provenance note. Surfaced to the operator so a
+    /// synthetic bundle is impossible to mistake for a real one.
+    note: String,
+    /// Any error message; absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Build the upgrade-transition proof bundle and emit it on stdout in
+/// `RotateVKConfig.proofBundlePath`'s expected JSON shape.
+///
+/// The publicValues layout MUST match `pkg/covenant.EncodeUpgradePublicValues`
+/// (Go) byte-for-byte. The on-chain `Upgrade*` methods assert specific
+/// slot bindings (preStateRoot, postStateRoot, batchDataHash,
+/// chainIdBytes, migrationHash, blockNumber); a drift in any of those
+/// causes the rotation tx to be rejected by `verifyScript`.
+///
+/// Production note: today this routine emits a SHAPE-CORRECT synthetic
+/// proof bundle, not a real STARK. Generating a real proof for the
+/// upgrade transition requires a guest-side entry point that commits
+/// the upgrade publicValues layout (the production
+/// `prover/guest/src/main.rs::main` commits a different layout —
+/// receiptsHash/withdrawalRoot/migrateScriptHash=zero/big-endian
+/// chainId+blockNumber — that the on-chain Upgrade verifier would
+/// reject). Adding that guest entry point would rotate the
+/// SP1VerifyingKeyHash and require a docker rebuild of the in-tree
+/// pinned ELF (~4 min on Apple Silicon), so we ship the synthetic
+/// path now and document the gap in `docs/operator/vk-rotation.md`.
+/// Mode 1 production rotations MUST swap the synthetic blob for a
+/// real STARK once the guest upgrade entry point lands.
+async fn run_upgrade_proof(input: &HostInput) {
+    // ── 1. Parse and validate the rotation inputs ────────────────────────
+    let pre_state_root = match decode_required_32(&input.pre_state_root, "pre_state_root") {
+        Ok(b) => b,
+        Err(e) => {
+            return emit_upgrade_error(e);
+        }
+    };
+    if input.new_covenant_script_hex.is_empty() {
+        return emit_upgrade_error(
+            "upgrade-proof: new_covenant_script_hex is required (rotation target)".into(),
+        );
+    }
+    let new_script = match hex::decode(strip_0x(&input.new_covenant_script_hex)) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            return emit_upgrade_error(
+                "upgrade-proof: new_covenant_script_hex decoded to empty bytes".into(),
+            );
+        }
+        Err(e) => {
+            return emit_upgrade_error(format!(
+                "upgrade-proof: new_covenant_script_hex is not valid hex: {}",
+                e
+            ));
+        }
+    };
+    if input.chain_id == 0 {
+        return emit_upgrade_error(
+            "upgrade-proof: chain_id is required (must match the live covenant ChainId)".into(),
+        );
+    }
+
+    // ── 2. Build the synthetic batch + proof blobs ───────────────────────
+    //
+    // The upgrade transition has no transactions to execute, so the
+    // batchData is purely a binding artifact: the on-chain assertion
+    // is `pv[104..136) == hash256(batchData)`, which we satisfy by
+    // generating a deterministic blob from `new_covenant_script ||
+    // pre_state_root || block_number`. Any non-empty bytes work for
+    // the on-chain check; we want determinism so two operators
+    // independently rebuilding the same rotation produce identical
+    // bundles (audit-friendliness).
+    let batch_data = synthetic_blob(
+        b"bsvm-upgrade-batch",
+        &new_script,
+        &pre_state_root,
+        input.block_number,
+        input.chain_id,
+        // Sized to mirror SyntheticUpgradeProofBundle's batch size
+        // (deploy/covenant rotate-vk.go uses 20_000 bytes).
+        20_000,
+    );
+    let proof_blob = synthetic_blob(
+        b"bsvm-upgrade-proof",
+        &new_script,
+        &pre_state_root,
+        input.block_number,
+        input.chain_id,
+        // Mirrors SyntheticUpgradeProofBundle's proof size
+        // (165_000 = ~165 KB matches contracts/rollup_fri_test.go's
+        // testProofBlobSize used by the on-chain integration tests).
+        165_000,
+    );
+
+    // ── 3. Encode the spec-12 publicValues blob ──────────────────────────
+    //
+    // MUST match pkg/covenant/upgrade.go::EncodeUpgradePublicValues
+    // byte-for-byte. The new block number is `block_number + 1`
+    // (the upgrade tx advances the covenant by exactly one block).
+    let public_values = encode_upgrade_public_values(
+        &pre_state_root,
+        &pre_state_root, // postStateRoot == preStateRoot for a no-op upgrade
+        &batch_data,
+        &proof_blob,
+        &new_script,
+        input.chain_id,
+        input.block_number.saturating_add(1),
+    );
+
+    // ── 4. Resolve the VK hash from the in-tree pinned ELF ───────────────
+    //
+    // Reuses the outer #[tokio::main] runtime so we don't spawn a
+    // nested one. setup() is fast for VK extraction (no proving), but
+    // ProverClient construction itself is heavy (~seconds): operators
+    // who only need the publicValues / batchData / proofBlob bytes can
+    // ignore the vkHash field — it's emitted as a convenience for
+    // double-checking the rotation targets the pinned VK.
+    let vk_hash = resolve_vk_hash().await;
+
+    // ── 5. Emit the rotate-vk-shaped JSON bundle ─────────────────────────
+    let bundle = UpgradeProofBundle {
+        public_values_hex: format!("0x{}", hex::encode(&public_values)),
+        batch_data_hex: format!("0x{}", hex::encode(&batch_data)),
+        proof_blob_hex: format!("0x{}", hex::encode(&proof_blob)),
+        vk_hash,
+        real_proof: false,
+        note: "synthetic upgrade-proof bundle (shape-correct, NOT cryptographically valid). \
+               The on-chain SP1 verifier WILL reject this proof. Use this for partial-sig \
+               assembly + dry-run only; mainnet rotations require a real STARK proof, which \
+               in turn requires a guest entry point that commits the spec-12 upgrade \
+               publicValues layout (currently missing — see docs/operator/vk-rotation.md \
+               §1 TODO(WW-upgrade-proof-bridge))."
+            .into(),
+        error: None,
+    };
+    println!("{}", serde_json::to_string(&bundle).unwrap());
+}
+
+/// Resolve the in-tree pinned `SP1VerifyingKeyHash` via the SP1 SDK's
+/// setup path. Returns the 0x-prefixed 32-byte hash that matches the
+/// `prover/guest/elf/SP1VerifyingKeyHash.txt` pin. On any SDK failure
+/// we emit an empty string rather than aborting — the upgrade-proof
+/// caller cares primarily about the publicValues / batchData /
+/// proofBlob bytes; the vkHash field is a convenience double-check.
+async fn resolve_vk_hash() -> String {
+    let client = ProverClient::builder().cpu().build().await;
+    match client.setup(GUEST_ELF.clone()).await {
+        Ok(pk) => pk.verifying_key().bytes32().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Mirror of `pkg/covenant.EncodeUpgradePublicValues` in Rust. MUST
+/// stay byte-for-byte identical with the Go side; the on-chain
+/// `Upgrade*` methods assert specific Substr offsets against this blob.
+///
+/// Layout (matches the Substr offsets in
+/// `pkg/covenant/contracts/rollup_fri.runar.go::UpgradeSingleKey` etc.):
+///
+///   [  0..32 )   preStateRoot
+///   [ 32..64 )   postStateRoot
+///   [ 64..96 )   hash256(proofBlob)            [reserved, on-chain unchecked]
+///   [ 96..104)   8 zero bytes                  [reserved]
+///   [104..136)   hash256(batchData)
+///   [136..144)   chainId little-endian (8 bytes)
+///   [144..240)   96 zero bytes                 [reserved]
+///   [240..272)   hash256(newCovenantScript)
+///   [272..280)   newBlockNumber little-endian (8 bytes)
+fn encode_upgrade_public_values(
+    pre_state_root: &[u8; 32],
+    post_state_root: &[u8; 32],
+    batch_data: &[u8],
+    proof_blob: &[u8],
+    new_covenant_script: &[u8],
+    chain_id: u64,
+    new_block_number: u64,
+) -> [u8; 280] {
+    let mut out = [0u8; 280];
+    out[0..32].copy_from_slice(pre_state_root);
+    out[32..64].copy_from_slice(post_state_root);
+
+    let proof_hash = hash256(proof_blob);
+    out[64..96].copy_from_slice(&proof_hash);
+    // out[96..104] left as zeros.
+
+    let batch_data_hash = hash256(batch_data);
+    out[104..136].copy_from_slice(&batch_data_hash);
+
+    out[136..144].copy_from_slice(&chain_id.to_le_bytes());
+    // out[144..240] left as zeros.
+
+    let mig_hash = hash256(new_covenant_script);
+    out[240..272].copy_from_slice(&mig_hash);
+
+    out[272..280].copy_from_slice(&new_block_number.to_le_bytes());
+    out
+}
+
+/// Compute hash256 (BSV double-SHA256) of the input.
+fn hash256(b: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(b);
+    let second = Sha256::digest(first);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&second);
+    out
+}
+
+/// Build a deterministic byte blob seeded by the rotation inputs.
+/// Two operators rebuilding the same rotation get identical bytes,
+/// which makes diffing partial-sig bundles trivial (per spec-12 the
+/// rotation transition is fully determined by these inputs — there
+/// is no nondeterminism in a no-op state advance).
+fn synthetic_blob(
+    tag: &[u8],
+    new_script: &[u8],
+    pre_state_root: &[u8; 32],
+    block_number: u64,
+    chain_id: u64,
+    size: usize,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(tag);
+    hasher.update(new_script);
+    hasher.update(pre_state_root);
+    hasher.update(block_number.to_le_bytes());
+    hasher.update(chain_id.to_le_bytes());
+    let mut seed: [u8; 32] = hasher.finalize().into();
+
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
+        let take = (size - out.len()).min(32);
+        out.extend_from_slice(&seed[..take]);
+        seed = Sha256::digest(seed).into();
+    }
+    out
+}
+
+/// Strip an optional `0x` prefix from a hex string.
+fn strip_0x(s: &str) -> &str {
+    s.strip_prefix("0x").unwrap_or(s)
+}
+
+/// Decode a required hex string as exactly 32 bytes. Returns a
+/// human-readable error pinpointing the field name on failure.
+fn decode_required_32(s: &str, field: &str) -> Result<[u8; 32], String> {
+    if s.is_empty() {
+        return Err(format!("upgrade-proof: {} is required", field));
+    }
+    let bytes = hex::decode(strip_0x(s))
+        .map_err(|e| format!("upgrade-proof: {} is not valid hex: {}", field, e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "upgrade-proof: {} must decode to 32 bytes, got {}",
+            field,
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Emit an upgrade-proof error in the same JSON shape so the Go-side
+/// caller can parse a single envelope regardless of success / failure.
+fn emit_upgrade_error(msg: String) {
+    let bundle = UpgradeProofBundle {
+        public_values_hex: String::new(),
+        batch_data_hex: String::new(),
+        proof_blob_hex: String::new(),
+        vk_hash: String::new(),
+        real_proof: false,
+        note: String::new(),
+        error: Some(msg),
+    };
+    println!("{}", serde_json::to_string(&bundle).unwrap());
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Rust `encode_upgrade_public_values` MUST stay byte-for-byte
+    /// identical to `pkg/covenant.EncodeUpgradePublicValues`. We can't
+    /// import the Go function here, so we hand-pin the layout invariants
+    /// against the SAME inputs the Go test
+    /// (`pkg/covenant.TestEncodeUpgradePublicValues_ShapeAndBindings`)
+    /// uses. A future drift in either encoder will surface as a
+    /// mismatch between this test's golden assertions and the Go test's
+    /// — and either way breaks the on-chain Upgrade method's Substr
+    /// offsets, which is the only thing keeping VK rotations working.
+    #[test]
+    fn encode_upgrade_public_values_matches_spec_12_layout() {
+        // Match pkg/covenant/upgrade_test.go::TestEncodeUpgradePublicValues_ShapeAndBindings
+        // verbatim so a Rust/Go drift surfaces as a layout mismatch here.
+        let mut pre = [0u8; 32];
+        let mut post = [0u8; 32];
+        for i in 0..32 {
+            pre[i] = i as u8;
+            post[i] = 0xff - i as u8;
+        }
+        let batch = b"batch-blob".to_vec();
+        let proof = b"proof-blob".to_vec();
+        // Identical to the Go test's `newScript`.
+        let new_script: [u8; 7] = [0x76, 0xa9, 0x14, 0xde, 0xad, 0xbe, 0xef];
+        let chain_id: u64 = 8_453_111;
+        let new_block: u64 = 42;
+
+        let pv = encode_upgrade_public_values(
+            &pre,
+            &post,
+            &batch,
+            &proof,
+            &new_script,
+            chain_id,
+            new_block,
+        );
+        assert_eq!(pv.len(), 280, "publicValues must be exactly 280 bytes");
+
+        // pv[0..32) preStateRoot
+        assert_eq!(&pv[0..32], &pre[..]);
+        // pv[32..64) postStateRoot
+        assert_eq!(&pv[32..64], &post[..]);
+        // pv[64..96) hash256(proofBlob)
+        assert_eq!(&pv[64..96], &hash256(&proof));
+        // pv[96..104) zero padding
+        assert_eq!(&pv[96..104], &[0u8; 8]);
+        // pv[104..136) hash256(batchData)
+        assert_eq!(&pv[104..136], &hash256(&batch));
+        // pv[136..144) chainId little-endian
+        assert_eq!(&pv[136..144], &chain_id.to_le_bytes());
+        // pv[144..240) zero-filled reserved
+        assert!(pv[144..240].iter().all(|&b| b == 0));
+        // pv[240..272) hash256(newCovenantScript)
+        assert_eq!(&pv[240..272], &hash256(&new_script));
+        // pv[272..280) newBlockNumber little-endian
+        assert_eq!(&pv[272..280], &new_block.to_le_bytes());
+    }
+
+    /// hash256 must be SHA256(SHA256(x)). Golden-vector against a
+    /// trivial input pins the helper across refactors.
+    #[test]
+    fn hash256_is_double_sha256() {
+        // hash256(b"") = SHA256(SHA256(b""))
+        let empty_inner = Sha256::digest(b"");
+        let empty_outer = Sha256::digest(empty_inner);
+        let mut want = [0u8; 32];
+        want.copy_from_slice(&empty_outer);
+        assert_eq!(hash256(b""), want);
+    }
+
+    /// `synthetic_blob` must be deterministic in the rotation inputs.
+    /// Two operators independently rebuilding the same rotation MUST
+    /// see identical bundle bytes — this lets multisig partial-sig
+    /// flows be diffed cleanly.
+    #[test]
+    fn synthetic_blob_is_deterministic_in_inputs() {
+        let script = b"new-script-bytes".to_vec();
+        let mut pre = [0u8; 32];
+        pre[0] = 0xab;
+
+        let a = synthetic_blob(b"tag", &script, &pre, 100, 8453111, 1024);
+        let b = synthetic_blob(b"tag", &script, &pre, 100, 8453111, 1024);
+        assert_eq!(a, b, "same inputs MUST yield identical bytes");
+        assert_eq!(a.len(), 1024);
+
+        // Changing any input changes the output.
+        let c = synthetic_blob(b"tag", &script, &pre, 101, 8453111, 1024);
+        assert_ne!(a, c, "block_number drift MUST change the blob");
     }
 }
