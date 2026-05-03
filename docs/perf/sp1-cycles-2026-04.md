@@ -157,6 +157,10 @@ chain-id fixes are bench-test-local; the production daemon
    batch range. Today's per-tx cycle delta is dominated by setup
    overhead; the bench needs a multi-tx workload to show the
    per-opcode cost dominates.
+   **DONE (2026-05).** `pkg/prover/bench_test.go` now ships
+   `MultiTxBatch_8`, `MultiTxBatch_64`, and `MultiTxBatch_128`
+   fixtures; see [`sp1-cycles-2026-05.md`](sp1-cycles-2026-05.md)
+   for the multi-tx scaling snapshot.
 4. **In-guest sanity check.** Add `commit_error(0x07, …)` (or
    similar) to the guest when `transactions.is_empty()` AND
    `inbox_drain_count == 0`, so a future wire-decode regression is

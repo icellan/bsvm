@@ -49,6 +49,7 @@ package prover
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -196,6 +197,40 @@ func runHostBench(t *testing.T, binary string, args []string, envelope []byte) *
 // buildBridgeInput needs to stay in sync with the Rust bridge / bench.
 func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	t.Helper()
+	return buildBenchEnvelopeFromBuilder(t, fx.name, 1, func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction {
+		return []*types.Transaction{fx.build(t, key, signer)}
+	})
+}
+
+// buildBenchEnvelopeForBatch drives a multi-tx benchBatchFixture through
+// the same Go EVM pipeline as the single-tx path. The fixture's builder
+// returns N already-signed transactions (typically with sequential
+// nonces from the same prefunded sender). The block gas limit
+// (DefaultGasLimit = 30_000_000) caps the realistic batch size at
+// ~1400 simple transfers; the multi-tx fixtures here stay well under
+// that ceiling so ProcessBatch never silently drops txs on gas-pool
+// exhaustion.
+func buildBenchEnvelopeForBatch(t *testing.T, fx benchBatchFixture) []byte {
+	t.Helper()
+	return buildBenchEnvelopeFromBuilder(t, fx.name, fx.txCount, fx.build)
+}
+
+// buildBenchEnvelopeFromBuilder is the shared envelope-construction
+// helper used by both single-tx and multi-tx bench paths. The builder
+// closure is responsible for signing every tx with the supplied key
+// and signer; the helper takes care of genesis, pre-funding, batch
+// execution, state export, and the buildBridgeInput call. The
+// expectedTxCount parameter pins the number of receipts ProcessBatch
+// MUST produce — any divergence (e.g., a tx silently skipped on
+// nonce or out-of-gas) trips a t.Fatalf so the bench cycle count
+// can't be silently misattributed to a partial batch.
+func buildBenchEnvelopeFromBuilder(
+	t *testing.T,
+	fixtureName string,
+	expectedTxCount int,
+	builder func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction,
+) []byte {
+	t.Helper()
 
 	database := db.NewMemoryDB()
 	chainConfig := vm.DefaultL2Config(benchChainID)
@@ -225,20 +260,27 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	preStateRoot := genesisHeader.StateRoot
 
 	signer := types.NewLondonSigner(big.NewInt(benchChainID))
-	tx := fx.build(t, key, signer)
-	var encBuf bytes.Buffer
-	if err := tx.EncodeRLP(&encBuf); err != nil {
-		t.Fatalf("%s: EncodeRLP: %v", fx.name, err)
+	txs := builder(key, signer)
+	if len(txs) != expectedTxCount {
+		t.Fatalf("%s: builder returned %d txs, expected %d", fixtureName, len(txs), expectedTxCount)
 	}
-	txBytes := encBuf.Bytes()
+
+	txBytesList := make([][]byte, len(txs))
+	for i, tx := range txs {
+		var encBuf bytes.Buffer
+		if err := tx.EncodeRLP(&encBuf); err != nil {
+			t.Fatalf("%s: tx[%d] EncodeRLP: %v", fixtureName, i, err)
+		}
+		txBytesList[i] = encBuf.Bytes()
+	}
 
 	preStateDB, err := state.New(preStateRoot, database)
 	if err != nil {
-		t.Fatalf("%s: pre-state open: %v", fx.name, err)
+		t.Fatalf("%s: pre-state open: %v", fixtureName, err)
 	}
 	execStateDB, err := state.New(preStateRoot, database)
 	if err != nil {
-		t.Fatalf("%s: exec state open: %v", fx.name, err)
+		t.Fatalf("%s: exec state open: %v", fixtureName, err)
 	}
 	execStateDB.StartAccessRecording()
 
@@ -247,17 +289,27 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 
 	l2Block, receipts, err := executor.ProcessBatch(
 		genesisHeader, coinbaseAddr, 1000,
-		[]*types.Transaction{tx},
+		txs,
 		execStateDB, chainCtx,
 	)
 	if err != nil {
-		t.Fatalf("%s: ProcessBatch: %v", fx.name, err)
+		t.Fatalf("%s: ProcessBatch: %v", fixtureName, err)
 	}
-	if len(receipts) != 1 {
-		t.Fatalf("%s: expected 1 receipt, got %d", fx.name, len(receipts))
+	if len(receipts) != expectedTxCount {
+		// ProcessBatch silently drops txs that fail validation (nonce,
+		// gas pool). For a bench fixture this is always a mistake — we
+		// want the cycle count attributable to N successful txs, not
+		// N-K. Surface the count mismatch loudly so a future fixture
+		// regression (e.g., bumping the per-tx Gas above the block
+		// limit / N) is caught at test time, not via a confusing
+		// cycles-per-tx delta in the perf report.
+		t.Fatalf("%s: ProcessBatch produced %d receipts, expected %d (txs likely dropped on nonce or gas-pool)",
+			fixtureName, len(receipts), expectedTxCount)
 	}
-	if receipts[0].Status != types.ReceiptStatusSuccessful {
-		t.Fatalf("%s: tx reverted, receipt status %d", fx.name, receipts[0].Status)
+	for i, receipt := range receipts {
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			t.Fatalf("%s: tx[%d] reverted, receipt status %d", fixtureName, i, receipt.Status)
+		}
 	}
 
 	postStateRoot := l2Block.StateRoot()
@@ -270,11 +322,11 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	recording := execStateDB.StopAccessRecording()
 	export, err := ExportStateForProving(preStateDB, recording.Accounts, recording.Slots)
 	if err != nil {
-		t.Fatalf("%s: ExportStateForProving: %v", fx.name, err)
+		t.Fatalf("%s: ExportStateForProving: %v", fixtureName, err)
 	}
 	stateExportJSON, err := SerializeExport(export)
 	if err != nil {
-		t.Fatalf("%s: SerializeExport: %v", fx.name, err)
+		t.Fatalf("%s: SerializeExport: %v", fixtureName, err)
 	}
 
 	emptyInbox := covenant.EmptyInboxState().TxQueueHash
@@ -282,7 +334,7 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 	proveInput := &ProveInput{
 		PreStateRoot: preStateRoot,
 		StateExport:  stateExportJSON,
-		Transactions: [][]byte{txBytes},
+		Transactions: txBytesList,
 		BlockContext: BlockContext{
 			Number:    l2Block.NumberU64(),
 			Timestamp: l2Block.Time(),
@@ -302,15 +354,115 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 
 	envelopeJSON, err := buildBridgeInput(proveInput, "execute")
 	if err != nil {
-		t.Fatalf("%s: buildBridgeInput: %v", fx.name, err)
+		t.Fatalf("%s: buildBridgeInput: %v", fixtureName, err)
 	}
 	if dir := os.Getenv("BSVM_BENCH_DUMP_ENVELOPE_DIR"); dir != "" {
-		path := filepath.Join(dir, fx.name+".json")
+		path := filepath.Join(dir, fixtureName+".json")
 		if err := os.WriteFile(path, envelopeJSON, 0o644); err != nil {
-			t.Fatalf("%s: write envelope dump: %v", fx.name, err)
+			t.Fatalf("%s: write envelope dump: %v", fixtureName, err)
 		}
 	}
 	return envelopeJSON
+}
+
+// benchBatchFixture pairs a fixture name with a builder that returns
+// exactly txCount signed transactions, plus the expected count itself
+// so the harness can sanity-check the batch size on every run.
+// Multi-tx fixtures are bench-only — the dual-EVM equivalence harness
+// (equivalence_test.go) keeps using equivalenceFixture (single tx per
+// fixture) so each assertion stays attributable to a specific tx type.
+type benchBatchFixture struct {
+	name    string
+	txCount int
+	build   func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction
+}
+
+// makeMultiTransferBatch builds a slice of n signed legacy transfers
+// from the same prefunded sender, with sequential nonces 0..n-1. Each
+// tx sends 1 wei to a distinct receiver address derived from the
+// transaction index — this maximises the number of distinct touched
+// accounts (and therefore MPT proof witnesses), which is the realistic
+// production-batch shape spec 12 plans for. Using LegacyTx keeps the
+// per-tx wire format minimal so cycle scaling reflects EVM execution
+// cost rather than tx-decode overhead.
+//
+// Gas budget: 21_000 per tx × 128 = 2_688_000 — well under the 30M
+// block limit set by block.DefaultGasLimit. ApplyTransaction's per-tx
+// gas pool draw is the only ceiling that matters here; sender balance
+// is 1000 ETH from buildBenchEnvelopeFromBuilder, which dwarfs even
+// 128 × (21_000 × 1 gwei) = 0.0027 ETH worth of gas.
+//
+// SignNewTx failure here panics rather than failing a test — it would
+// indicate a programming bug (bad key / bad signer / wrong tx fields)
+// not a runtime condition the bench can recover from. Builder
+// closures in benchBatchFixtures cannot capture a *testing.T anyway
+// because the var-init runs before any test body.
+func makeMultiTransferBatch(n int, key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction {
+	txs := make([]*types.Transaction, n)
+	for i := 0; i < n; i++ {
+		// Distinct receiver per tx so each tx writes to a new MPT
+		// account leaf. Encode the tx index in the low bytes of the
+		// address; the high bytes stay 0xaa to avoid colliding with
+		// the existing single-tx fixture receivers (0x11.., 0x22..,
+		// etc.) in any future cross-test fixture inspection.
+		var to types.Address
+		for j := range to {
+			to[j] = 0xaa
+		}
+		to[18] = byte(i >> 8)
+		to[19] = byte(i & 0xff)
+		tx, err := types.SignNewTx(key, signer, &types.LegacyTx{
+			Nonce:    uint64(i),
+			GasPrice: big.NewInt(1_000_000_000),
+			Gas:      21_000,
+			To:       &to,
+			Value:    uint256.NewInt(1), // 1 wei — minimal but non-zero
+		})
+		if err != nil {
+			panic(fmt.Sprintf("makeMultiTransferBatch: SignNewTx[%d]: %v", i, err))
+		}
+		txs[i] = tx
+	}
+	return txs
+}
+
+// benchBatchFixtures enumerates the multi-tx batch fixtures. These
+// scale the bench up to the production-batch size (spec 12: ~128
+// transactions per batch) so cycle counts stop being dominated by
+// SP1 setup overhead and start reflecting the per-tx EVM work the
+// guest actually executes.
+//
+// Cycle counts per fixture grow roughly linearly with txCount above
+// the setup floor (~300K cycles); the cycles-per-tx delta is the
+// regression-detection signal future runs should track. See
+// docs/perf/sp1-cycles-2026-05.md for the captured baseline.
+//
+// If MultiTxBatch_128 exceeds SP1's single-segment cycle limit
+// (currently 2^22 = ~4.2M cycles per segment in SP1 v6.x), the bench
+// will report segments > 1; that's expected and not a failure — the
+// segment count surfaces in the bench log so an operator notices.
+var benchBatchFixtures = []benchBatchFixture{
+	{
+		name:    "MultiTxBatch_8",
+		txCount: 8,
+		build: func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction {
+			return makeMultiTransferBatch(8, key, signer)
+		},
+	},
+	{
+		name:    "MultiTxBatch_64",
+		txCount: 64,
+		build: func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction {
+			return makeMultiTransferBatch(64, key, signer)
+		},
+	},
+	{
+		name:    "MultiTxBatch_128",
+		txCount: 128,
+		build: func(key *ecdsa.PrivateKey, signer types.Signer) []*types.Transaction {
+			return makeMultiTransferBatch(128, key, signer)
+		},
+	},
 }
 
 // runBenchCase drives one fixture through the bench binary and logs
@@ -321,6 +473,27 @@ func buildBenchEnvelopeForFixture(t *testing.T, fx equivalenceFixture) []byte {
 func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool) {
 	t.Helper()
 	envelope := buildBenchEnvelopeForFixture(t, fx)
+	runBenchEnvelope(t, binary, fx.name, 1, envelope, prove)
+}
+
+// runBenchBatchCase drives one multi-tx batch fixture through the
+// bench binary. Same canary asserts as runBenchCase (pv_bytes==280,
+// non-empty pv_hash, vk_hash drift logging) — multi-tx batches don't
+// change the public-values shape, only the cycle count.
+func runBenchBatchCase(t *testing.T, binary string, fx benchBatchFixture, prove bool) {
+	t.Helper()
+	envelope := buildBenchEnvelopeForBatch(t, fx)
+	runBenchEnvelope(t, binary, fx.name, fx.txCount, envelope, prove)
+}
+
+// runBenchEnvelope is the shared post-envelope bench driver. Both
+// single-tx (runBenchCase) and multi-tx (runBenchBatchCase) paths
+// converge here once the JSON envelope is built. The txCount
+// parameter feeds the cycles-per-tx breakdown logged for multi-tx
+// fixtures (so a regression report can spot which fixture's per-tx
+// cost grew, not just the absolute total).
+func runBenchEnvelope(t *testing.T, binary string, name string, txCount int, envelope []byte, prove bool) {
+	t.Helper()
 
 	var args []string
 	if prove {
@@ -328,7 +501,7 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 	}
 	out := runHostBench(t, binary, args, envelope)
 
-	budget := budgetCycles(fx.name)
+	budget := budgetCycles(name)
 	hit := "OK"
 	if out.Cycles > budget {
 		hit = "OVER"
@@ -339,7 +512,7 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 	// --prove run.
 	if prove {
 		t.Logf("[bench] %s prove proof_gen_ms=%d proof_bytes=%d wall_ms=%d vk_hash=%s",
-			fx.name, out.ProofGenMs, out.ProofBytes, out.WallMs, out.VKHash)
+			name, out.ProofGenMs, out.ProofBytes, out.WallMs, out.VKHash)
 		// Document the wall-clock budget for context. We don't assert
 		// on it — CI runs CPU-only and would always fail the GPU
 		// target.
@@ -348,21 +521,32 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 		if out.ProofGenMs > proofTimeBudgetMs {
 			state = "OVER (CI is CPU-only — GPU target is informational)"
 		}
-		t.Logf("[bench] %s prove time vs 60s GPU budget: %s", fx.name, state)
+		t.Logf("[bench] %s prove time vs 60s GPU budget: %s", name, state)
 	} else {
 		// Log format matches the bench spec example exactly:
 		//   [bench] LegacyTransfer cycles=2_345_678 (budget: 5M) wall_ms=42
 		t.Logf("[bench] %s cycles=%s (budget: %s) wall_ms=%d %s",
-			fx.name, formatThousands(out.Cycles), formatBudget(budget),
+			name, formatThousands(out.Cycles), formatBudget(budget),
 			out.WallMs, hit)
 		// Also log instructions + segments + public-values shape so a
 		// regression in any of these is visible in CI output.
 		pvBytes := (len(out.PublicValues) - 2) / 2 // strip "0x", divide by 2
 		t.Logf("[bench] %s instructions=%s segments=%d pv_bytes=%d pv_hash=%s",
-			fx.name, formatThousands(out.Instructions), out.Segments,
+			name, formatThousands(out.Instructions), out.Segments,
 			pvBytes, out.PublicValuesHash)
+		// Cycles-per-tx breakdown for multi-tx fixtures. Logged ONLY
+		// when txCount > 1 so the line stays out of single-tx fixture
+		// output (where it would just duplicate the total cycle line).
+		// This is the regression-detection number future runs should
+		// compare against — total cycles include the SP1 setup floor
+		// (~300K), but the per-tx delta isolates the EVM-execution
+		// cost change.
+		if txCount > 1 {
+			t.Logf("[bench] %s cycles_per_tx=%s (txCount=%d)",
+				name, formatThousands(out.Cycles/uint64(txCount)), txCount)
+		}
 		if os.Getenv("BSVM_BENCH_DUMP_PV") == "1" {
-			t.Logf("[bench] %s pv=%s", fx.name, out.PublicValues)
+			t.Logf("[bench] %s pv=%s", name, out.PublicValues)
 		}
 		// Wire-format canary: the production guest commits exactly 280
 		// bytes of public values (spec 12 — preStateRoot, postStateRoot,
@@ -380,13 +564,13 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 				"Compare prover/host-bench/src/main.rs::GuestBatchInput "+
 				"with prover/guest/src/main.rs::BatchInput field-by-field, "+
 				"and run `cargo test --lib --release wire_format` in "+
-				"prover/guest/", fx.name, pvBytes)
+				"prover/guest/", name, pvBytes)
 		}
 		emptyPVHash := "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 		if out.PublicValuesHash == emptyPVHash {
 			t.Fatalf("[bench] %s pv_hash = SHA256(\"\") — guest committed "+
 				"nothing, almost certainly a wire-format regression. See "+
-				"docs/decisions/vk-rotation-wire-format-2026-04.md", fx.name)
+				"docs/decisions/vk-rotation-wire-format-2026-04.md", name)
 		}
 		// VK pin check: as of 2026-05-03 (Phase 1 of
 		// docs/decisions/sp1-reproducible-build-2026-05.md) every
@@ -402,7 +586,7 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 		pinned := loadPinnedVKHash(t)
 		if pinned != "" && !strings.EqualFold(out.VKHash, pinned) {
 			t.Logf("[bench] %s vk_hash drift (informational): bench=%s pinned=%s — see docs/operator/sp1-build.md",
-				fx.name, out.VKHash, pinned)
+				name, out.VKHash, pinned)
 		}
 	}
 }
@@ -508,4 +692,88 @@ func TestSP1Bench(t *testing.T) {
 			runBenchCase(t, binary, fx, isProveCase)
 		})
 	}
+
+	// Multi-tx batch fixtures run after the single-tx fixtures so the
+	// log timeline reads "small → big". --prove stays disabled for
+	// every batch fixture even when BSVM_HOST_BENCH_PROVE=1: at
+	// MultiTxBatch_128 the proof would take many minutes on CPU, and
+	// the prove-time signal is already captured on the first single-tx
+	// fixture above. Operators who want a multi-tx --prove run can
+	// invoke `-run TestSP1Bench/MultiTxBatch_128` directly with
+	// BSVM_HOST_BENCH_PROVE=1; the loop here keeps the default
+	// behaviour fast enough for an iterative dev workflow.
+	for _, fx := range benchBatchFixtures {
+		fx := fx
+		t.Run(fx.name, func(t *testing.T) {
+			runBenchBatchCase(t, binary, fx, false)
+		})
+	}
+}
+
+// TestSP1Bench_BatchEnvelopeSmoke is a fast Go-side sanity check that
+// every benchBatchFixture builds a valid envelope without invoking
+// the SP1 binary. It catches the obvious failure modes (ProcessBatch
+// silently drops txs on nonce / gas-pool exhaustion, JSON envelope
+// fails to round-trip, the all-zero hash slips into a critical field)
+// before an operator burns 4 min per fixture on an unnecessary host-
+// bench run. No subprocess is forked so this test runs in <1s and
+// has no docker / Rust dependency.
+func TestSP1Bench_BatchEnvelopeSmoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("envelope smoke test still pulls in genesis + state-export; skipped under -short for speed")
+	}
+	for _, fx := range benchBatchFixtures {
+		fx := fx
+		t.Run(fx.name, func(t *testing.T) {
+			envelope := buildBenchEnvelopeForBatch(t, fx)
+			if len(envelope) == 0 {
+				t.Fatalf("%s: empty envelope", fx.name)
+			}
+			// Loosely verify the envelope round-trips through json so a
+			// future schema break doesn't slip past the bench. Using
+			// json.RawMessage avoids coupling the smoke test to the
+			// host-bridge's exact field shape.
+			var dec map[string]json.RawMessage
+			if err := json.Unmarshal(envelope, &dec); err != nil {
+				t.Fatalf("%s: envelope is not valid JSON: %v", fx.name, err)
+			}
+			// Spot-check that the transaction count survived through
+			// buildBridgeInput. The host-bridge envelope key for the
+			// raw tx list is "transactions" (lowercase, matches the
+			// Rust BridgeInput field). If that key disappears (e.g.,
+			// renamed) the smoke test surfaces it before the SP1 run
+			// silently produces zero-cycle output.
+			rawTxs, ok := dec["transactions"]
+			if !ok {
+				t.Fatalf("%s: envelope missing 'transactions' field; keys=%v",
+					fx.name, sortedKeys(dec))
+			}
+			var txList []json.RawMessage
+			if err := json.Unmarshal(rawTxs, &txList); err != nil {
+				t.Fatalf("%s: transactions field not a JSON array: %v", fx.name, err)
+			}
+			if len(txList) != fx.txCount {
+				t.Fatalf("%s: envelope transactions=%d, expected %d",
+					fx.name, len(txList), fx.txCount)
+			}
+		})
+	}
+}
+
+// sortedKeys returns the keys of a map in sorted order — used by
+// the envelope smoke test's failure messages so the diagnostic output
+// is deterministic across runs (Go's map iteration is randomised).
+func sortedKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	// Tiny inline sort — pulling sort.Strings here would add an import
+	// solely for diagnostic output, not worth it for <30 keys.
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+	return keys
 }
