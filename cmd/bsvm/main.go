@@ -26,6 +26,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/icellan/bsvm/internal/db"
+	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/block"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/governance"
@@ -824,17 +825,59 @@ func cmdRun(ctx *cli.Context) error {
 		},
 		makeProposalVerifier(govConfig.Keys),
 	)
-	proposalWorkflow.OnReady(func(p *governance.Proposal) {
-		// v1: log when a proposal reaches threshold. The actual BSV
-		// broadcast path lands when the governance broadcaster is
-		// wired up to the covenant manager.
-		slog.Info("governance proposal ready for broadcast",
-			"id", p.ID,
-			"action", p.Action,
-			"signatures", len(p.Signatures),
-			"required", p.Required,
+	// Resolve an ARC client for the at-threshold broadcast. Reuse the
+	// one wireBSVBroadcast already built where possible (so we don't
+	// open a second connection pool); otherwise build a fresh one
+	// from the operator's [bsv].arc_* config. nil is acceptable —
+	// the governance broadcaster surfaces a clear WARN when ARC is
+	// unconfigured rather than silently dropping the broadcast.
+	var govBroadcastARC arc.ARCClient
+	if broadcastWiring != nil {
+		govBroadcastARC = broadcastWiring.ARC
+	}
+	if govBroadcastARC == nil {
+		if c, arcErr := BuildARCClient(nodeCfg.BSV, overlayNode.Counters()); arcErr == nil {
+			govBroadcastARC = c
+		} else {
+			slog.Warn("governance broadcaster: failed to build ARC client; threshold proposals will not broadcast",
+				"error", arcErr)
+		}
+	}
+
+	// Build the at-threshold BSV broadcaster (spec 15 §"Multisig
+	// governance actions"). Freeze + unfreeze are fully wired here;
+	// upgrade is deferred behind WW-governance-payload-extension
+	// because the proposal payload as defined today does not carry
+	// the SP1 proof bundle BuildUpgradeUnlockScript needs. See
+	// pkg/governance/broadcaster.go's dispatchUpgrade for the path
+	// the operator falls back to (rotate-vk).
+	govBroadcaster, gbErr := governance.NewBroadcaster(governance.BroadcasterConfig{
+		ARC:          govBroadcastARC,
+		State:        &covenantStateAdapter{mgr: covenantMgr},
+		SpendBuilder: governanceSpendBuilder,
+		DefaultSats:  covenant.DefaultCovenantSats,
+		Logger:       slog.Default(),
+	})
+	if gbErr != nil {
+		return fmt.Errorf("governance broadcaster: %w", gbErr)
+	}
+	govBroadcaster.Subscribe(func(r governance.BroadcastResult) {
+		if r.Err != nil {
+			// Already logged at WARN inside the broadcaster; the
+			// subscription is here for any future RPC fan-out (e.g.
+			// admin_listGovernanceProposals can surface the most
+			// recent broadcast outcome). Re-stating at INFO would be
+			// double-noise.
+			return
+		}
+		slog.Info("governance proposal broadcast",
+			"id", r.ProposalID,
+			"action", r.Action,
+			"txid", r.TxID,
+			"broadcastedAt", r.BroadcastedAt.Format(time.RFC3339),
 		)
 	})
+	proposalWorkflow.OnReady(govBroadcaster.OnReady)
 	rpcServer.AdminAPI().SetGovernanceWorkflow(proposalWorkflow, govConfig.Threshold)
 	gossipMgr.RegisterHandler(network.MsgProposal, func(peerID peer.ID, msg *network.Message) error {
 		var p governance.Proposal

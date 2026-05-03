@@ -283,12 +283,25 @@ is logged-only." Cited lines: `pkg/rpc/admin_api.go:92`,
       `admin-setConfig-live-reload` for the whitelist subset.
 - [ ] Open a tracked TODO with named hook
       `admin-bridge-monitor-rpc` once the bridge monitor lands.
-- [ ] Open a tracked TODO with named hook
-      `governance-broadcast-onready` for the multisig broadcast
-      gap (this is the highest-impact item on Claim 3).
-- [ ] Other: also document in `docs/operator/admin.md` that
-      multisig broadcast is currently log-only, so an operator
-      reading the runbook is not surprised at threshold time.
+- [x] **DONE** (2026-05-03): `governance-broadcast-onready` —
+      `cmd/bsvm/main.go`'s `OnReady` callback is no longer log-only.
+      Freeze + unfreeze proposals at threshold now build a real BSV
+      spend tx (via `pkg/covenant.BuildFreezeUnlockScript` /
+      `BuildUnfreezeUnlockScript` and
+      `deploy/covenant.BuildUpgradeSpendTx`) and broadcast through
+      the daemon's ARC client. ARC failures surface at WARN with the
+      full assembled tx hex so operators can retry; the proposal
+      stays in the workflow store so a re-sign re-fires the
+      threshold event. Upgrade proposals stay deferred — the
+      proposal payload as defined in spec 15 doesn't carry the SP1
+      proof bundle `BuildUpgradeUnlockScript` requires; that
+      sub-gap is tracked separately as
+      `WW-governance-payload-extension`. See
+      `docs/operator/admin.md` §"Multisig governance proposals".
+- [x] **DONE** (2026-05-03): documented the threshold flow + the
+      ARC-failure UX in `docs/operator/admin.md` so an operator
+      reading the runbook knows exactly what happens at threshold
+      time AND which actions are deferred.
 
 **Notes for the operator**: The three sub-claims have very
 different urgencies. Multisig broadcast is the only one that
