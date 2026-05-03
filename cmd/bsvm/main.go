@@ -879,12 +879,14 @@ func cmdRun(ctx *cli.Context) error {
 	}
 
 	// Build the at-threshold BSV broadcaster (spec 15 §"Multisig
-	// governance actions"). Freeze + unfreeze are fully wired here;
-	// upgrade is deferred behind WW-governance-payload-extension
-	// because the proposal payload as defined today does not carry
-	// the SP1 proof bundle BuildUpgradeUnlockScript needs. See
-	// pkg/governance/broadcaster.go's dispatchUpgrade for the path
-	// the operator falls back to (rotate-vk).
+	// governance actions"). Freeze + unfreeze + upgrade are all wired
+	// here. The upgrade path consumes the optional UpgradePayload on
+	// the proposal (populated by the proposer via
+	// governance.NewUpgradeProposal — typically through
+	// `rotate-vk --via-governance-proposal`) and dispatches via
+	// pkg/covenant.BuildUpgradeUnlockScript +
+	// deploy/covenant.BuildUpgradeSpendTx. Closes
+	// WW-governance-payload-extension.
 	govBroadcaster, gbErr := governance.NewBroadcaster(governance.BroadcasterConfig{
 		ARC:          govBroadcastARC,
 		State:        &covenantStateAdapter{mgr: covenantMgr},

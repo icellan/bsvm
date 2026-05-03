@@ -67,6 +67,7 @@ import (
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/covenant"
 	covenantanf "github.com/icellan/bsvm/pkg/covenant/anf"
+	"github.com/icellan/bsvm/pkg/governance"
 )
 
 // RotateVKConfig is the input shape for the rotate-vk binary. It is
@@ -172,7 +173,16 @@ type RotateSummary struct {
 	// populated only when --anf-publish was set AND broadcast succeeded.
 	AnfPublishTxID string `json:"anfPublishTxid,omitempty"`
 	Broadcast      bool   `json:"broadcast"`
-	GeneratedAt    string `json:"generatedAt"`
+	// ProposalOutPath is the on-disk path the governance proposal
+	// JSON was written to when --via-governance-proposal was set.
+	// Empty otherwise.
+	ProposalOutPath string `json:"proposalOutPath,omitempty"`
+	// ProposalID is the content-hash ID of the gossiped proposal,
+	// populated only when --via-governance-proposal was set. Operators
+	// reference this ID when calling admin_signGovernanceProposal on
+	// a running node.
+	ProposalID  string `json:"proposalId,omitempty"`
+	GeneratedAt string `json:"generatedAt"`
 }
 
 // RotateOptions packages the CLI flag set used by the rotate-vk
@@ -195,6 +205,27 @@ type RotateOptions struct {
 	// JSON is written (for operator inspection before --anf-publish).
 	// Defaults to "<config-dir>/rotate-vk.anf.json" when empty.
 	AnfDocPath string
+	// ViaGovernanceProposal, when true, switches rotate-vk from
+	// direct ARC broadcast to the governance-coordinated multisig
+	// flow. Instead of building + signing + broadcasting a BSV
+	// transaction, rotate-vk constructs a governance.Proposal carrying
+	// an UpgradePayload (the SP1 proof bundle, current state root,
+	// current block number, new covenant script + ANF hash, chain id)
+	// and writes it to ProposalOutPath as JSON. The operator then
+	// submits it on a running node via admin_createGovernanceProposal,
+	// where it gossips through the libp2p MsgProposal channel; once
+	// the M-of-N signature threshold is met, the daemon's governance
+	// broadcaster (pkg/governance.Broadcaster.dispatchUpgrade) builds
+	// the upgrade tx and broadcasts via ARC.
+	//
+	// Defaults to false. Mutually exclusive with --broadcast: passing
+	// both errors out (the binary cannot both directly broadcast and
+	// hand off to governance gossip in the same invocation).
+	ViaGovernanceProposal bool
+	// ProposalOutPath is where the governance proposal JSON is
+	// written when ViaGovernanceProposal is set. Defaults to
+	// "<config-dir>/rotate-vk.proposal.json" when empty.
+	ProposalOutPath string
 }
 
 // RunRotateVK is the rotation binary's main loop. The cmd/rotate-vk
@@ -204,7 +235,10 @@ func RunRotateVK(opts RotateOptions) error {
 	if opts.ConfigPath == "" {
 		return errors.New("--config is required")
 	}
-	if opts.Broadcast {
+	if opts.Broadcast && opts.ViaGovernanceProposal {
+		return errors.New("--broadcast and --via-governance-proposal are mutually exclusive (pick direct ARC broadcast OR the governance-coordinated multisig flow)")
+	}
+	if opts.Broadcast || opts.ViaGovernanceProposal {
 		opts.DryRun = false
 	}
 
@@ -215,7 +249,15 @@ func RunRotateVK(opts RotateOptions) error {
 	if err := cfg.OperatorConfig.Validate(false); err != nil {
 		return fmt.Errorf("validate base config: %w", err)
 	}
-	if err := cfg.ValidateRotation(opts.Broadcast); err != nil {
+	// In the via-governance-proposal flow we still need the same
+	// on-chain field validation as --broadcast (state root, block
+	// number, sats) because the proposal payload binds the signers
+	// to those values. The only field we relax is governanceSigsHex
+	// — those come from the M-of-N gossip cycle, not from this
+	// binary's input.
+	requireOnChain := opts.Broadcast || opts.ViaGovernanceProposal
+	requireSigs := opts.Broadcast
+	if err := cfg.ValidateRotationOpts(requireOnChain, requireSigs); err != nil {
 		return fmt.Errorf("validate rotation: %w", err)
 	}
 
@@ -251,6 +293,15 @@ func RunRotateVK(opts RotateOptions) error {
 		}
 		summary.OldVKHash = resOld.VKHashHex
 		summary.OldRollupScript = hex.EncodeToString(resOld.RollupScript)
+	}
+
+	if opts.ViaGovernanceProposal {
+		// Hand off to the governance gossip flow. Constructs an
+		// upgrade proposal carrying the SP1 proof bundle + rotation
+		// bindings and writes the proposal JSON to disk so the
+		// operator can submit it via admin_createGovernanceProposal
+		// on a running node. Closes WW-governance-payload-extension.
+		return runViaGovernanceProposal(opts, cfg, resNew, summary)
 	}
 
 	if !opts.Broadcast {
@@ -470,6 +521,130 @@ func runBroadcastUpgrade(
 			summary.AnfPublishTxID = anfTxID
 		}
 	}
+
+	return EmitRotateSummary(summary, opts.OutPath)
+}
+
+// runViaGovernanceProposal implements --via-governance-proposal:
+// instead of building + broadcasting the upgrade tx directly, build
+// an upgrade governance proposal carrying the SP1 proof bundle +
+// rotation bindings and write it to ProposalOutPath as JSON. The
+// operator then submits the proposal on a running node via
+// admin_createGovernanceProposal; once gossip carries it to the
+// shard's other governance key holders and the M-of-N threshold is
+// met, the daemon's governance broadcaster
+// (pkg/governance.Broadcaster.dispatchUpgrade) builds the upgrade tx
+// + broadcasts via ARC.
+//
+// This is the gossip-coordinated multisig path; the existing
+// --broadcast flow remains the direct/airgapped path for operators
+// who collect signatures out-of-band.
+func runViaGovernanceProposal(
+	opts RotateOptions,
+	cfg *RotateVKConfig,
+	resNew *CompileResult,
+	summary RotateSummary,
+) error {
+	if cfg.Governance.Mode == "none" {
+		return errors.New("--via-governance-proposal cannot rotate a governance-none shard (no key authorises the spend; spec 12)")
+	}
+	if cfg.CurrentStateRootHex == "" {
+		return errors.New("--via-governance-proposal requires currentStateRootHex (the live covenant's StateRoot)")
+	}
+
+	gov, err := buildGovernanceConfig(cfg.Governance)
+	if err != nil {
+		return fmt.Errorf("governance: %w", err)
+	}
+
+	preStateRoot, err := decodeHash32(cfg.CurrentStateRootHex)
+	if err != nil {
+		return fmt.Errorf("currentStateRootHex: %w", err)
+	}
+
+	pv, batchData, proofBlob, proofSource, err := resolveProofBundle(
+		cfg.ProofBundlePath, opts.ConfigPath, cfg.ChainID,
+		preStateRoot, resNew.RollupScript, cfg.CurrentBlockNumber)
+	if err != nil {
+		return fmt.Errorf("proof bundle: %w", err)
+	}
+	if proofSource == "synthetic" {
+		fmt.Fprintln(os.Stderr,
+			"rotate-vk: WARN proof bundle is SYNTHETIC — once threshold "+
+				"signatures are collected the on-chain SP1 verifier WILL "+
+				"reject the broadcast tx. Supply a real proofBundlePath in "+
+				"the config before gossiping the proposal against a "+
+				"production shard.")
+	}
+
+	// Build the canonical ANF document so the proposal commits to the
+	// same on-chain ANF hash a direct --broadcast would.
+	anfDoc, anfCanonical, err := BuildANFDocument(&cfg.OperatorConfig, resNew, ANFOptions{
+		Kind: covenantanf.KindRotation,
+	})
+	if err != nil {
+		return fmt.Errorf("build ANF document: %w", err)
+	}
+	anfHash := covenantanf.Hash256(anfCanonical)
+	anfDocPath := opts.AnfDocPath
+	if anfDocPath == "" {
+		anfDocPath = filepath.Join(filepath.Dir(opts.ConfigPath), "rotate-vk.anf.json")
+	}
+	if writeErr := WriteANFDocument(anfDocPath, anfCanonical); writeErr != nil {
+		return fmt.Errorf("write ANF document: %w", writeErr)
+	}
+	summary.AnfHash = hex.EncodeToString(anfHash[:])
+	summary.AnfDocPath = anfDocPath
+	_ = anfDoc
+
+	threshold := expectedSigsForGov(gov)
+	if threshold < 1 {
+		return fmt.Errorf("governance mode %v has no upgrade path", cfg.Governance.Mode)
+	}
+
+	payload := governance.UpgradePayload{
+		PublicValuesHex:       hex.EncodeToString(pv),
+		BatchDataHex:          hex.EncodeToString(batchData),
+		ProofBlobHex:          hex.EncodeToString(proofBlob),
+		CurrentStateRootHex:   hex.EncodeToString(preStateRoot[:]),
+		CurrentBlockNumber:    cfg.CurrentBlockNumber,
+		NewCovenantAnfHashHex: hex.EncodeToString(anfHash[:]),
+		NewCovenantScriptHex:  hex.EncodeToString(resNew.RollupScript),
+		ChainID:               cfg.ChainID,
+	}
+	proposal, err := governance.NewUpgradeProposal(payload, threshold, 0)
+	if err != nil {
+		return fmt.Errorf("build upgrade proposal: %w", err)
+	}
+
+	proposalPath := opts.ProposalOutPath
+	if proposalPath == "" {
+		proposalPath = filepath.Join(filepath.Dir(opts.ConfigPath), "rotate-vk.proposal.json")
+	}
+	proposalBytes, err := json.MarshalIndent(proposal, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal proposal: %w", err)
+	}
+	if err := os.WriteFile(proposalPath, append(proposalBytes, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write proposal %s: %w", proposalPath, err)
+	}
+
+	method, err := covenant.UpgradeMethodName(gov)
+	if err != nil {
+		return fmt.Errorf("upgrade method: %w", err)
+	}
+
+	summary.UpgradeMethod = method
+	summary.Broadcast = false
+	summary.ProposalOutPath = proposalPath
+	summary.ProposalID = proposal.ID
+
+	fmt.Fprintf(os.Stderr,
+		"rotate-vk: governance upgrade proposal %s written to %s "+
+			"(threshold=%d). Submit on a running node via "+
+			"admin_createGovernanceProposal; the daemon's broadcaster "+
+			"fires once %d signatures are collected.\n",
+		proposal.ID, proposalPath, threshold, threshold)
 
 	return EmitRotateSummary(summary, opts.OutPath)
 }
@@ -744,8 +919,22 @@ func LoadRotateVKConfig(path string) (*RotateVKConfig, error) {
 }
 
 // ValidateRotation checks the rotate-specific fields. broadcastMode
-// = true tightens the check to require all on-chain inputs.
+// = true tightens the check to require all on-chain inputs. The
+// governance-proposal flow (--via-governance-proposal) needs the
+// same on-chain inputs EXCEPT governanceSigsHex (those come from the
+// gossip cycle, not this binary's input); callers that want the
+// looser variant pass requireSigs=false via ValidateRotationOpts.
 func (c *RotateVKConfig) ValidateRotation(broadcastMode bool) error {
+	return c.ValidateRotationOpts(broadcastMode, broadcastMode)
+}
+
+// ValidateRotationOpts is the internal variant of ValidateRotation
+// that lets the via-governance-proposal flow opt out of the
+// governanceSigsHex requirement. requireOnChainFields tightens the
+// check to require the rotation-only on-chain inputs (state root,
+// block number, sats); requireSigs additionally requires
+// governanceSigsHex to be populated.
+func (c *RotateVKConfig) ValidateRotationOpts(requireOnChainFields, requireSigs bool) error {
 	if c.CovenantTxID == "" {
 		return errors.New("covenantTxId must be set (the live UTXO to spend)")
 	}
@@ -753,15 +942,17 @@ func (c *RotateVKConfig) ValidateRotation(broadcastMode bool) error {
 	if !looksLikeBitcoinTxID(c.CovenantTxID) {
 		return fmt.Errorf("covenantTxId %q does not look like a 32-byte hex txid", c.CovenantTxID)
 	}
-	if broadcastMode {
+	if requireOnChainFields {
 		if c.CovenantSatsLive == 0 {
-			return errors.New("covenantSatsLive must be > 0 in --broadcast mode")
-		}
-		if c.Governance.Mode != "none" && len(c.GovernanceSigsHex) == 0 {
-			return errors.New("governanceSigsHex required for non-none governance in --broadcast mode")
+			return errors.New("covenantSatsLive must be > 0 in --broadcast / --via-governance-proposal mode")
 		}
 		if c.NewVKHashFile == "" {
-			return errors.New("newVKHashFile must be set in --broadcast mode")
+			return errors.New("newVKHashFile must be set in --broadcast / --via-governance-proposal mode")
+		}
+	}
+	if requireSigs {
+		if c.Governance.Mode != "none" && len(c.GovernanceSigsHex) == 0 {
+			return errors.New("governanceSigsHex required for non-none governance in --broadcast mode")
 		}
 	}
 	return nil

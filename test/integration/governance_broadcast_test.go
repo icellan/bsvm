@@ -184,11 +184,18 @@ func TestGovernanceBroadcast_FreezeReachesARC(t *testing.T) {
 	}
 }
 
-// TestGovernanceBroadcast_UpgradeIsDeferred asserts the upgrade path
-// emits the WW-governance-payload-extension typed error — proving
-// the broadcaster does NOT silently drop upgrade proposals at
-// threshold even though it can't yet broadcast them.
-func TestGovernanceBroadcast_UpgradeIsDeferred(t *testing.T) {
+// TestGovernanceBroadcast_UpgradeAssemblesAndReachesARC asserts the
+// upgrade dispatch path (closing WW-governance-payload-extension)
+// builds a real spend tx via deploy/covenant.BuildUpgradeSpendTx and
+// dispatches it to the configured ARC endpoint. The endpoint is
+// unreachable so the broadcast fails — the test asserts the failure
+// surfaces through Subscribe AND that a non-empty TxHex was assembled
+// before the network failure.
+func TestGovernanceBroadcast_UpgradeAssemblesAndReachesARC(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping governance upgrade broadcast assembly in short mode")
+	}
+
 	gov := covenant.GovernanceConfig{
 		Mode:      covenant.GovernanceSingleKey,
 		Threshold: 1,
@@ -196,7 +203,7 @@ func TestGovernanceBroadcast_UpgradeIsDeferred(t *testing.T) {
 	}
 	state := &integrationCovenantState{
 		tipTxID: fixtureGovernanceTipTxID(t),
-		cov:     &covenant.CompiledCovenant{LockingScript: []byte{0x76, 0xa9}},
+		cov:     &covenant.CompiledCovenant{LockingScript: []byte{0x76, 0xa9, 0x14, 0x00}},
 		gov:     gov,
 		sats:    covenant.DefaultCovenantSats,
 	}
@@ -206,10 +213,11 @@ func TestGovernanceBroadcast_UpgradeIsDeferred(t *testing.T) {
 	}
 
 	b, err := governance.NewBroadcaster(governance.BroadcasterConfig{
-		ARC:          arcClient,
-		State:        state,
-		SpendBuilder: integrationSpendBuilder,
-		DefaultSats:  covenant.DefaultCovenantSats,
+		ARC:              arcClient,
+		State:            state,
+		SpendBuilder:     integrationSpendBuilder,
+		DefaultSats:      covenant.DefaultCovenantSats,
+		BroadcastTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewBroadcaster: %v", err)
@@ -225,18 +233,42 @@ func TestGovernanceBroadcast_UpgradeIsDeferred(t *testing.T) {
 		mu.Unlock()
 	})
 
-	p, _ := governance.NewProposal(governance.ActionUpgrade, nil, 1, time.Hour)
+	newScript := []byte{0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
+	payload := governance.UpgradePayload{
+		PublicValuesHex:       hex.EncodeToString(make([]byte, 280)),
+		BatchDataHex:          hex.EncodeToString([]byte{0x01, 0x02, 0x03}),
+		ProofBlobHex:          hex.EncodeToString([]byte{0x10, 0x20, 0x30}),
+		CurrentStateRootHex:   strings.Repeat("ab", 32),
+		CurrentBlockNumber:    12847,
+		NewCovenantAnfHashHex: strings.Repeat("cd", 32),
+		NewCovenantScriptHex:  hex.EncodeToString(newScript),
+		ChainID:               8453111,
+	}
+	p, err := governance.NewUpgradeProposal(payload, 1, time.Hour)
+	if err != nil {
+		t.Fatalf("NewUpgradeProposal: %v", err)
+	}
 	p.AddSignature(hex.EncodeToString(state.gov.Keys[0]),
 		hex.EncodeToString(make([]byte, 71)))
+
 	b.OnReady(p)
 
 	mu.Lock()
 	defer mu.Unlock()
-	if got.Err == nil {
-		t.Fatal("expected upgrade-deferred error, got nil — was the path silently dropped?")
+	if got.Action != governance.ActionUpgrade {
+		t.Errorf("BroadcastResult.Action = %q, want upgrade", got.Action)
 	}
-	if !strings.Contains(got.Err.Error(), "WW-governance-payload-extension") {
-		t.Errorf("expected WW-governance-payload-extension marker in error, got: %v", got.Err)
+	if got.Err == nil {
+		t.Fatal("expected ARC.Broadcast error against 127.0.0.1:1, got nil — was the broadcast attempted?")
+	}
+	if got.TxHex == "" {
+		t.Fatal("BroadcastResult.TxHex empty — assembly did not produce a tx before ARC failure")
+	}
+	if _, decErr := hex.DecodeString(got.TxHex); decErr != nil {
+		t.Errorf("TxHex is not valid hex: %v", decErr)
+	}
+	if got.TxID == "" {
+		t.Error("BroadcastResult.TxID empty after ARC failure — operator can't identify the tx")
 	}
 }
 

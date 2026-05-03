@@ -275,10 +275,13 @@ func TestBroadcaster_ARCFailureSurfacesAsWarn(t *testing.T) {
 	}
 }
 
-// TestBroadcaster_UpgradeDeferred asserts the upgrade path emits a
-// typed error documenting WW-governance-payload-extension instead of
-// silently dropping the proposal.
-func TestBroadcaster_UpgradeDeferred(t *testing.T) {
+// TestBroadcaster_UpgradeWithoutPayloadSurfacesError asserts an
+// upgrade proposal that lacks an UpgradePayload (e.g. an old gossip
+// wire-format proposal, or a proposer that used NewProposal instead
+// of NewUpgradeProposal) surfaces a typed error instead of attempting
+// to assemble an unlock script with zero bindings. The proposal stays
+// in the workflow store for retry.
+func TestBroadcaster_UpgradeWithoutPayloadSurfacesError(t *testing.T) {
 	state := &stubState{
 		tipTxID: fixtureTipTxID(),
 		cov:     fixtureCovenant(),
@@ -297,21 +300,165 @@ func TestBroadcaster_UpgradeDeferred(t *testing.T) {
 	var got BroadcastResult
 	b.Subscribe(func(r BroadcastResult) { got = r })
 
+	// NewProposal (not NewUpgradeProposal) — no UpgradePayload.
 	p, _ := NewProposal(ActionUpgrade, nil, 1, time.Hour)
 	p.AddSignature(hex.EncodeToString(fixtureKey), hex.EncodeToString(make([]byte, 71)))
 	b.OnReady(p)
 
 	if stub.called != 0 {
-		t.Errorf("ARC.Broadcast was called for upgrade — should be deferred (called=%d)", stub.called)
+		t.Errorf("ARC.Broadcast was called for upgrade-without-payload — should short-circuit (called=%d)", stub.called)
 	}
 	if builder.called != 0 {
-		t.Errorf("spend builder was called for upgrade — should be deferred (called=%d)", builder.called)
+		t.Errorf("spend builder was called for upgrade-without-payload — should short-circuit (called=%d)", builder.called)
 	}
 	if got.Err == nil {
-		t.Fatal("expected BroadcastResult.Err for deferred upgrade")
+		t.Fatal("expected BroadcastResult.Err for upgrade missing UpgradePayload")
 	}
-	if !strings.Contains(got.Err.Error(), "WW-governance-payload-extension") {
-		t.Errorf("error should reference the deferral tracker: %v", got.Err)
+	if !strings.Contains(got.Err.Error(), "UpgradePayload") {
+		t.Errorf("error should reference the missing UpgradePayload: %v", got.Err)
+	}
+}
+
+// TestBroadcaster_UpgradeAssemblesAndBroadcasts is the happy-path
+// upgrade dispatch coverage closing WW-governance-payload-extension:
+// a NewUpgradeProposal proposal at threshold builds the unlock
+// script, builds the spend tx with the NEW covenant script as the
+// continuation output, broadcasts via ARC, and surfaces the txid
+// through Subscribe.
+func TestBroadcaster_UpgradeAssemblesAndBroadcasts(t *testing.T) {
+	newScript := []byte{0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44}
+	state := &stubState{
+		tipTxID: fixtureTipTxID(),
+		tipVout: 0,
+		cov:     fixtureCovenant(),
+		gov: covenant.GovernanceConfig{
+			Mode:      covenant.GovernanceSingleKey,
+			Threshold: 1,
+			Keys:      [][]byte{fixtureKey},
+		},
+		sats: 4321,
+	}
+	builder := &stubSpendBuilder{
+		returnTxHex: hex.EncodeToString([]byte{0xca, 0xfe, 0xba, 0xbe}),
+		returnTxID:  strings.Repeat("dd", 32),
+	}
+	var resp arc.BroadcastResponse
+	resp.Status = arc.StatusReceived
+	for i := range resp.TxID {
+		resp.TxID[i] = byte(0xee)
+	}
+	stub := &stubARC{resp: &resp}
+
+	b, err := NewBroadcaster(BroadcasterConfig{
+		ARC: stub, State: state, SpendBuilder: builder.Build, DefaultSats: 100,
+	})
+	if err != nil {
+		t.Fatalf("NewBroadcaster: %v", err)
+	}
+
+	payload := UpgradePayload{
+		PublicValuesHex:       hex.EncodeToString(make([]byte, 280)),
+		BatchDataHex:          hex.EncodeToString([]byte{0x01, 0x02, 0x03}),
+		ProofBlobHex:          hex.EncodeToString([]byte{0x10, 0x20, 0x30}),
+		CurrentStateRootHex:   strings.Repeat("ab", 32),
+		CurrentBlockNumber:    100,
+		NewCovenantAnfHashHex: strings.Repeat("cd", 32),
+		NewCovenantScriptHex:  hex.EncodeToString(newScript),
+		ChainID:               8453111,
+	}
+	p, err := NewUpgradeProposal(payload, 1, time.Hour)
+	if err != nil {
+		t.Fatalf("NewUpgradeProposal: %v", err)
+	}
+	p.AddSignature(hex.EncodeToString(fixtureKey), hex.EncodeToString(make([]byte, 71)))
+
+	var got BroadcastResult
+	b.Subscribe(func(r BroadcastResult) { got = r })
+	b.OnReady(p)
+
+	if got.Err != nil {
+		t.Fatalf("BroadcastResult.Err = %v, want nil", got.Err)
+	}
+	if builder.called != 1 {
+		t.Fatalf("spend builder called %d times, want 1", builder.called)
+	}
+	// CRITICAL: continuation output is the NEW covenant script — that's
+	// the rotation's whole point. If this drifts to the LIVE script
+	// (the freeze/unfreeze shape), the rotation never actually swaps.
+	if !bytesEqual(builder.lastScript, newScript) {
+		t.Errorf("upgrade continuation script != NEW covenant script (got %x, want %x)",
+			builder.lastScript, newScript)
+	}
+	if builder.lastSats != 4321 {
+		t.Errorf("upgrade spend sats = %d, want 4321", builder.lastSats)
+	}
+	if len(builder.lastUnlock) == 0 {
+		t.Error("spend builder unlock bytes empty — BuildUpgradeUnlockScript did not run")
+	}
+	if stub.called != 1 {
+		t.Fatalf("ARC.Broadcast called %d times, want 1", stub.called)
+	}
+	if got.TxID == "" {
+		t.Error("BroadcastResult.TxID empty after upgrade broadcast")
+	}
+	if got.Action != ActionUpgrade {
+		t.Errorf("BroadcastResult.Action = %q, want upgrade", got.Action)
+	}
+}
+
+// TestBroadcaster_UpgradeRejectsMalformedPayload asserts the upgrade
+// dispatcher fails fast on a payload with a malformed publicValues
+// length, so the proposer (or a malicious peer) can't push the
+// broadcaster into building an unlock script the on-chain SP1
+// verifier would reject.
+func TestBroadcaster_UpgradeRejectsMalformedPayload(t *testing.T) {
+	state := &stubState{
+		tipTxID: fixtureTipTxID(),
+		cov:     fixtureCovenant(),
+		gov: covenant.GovernanceConfig{
+			Mode:      covenant.GovernanceSingleKey,
+			Threshold: 1,
+			Keys:      [][]byte{fixtureKey},
+		},
+		sats: 1000,
+	}
+	builder := &stubSpendBuilder{}
+	stub := &stubARC{resp: &arc.BroadcastResponse{}}
+	b, _ := NewBroadcaster(BroadcasterConfig{
+		ARC: stub, State: state, SpendBuilder: builder.Build, DefaultSats: 100,
+	})
+
+	payload := UpgradePayload{
+		PublicValuesHex:       hex.EncodeToString(make([]byte, 100)), // wrong length
+		BatchDataHex:          hex.EncodeToString([]byte{0x01}),
+		ProofBlobHex:          hex.EncodeToString([]byte{0x02}),
+		CurrentStateRootHex:   strings.Repeat("ab", 32),
+		NewCovenantAnfHashHex: strings.Repeat("cd", 32),
+		NewCovenantScriptHex:  hex.EncodeToString([]byte{0xab}),
+		ChainID:               1,
+		CurrentBlockNumber:    1,
+	}
+	p, err := NewUpgradeProposal(payload, 1, time.Hour)
+	if err != nil {
+		t.Fatalf("NewUpgradeProposal: %v", err)
+	}
+	p.AddSignature(hex.EncodeToString(fixtureKey), hex.EncodeToString(make([]byte, 71)))
+
+	var got BroadcastResult
+	b.Subscribe(func(r BroadcastResult) { got = r })
+	b.OnReady(p)
+
+	if stub.called != 0 {
+		t.Errorf("ARC.Broadcast called despite malformed payload (called=%d)", stub.called)
+	}
+	if builder.called != 0 {
+		t.Errorf("spend builder called despite malformed payload (called=%d)", builder.called)
+	}
+	if got.Err == nil {
+		t.Fatal("expected BroadcastResult.Err for malformed publicValues length")
+	}
+	if !strings.Contains(got.Err.Error(), "280") {
+		t.Errorf("expected '280' in error referring to publicValues size, got: %v", got.Err)
 	}
 }
 

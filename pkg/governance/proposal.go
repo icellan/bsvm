@@ -43,11 +43,70 @@ const (
 // Matches the spec 15 default (24 hours).
 const DefaultExpiry = 24 * time.Hour
 
+// UpgradePayload carries the SP1 proof bundle and rotation-target
+// bindings that pkg/covenant.BuildUpgradeUnlockScript needs to
+// assemble an upgrade-tx unlock script. It is OPTIONAL on the
+// Proposal struct — only `upgrade` proposals carry one. Freeze and
+// unfreeze proposals leave it nil and the broadcaster's
+// dispatchUpgrade is the only consumer.
+//
+// All hex fields are encoded WITHOUT a 0x prefix and without
+// surrounding whitespace; the decoder uses encoding/hex directly.
+//
+// The struct is part of the canonical signing bytes — signers see
+// the full upgrade-tx-they-are-authorising before signing. See
+// docs/operator/vk-rotation.md §6 "Multisig flow via governance
+// proposals" for the operator workflow.
+type UpgradePayload struct {
+	// PublicValuesHex is the 280-byte SP1 public-values blob the
+	// rotation's STARK proof commits to (covenant.UpgradeRequest.PublicValues).
+	// Decoded length MUST be 280; the broadcaster surfaces a typed
+	// error if it isn't.
+	PublicValuesHex string `json:"publicValuesHex"`
+
+	// BatchDataHex is the canonical batch encoding the proof commits
+	// to (covenant.UpgradeRequest.BatchData). Hex-encoded.
+	BatchDataHex string `json:"batchDataHex"`
+
+	// ProofBlobHex is the SP1 STARK proof bytes
+	// (covenant.UpgradeRequest.ProofBlob). Hex-encoded.
+	ProofBlobHex string `json:"proofBlobHex"`
+
+	// CurrentStateRootHex is the live covenant's pre-upgrade StateRoot
+	// (covenant.UpgradeRequest.CurrentStateRoot). 32 bytes hex.
+	CurrentStateRootHex string `json:"currentStateRootHex"`
+
+	// CurrentBlockNumber is the live covenant's pre-upgrade
+	// BlockNumber (covenant.UpgradeRequest.CurrentBlockNumber). The
+	// upgrade tx advances this to CurrentBlockNumber + 1.
+	CurrentBlockNumber uint64 `json:"currentBlockNumber"`
+
+	// NewCovenantAnfHashHex is the 32-byte hash256 of the canonical
+	// ANF document for the new covenant
+	// (covenant.UpgradeRequest.NewCovenantAnfHash). Bound into the
+	// spec-10 migration OP_RETURN.
+	NewCovenantAnfHashHex string `json:"newCovenantAnfHashHex"`
+
+	// NewCovenantScriptHex is the new covenant locking script bytes
+	// (covenant.UpgradeRequest.NewCovenantScript). The upgrade method
+	// asserts pv[240..272) == hash256(NewCovenantScript) so the proof
+	// binds the migration target.
+	NewCovenantScriptHex string `json:"newCovenantScriptHex"`
+
+	// ChainID is the EIP-155 chain id (covenant.UpgradeRequest.ChainID).
+	// Encoded LE into pv[136..144). MUST match the live covenant's
+	// ChainId readonly.
+	ChainID uint64 `json:"chainId"`
+}
+
 // Proposal is the canonical on-wire governance proposal. The `ID`
 // field is a content hash; everything else below it is content.
 type Proposal struct {
-	// ID is sha256(canonicalJSON({action, params})) — the content
-	// hash identifying the proposal.
+	// ID is sha256(canonicalJSON({action, params, upgradePayload})) —
+	// the content hash identifying the proposal. The upgrade payload
+	// is folded into the hash so signers commit to the exact
+	// rotation tx they are authorising; freeze/unfreeze proposals
+	// leave UpgradePayload nil and only (action, params) feed the hash.
 	ID string `json:"id"`
 
 	// Action selects the governance entry point (freeze / unfreeze /
@@ -56,8 +115,17 @@ type Proposal struct {
 
 	// Params is the opaque action-specific payload. For "freeze" and
 	// "unfreeze" this is empty (the action speaks for itself); for
-	// "upgrade" it's the new covenant script hex.
+	// "upgrade" it MAY carry the new covenant script hex for backwards
+	// compatibility, but the canonical payload now lives in
+	// UpgradePayload.
 	Params json.RawMessage `json:"params,omitempty"`
+
+	// UpgradePayload is the rotation bundle for `upgrade` proposals.
+	// nil for freeze/unfreeze. Carried omitempty so the gossip wire
+	// format stays backwards-compatible: existing freeze/unfreeze
+	// proposals serialise to the same bytes they did before this
+	// field existed.
+	UpgradePayload *UpgradePayload `json:"upgradePayload,omitempty"`
 
 	// Required is the number of signatures needed to broadcast.
 	// Copied from the shard's governance config at create time.
@@ -82,6 +150,10 @@ type Proposal struct {
 // NewProposal constructs a new proposal with the content-hash ID
 // derived from (action, params). The caller passes the governance
 // threshold from the shard config.
+//
+// For upgrade proposals carrying an SP1 proof bundle, prefer
+// NewUpgradeProposal — it folds the upgrade-payload bindings into the
+// content hash and the canonical JSON the signers see.
 func NewProposal(action Action, params json.RawMessage, required int, expiry time.Duration) (*Proposal, error) {
 	if action == "" {
 		return nil, errors.New("action is required")
@@ -92,7 +164,7 @@ func NewProposal(action Action, params json.RawMessage, required int, expiry tim
 	if expiry <= 0 {
 		expiry = DefaultExpiry
 	}
-	id, err := contentID(action, params)
+	id, err := contentID(action, params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -108,18 +180,93 @@ func NewProposal(action Action, params json.RawMessage, required int, expiry tim
 	}, nil
 }
 
+// NewUpgradeProposal constructs an `upgrade` proposal with the SP1
+// proof bundle + rotation-target bindings folded into the content
+// hash. Two nodes independently building the same upgrade proposal
+// (same payload) produce identical IDs — the foundation for the
+// gossip-driven multisig coordination.
+//
+// The payload's hex fields are copied verbatim into the proposal —
+// callers are expected to pass valid hex; the broadcaster's
+// dispatchUpgrade re-validates lengths before assembling the
+// unlock script.
+func NewUpgradeProposal(payload UpgradePayload, required int, expiry time.Duration) (*Proposal, error) {
+	if required < 1 {
+		return nil, errors.New("required signatures must be >= 1")
+	}
+	if payload.NewCovenantScriptHex == "" {
+		return nil, errors.New("upgrade payload: newCovenantScriptHex is required")
+	}
+	if payload.PublicValuesHex == "" {
+		return nil, errors.New("upgrade payload: publicValuesHex is required")
+	}
+	if payload.BatchDataHex == "" {
+		return nil, errors.New("upgrade payload: batchDataHex is required")
+	}
+	if payload.ProofBlobHex == "" {
+		return nil, errors.New("upgrade payload: proofBlobHex is required")
+	}
+	if payload.CurrentStateRootHex == "" {
+		return nil, errors.New("upgrade payload: currentStateRootHex is required")
+	}
+	if payload.NewCovenantAnfHashHex == "" {
+		return nil, errors.New("upgrade payload: newCovenantAnfHashHex is required")
+	}
+	if expiry <= 0 {
+		expiry = DefaultExpiry
+	}
+	pCopy := payload
+	id, err := contentID(ActionUpgrade, nil, &pCopy)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	return &Proposal{
+		ID:             id,
+		Action:         ActionUpgrade,
+		UpgradePayload: &pCopy,
+		Required:       required,
+		Signatures:     map[string]string{},
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(expiry),
+	}, nil
+}
+
 // contentID computes the canonical content hash keying a proposal.
 // Two nodes independently constructing the same proposal (same
-// action, same params) produce identical IDs — the foundation for
-// idempotent gossip merges.
-func contentID(action Action, params json.RawMessage) (string, error) {
+// action, same params, same upgrade payload) produce identical IDs —
+// the foundation for idempotent gossip merges.
+//
+// For freeze/unfreeze proposals, upgradePayload is nil and the body
+// shape is {action, params} — byte-identical to the pre-payload-extension
+// hash so existing freeze/unfreeze proposal IDs do not drift.
+//
+// For upgrade proposals built via NewUpgradeProposal, upgradePayload
+// is non-nil and the body shape is {action, params, upgradePayload};
+// the payload bindings (state root, block number, new script, proof
+// bundle) are folded in so signers commit to the exact upgrade tx
+// they are authorising.
+func contentID(action Action, params json.RawMessage, payload *UpgradePayload) (string, error) {
 	if params == nil {
 		params = json.RawMessage("null")
 	}
+	if payload == nil {
+		body := struct {
+			Action Action          `json:"action"`
+			Params json.RawMessage `json:"params"`
+		}{Action: action, Params: params}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(raw)
+		return hex.EncodeToString(sum[:]), nil
+	}
 	body := struct {
-		Action Action          `json:"action"`
-		Params json.RawMessage `json:"params"`
-	}{Action: action, Params: params}
+		Action         Action          `json:"action"`
+		Params         json.RawMessage `json:"params"`
+		UpgradePayload *UpgradePayload `json:"upgradePayload"`
+	}{Action: action, Params: params, UpgradePayload: payload}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return "", err
@@ -265,6 +412,10 @@ func clone(p *Proposal) *Proposal {
 	}
 	if p.Params != nil {
 		out.Params = append(json.RawMessage(nil), p.Params...)
+	}
+	if p.UpgradePayload != nil {
+		payloadCopy := *p.UpgradePayload
+		out.UpgradePayload = &payloadCopy
 	}
 	return &out
 }

@@ -523,6 +523,31 @@ is logged-only." Cited lines: `pkg/rpc/admin_api.go:92`,
       sub-gap is tracked separately as
       `WW-governance-payload-extension`. See
       `docs/operator/admin.md` §"Multisig governance proposals".
+- [x] **DONE** (2026-05-03): `WW-governance-payload-extension` —
+      `pkg/governance.Proposal` now carries an optional
+      `UpgradePayload` struct (`publicValuesHex`, `batchDataHex`,
+      `proofBlobHex`, `currentStateRootHex`, `currentBlockNumber`,
+      `newCovenantAnfHashHex`, `newCovenantScriptHex`, `chainId`).
+      `governance.NewUpgradeProposal` is the proposer-side helper
+      that folds those bindings into the proposal's content hash
+      so signers commit to the exact upgrade tx they are
+      authorising. `pkg/governance.Broadcaster.dispatchUpgrade`
+      decodes the payload at threshold, builds the unlock script
+      via `pkg/covenant.BuildUpgradeUnlockScript`, builds the spend
+      tx via `deploy/covenant.BuildUpgradeSpendTx` (same builder
+      `--broadcast` rotate-vk uses), and broadcasts via ARC.
+      `deploy/covenant/cmd/rotate-vk` exposes a new
+      `--via-governance-proposal` flag that emits the proposal JSON
+      instead of broadcasting directly — operators submit it via
+      `admin_createGovernanceProposal` on a running node, gossip
+      replicates + collects signatures, and the daemon's
+      broadcaster fires automatically once threshold is met. The
+      gossip wire format stays backwards-compatible: freeze /
+      unfreeze proposals serialise to byte-identical JSON. Coverage:
+      `pkg/governance/{proposal,broadcaster}_test.go` and
+      `test/integration/{governance_broadcast,rotate_vk}_test.go`.
+      See `docs/operator/vk-rotation.md` §4b for the operator
+      runbook.
 - [x] **DONE** (2026-05-03): documented the threshold flow + the
       ARC-failure UX in `docs/operator/admin.md` so an operator
       reading the runbook knows exactly what happens at threshold

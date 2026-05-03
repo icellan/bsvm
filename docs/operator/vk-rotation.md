@@ -270,6 +270,27 @@ unsupported), fix locally before continuing.
 
 Skip this section for `single_key` shards.
 
+Operators have **two** ways to coordinate signatures for an M-of-N
+rotation:
+
+* **Out-of-band partial-bundle flow** (`--broadcast`, the original
+  path). Suited to airgapped / HSM workflows where signatures are
+  collected manually and the rotation tx is broadcast directly via
+  ARC by the M-th operator.
+* **Governance-coordinated gossip flow** (`--via-governance-proposal`,
+  added 2026-05-03 closing `WW-governance-payload-extension`).
+  Suited to operators already running the daemon: rotate-vk emits a
+  governance proposal JSON, the operator submits it via
+  `admin_createGovernanceProposal`, libp2p gossip carries it to
+  the other governance key holders, and the daemon's broadcaster
+  fires the upgrade tx automatically once the M-of-N threshold is
+  met.
+
+The two paths are **mutually exclusive** in a single rotate-vk
+invocation — passing both flags errors out.
+
+### 4a. Out-of-band partial-bundle flow (`--broadcast`)
+
 For an M-of-N rotation, the first operator runs:
 
 ```bash
@@ -309,6 +330,92 @@ Each subsequent operator:
 
 When the M-th operator runs the binary, the count check passes and
 the assembly + ARC broadcast path activates.
+
+### 4b. Governance-coordinated gossip flow (`--via-governance-proposal`)
+
+Use this path when:
+
+* Every governance key holder runs (or has admin RPC access to) a
+  shard daemon node.
+* You want signature collection to flow over libp2p gossip rather
+  than a sidechannel like Slack.
+* You want the upgrade tx broadcast to happen automatically the
+  moment the M-th signature lands, with no manual co-sign step.
+
+The proposer runs:
+
+```bash
+./build/rotate-vk \
+    --config rotation.json \
+    --via-governance-proposal \
+    --proposal-out rotate-vk.proposal.json \
+    --out /tmp/rotation-summary.json
+```
+
+Note: `governanceSigsHex` is **NOT** required in the rotation config
+for this path — those signatures come from gossip, not from this
+binary's input.
+
+rotate-vk:
+
+1. Re-compiles the new covenant (same dry-run summary diff).
+2. Builds the SP1 proof bundle (real or synthetic, depending on
+   `proofBundlePath`).
+3. Builds the canonical ANF document for the new covenant and writes
+   it to `rotate-vk.anf.json` (so signers can fetch + audit it
+   independently).
+4. Constructs an upgrade `governance.Proposal` with an
+   `UpgradePayload` carrying:
+   * `publicValuesHex` (280 bytes)
+   * `batchDataHex`
+   * `proofBlobHex`
+   * `currentStateRootHex` + `currentBlockNumber`
+   * `newCovenantScriptHex` + `newCovenantAnfHashHex`
+   * `chainId`
+5. Writes the proposal JSON to `rotate-vk.proposal.json` and emits
+   a summary with the proposal's content-hash ID.
+
+The proposer then submits the proposal on a running shard node:
+
+```bash
+# Strip the gossip-only fields the admin RPC fills in itself.
+PROPOSAL=$(jq '.action, .upgradePayload' rotate-vk.proposal.json)
+# Or POST to /admin/rpc with admin_createGovernanceProposal directly.
+```
+
+Each subsequent governance key holder:
+
+1. Pulls the proposal from any node via
+   `admin_listGovernanceProposals` — gossip has already replicated
+   it.
+2. Inspects the proposal's `upgradePayload` to verify the bindings
+   match the rotation they expected to sign (the payload is part of
+   the content hash, so a tampered payload produces a different
+   proposal ID). The signer commits to the **exact upgrade tx they
+   are authorising** before signing — this is what the
+   `WW-governance-payload-extension` work was about.
+3. Signs `sha256(proposalId)` with their governance WIF using their
+   wallet's BRC-3 helper (see `cmd/bsvm/main.go::makeProposalVerifier`
+   for the canonical signing-bytes recipe).
+4. Submits the signature via `admin_signGovernanceProposal`.
+
+Once the M-th signature is recorded:
+
+* `pkg/governance.Workflow.maybeReady` fires the daemon's
+  `governance.Broadcaster.OnReady`.
+* `dispatchUpgrade` decodes the gossiped `UpgradePayload`, builds
+  the unlock script via `pkg/covenant.BuildUpgradeUnlockScript`,
+  builds the spend tx via `deploy/covenant.BuildUpgradeSpendTx`
+  (same builder rotate-vk's `--broadcast` uses), and broadcasts
+  via the daemon's ARC client.
+* The successful `BroadcastResult` surfaces through the
+  broadcaster's `Subscribe` callback (and into the admin RPC
+  `admin_listGovernanceProposals` response as `broadcastTxid`).
+
+If ARC rejects the broadcast (network failure, stale outpoint, the
+synthetic-proof caveat in §1 step 4), the proposal stays in the
+workflow store with `broadcastTxid` empty so a re-sign or restart
+can re-attempt.
 
 ---
 
@@ -491,4 +598,12 @@ ergonomics" milestone; tracking them here so they don't get lost.
   helper that closes the operator-side signing gap (covered by
   `cmd/bsvm/dev_sign_rotation_test.go`).
 * `test/integration/rotate_vk_test.go` — assembly-path coverage
-  (real testnet rotation gated behind `BSVM_TESTNET=1`).
+  (real testnet rotation gated behind `BSVM_TESTNET=1`); also
+  covers `--via-governance-proposal` end-to-end against a fake
+  ARC + workflow loop.
+* `pkg/governance/proposal.go::UpgradePayload` and
+  `pkg/governance.NewUpgradeProposal` — the proposal bundle
+  shape the gossip flow uses (see §4b).
+* `pkg/governance/broadcaster.go::dispatchUpgrade` — the at-threshold
+  broadcaster that builds + broadcasts the upgrade tx once gossip
+  collects M-of-N signatures.

@@ -31,6 +31,13 @@ func main() {
 			"Default: false (operator dry-runs, inspects --anf-doc, then opts in)")
 	flag.StringVar(&opts.AnfDocPath, "anf-doc", "",
 		"write the canonical ANF document JSON to this path (default: <config-dir>/rotate-vk.anf.json)")
+	flag.BoolVar(&opts.ViaGovernanceProposal, "via-governance-proposal", false,
+		"emit an upgrade governance proposal JSON instead of broadcasting directly. The "+
+			"operator submits the proposal on a running node via admin_createGovernanceProposal; "+
+			"once threshold signatures are collected through gossip, the daemon's broadcaster "+
+			"builds + broadcasts the upgrade tx. Mutually exclusive with --broadcast.")
+	flag.StringVar(&opts.ProposalOutPath, "proposal-out", "",
+		"in --via-governance-proposal mode, write the proposal JSON here (default: <config-dir>/rotate-vk.proposal.json)")
 	flag.Parse()
 
 	if err := covenantdeploy.RunRotateVK(opts); err != nil {

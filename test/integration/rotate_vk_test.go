@@ -29,10 +29,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	covenantdeploy "github.com/icellan/bsvm/deploy/covenant"
+	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/covenant"
+	"github.com/icellan/bsvm/pkg/governance"
 )
 
 // fixtureCurrentStateRoot is the placeholder StateRoot used in the
@@ -338,6 +342,197 @@ func TestRotateVK_Broadcast_AnfPublishAttemptsBroadcast(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"kind":"rotation"`) {
 		t.Errorf("ANF doc does not contain rotation kind tag: %q", raw)
+	}
+}
+
+// TestRotateVK_ViaGovernanceProposal_EmitsAndBroadcaster_Fires is
+// the integration coverage for --via-governance-proposal: the
+// rotate-vk binary builds an upgrade governance proposal, writes it
+// to disk, and the proposal can be ingested by a workflow + signed
+// by the M-of-N keys until the broadcaster's dispatchUpgrade fires.
+//
+// Mirrors the rotate_vk_test.go::FullSigsAssemblesTx pattern: the
+// fake ARC at 127.0.0.1:1 will reject the broadcast, but the test
+// asserts the assembly path completed (non-empty TxHex surfaced via
+// Subscribe). Closes WW-governance-payload-extension.
+func TestRotateVK_ViaGovernanceProposal_EmitsAndBroadcasterFires(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping rotate-vk via-governance-proposal in short mode")
+	}
+
+	cfg := rotateFixtureConfig(t)
+	// Switch to multisig 2-of-3 so we exercise the M-of-N gossip
+	// flow the new --via-governance-proposal path is designed for.
+	cfg.Governance = covenantdeploy.OperatorGovernance{
+		Mode:      "multisig",
+		Threshold: 2,
+		Keys: []string{
+			fixtureSinglekeyPubKeyHex,
+			"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+			"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+		},
+	}
+	// Note: NO governanceSigsHex — those come from the gossip cycle.
+
+	cfgPath := writeRotateConfigFile(t, cfg)
+	out := filepath.Join(filepath.Dir(cfgPath), "summary.json")
+	proposalPath := filepath.Join(filepath.Dir(cfgPath), "rotate-vk.proposal.json")
+
+	if err := covenantdeploy.RunRotateVK(covenantdeploy.RotateOptions{
+		ConfigPath:            cfgPath,
+		ViaGovernanceProposal: true,
+		ProposalOutPath:       proposalPath,
+		OutPath:               out,
+	}); err != nil {
+		t.Fatalf("RunRotateVK --via-governance-proposal: %v", err)
+	}
+
+	// Step 1: rotate-vk wrote the proposal JSON.
+	raw, err := os.ReadFile(proposalPath)
+	if err != nil {
+		t.Fatalf("read proposal: %v", err)
+	}
+	var proposal governance.Proposal
+	if err := json.Unmarshal(raw, &proposal); err != nil {
+		t.Fatalf("parse proposal: %v", err)
+	}
+	if proposal.Action != governance.ActionUpgrade {
+		t.Errorf("proposal.Action = %q, want upgrade", proposal.Action)
+	}
+	if proposal.UpgradePayload == nil {
+		t.Fatal("proposal.UpgradePayload nil — rotate-vk did not populate the upgrade bundle")
+	}
+	if proposal.UpgradePayload.NewCovenantScriptHex == "" {
+		t.Error("proposal.UpgradePayload.NewCovenantScriptHex empty")
+	}
+	if len(proposal.UpgradePayload.PublicValuesHex) != 280*2 {
+		t.Errorf("proposal.UpgradePayload.PublicValuesHex length = %d, want 560 (280 bytes hex)",
+			len(proposal.UpgradePayload.PublicValuesHex))
+	}
+	if proposal.Required != 2 {
+		t.Errorf("proposal.Required = %d, want 2", proposal.Required)
+	}
+
+	// Step 2: ingest the proposal into a workflow and fake the 2-of-3
+	// signature collection. The verifier here is a stub that accepts
+	// any signature and returns the corresponding governance key in
+	// rotation; production uses makeProposalVerifier in cmd/bsvm.
+	keyA := mustDecodeHexInt(fixtureSinglekeyPubKeyHex)
+	keyB := mustDecodeHexInt("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+	keyC := mustDecodeHexInt("02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+
+	gov := covenant.GovernanceConfig{
+		Mode:      covenant.GovernanceMultiSig,
+		Threshold: 2,
+		Keys:      [][]byte{keyA, keyB, keyC},
+	}
+	state := &integrationCovenantState{
+		tipTxID: fixtureGovernanceTipTxID(t),
+		tipVout: 0,
+		cov:     &covenant.CompiledCovenant{LockingScript: []byte{0x76, 0xa9, 0x14, 0x55}},
+		gov:     gov,
+		sats:    covenant.DefaultCovenantSats,
+	}
+	arcClient, err := arc.NewClient(arc.Config{URL: "http://127.0.0.1:1", Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("arc.NewClient: %v", err)
+	}
+	b, err := governance.NewBroadcaster(governance.BroadcasterConfig{
+		ARC:              arcClient,
+		State:            state,
+		SpendBuilder:     integrationSpendBuilder,
+		DefaultSats:      covenant.DefaultCovenantSats,
+		BroadcastTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewBroadcaster: %v", err)
+	}
+
+	var (
+		mu  sync.Mutex
+		got governance.BroadcastResult
+	)
+	b.Subscribe(func(r governance.BroadcastResult) {
+		mu.Lock()
+		got = r
+		mu.Unlock()
+	})
+
+	// Stub verifier that walks the governance keys in order — sigs are
+	// indexed by call count so the first sig binds to keyA, second to
+	// keyB. Production uses ECDSA verification over sha256(proposalID);
+	// for this assembly-path coverage that detail is irrelevant.
+	var sigCallCount int
+	var sigMu sync.Mutex
+	verifier := func(_ string, _ string) ([]byte, error) {
+		sigMu.Lock()
+		defer sigMu.Unlock()
+		idx := sigCallCount
+		sigCallCount++
+		switch idx {
+		case 0:
+			return keyA, nil
+		case 1:
+			return keyB, nil
+		default:
+			return keyC, nil
+		}
+	}
+
+	store := governance.NewMemoryStore()
+	wf := governance.NewWorkflow(store, nil, verifier)
+	wf.OnReady(b.OnReady)
+
+	// Step 3: ingest the proposal as if a peer's gossip delivered it.
+	if _, err := wf.CreateOrMerge(&proposal); err != nil {
+		t.Fatalf("CreateOrMerge: %v", err)
+	}
+
+	// Step 4: collect 2-of-3 signatures. Each Sign call routes through
+	// the broadcaster's OnReady once the threshold is met.
+	if _, err := wf.Sign(proposal.ID, hex.EncodeToString(make([]byte, 71))); err != nil {
+		t.Fatalf("Sign #1: %v", err)
+	}
+	if _, err := wf.Sign(proposal.ID, hex.EncodeToString(make([]byte, 71))); err != nil {
+		t.Fatalf("Sign #2: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got.Action != governance.ActionUpgrade {
+		t.Errorf("BroadcastResult.Action = %q, want upgrade", got.Action)
+	}
+	// Expecting an ARC error — the assembly path must have completed
+	// before the network failure.
+	if got.Err == nil {
+		t.Fatal("expected ARC.Broadcast error against 127.0.0.1:1, got nil — was the broadcaster fired?")
+	}
+	if got.TxHex == "" {
+		t.Fatal("BroadcastResult.TxHex empty — broadcaster did not assemble a tx before ARC failure")
+	}
+	if got.TxID == "" {
+		t.Error("BroadcastResult.TxID empty — operator can't identify the tx")
+	}
+}
+
+// TestRotateVK_ViaGovernanceProposal_RejectsBroadcastConflict asserts
+// the binary refuses to combine --via-governance-proposal with
+// --broadcast (the two are mutually exclusive: pick gossip OR direct
+// ARC).
+func TestRotateVK_ViaGovernanceProposal_RejectsBroadcastConflict(t *testing.T) {
+	cfg := rotateFixtureConfig(t)
+	cfgPath := writeRotateConfigFile(t, cfg)
+
+	err := covenantdeploy.RunRotateVK(covenantdeploy.RotateOptions{
+		ConfigPath:            cfgPath,
+		Broadcast:             true,
+		ViaGovernanceProposal: true,
+	})
+	if err == nil {
+		t.Fatal("expected error when combining --broadcast and --via-governance-proposal")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected 'mutually exclusive' in error, got: %v", err)
 	}
 }
 

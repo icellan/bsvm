@@ -30,15 +30,19 @@
 //     identical).
 //   - Broadcast via the supplied arc.ARCClient.
 //
-// Upgrade proposals are NOT broadcast from this path today. The
-// proposal payload as defined in spec 15 only carries the new
-// covenant script hex — it does NOT carry the SP1 proof bundle
-// (publicValues / batchData / proofBlob), the current state root, or
-// the canonical ANF document hash that BuildUpgradeUnlockScript
-// requires. Adding those fields to the gossip wire format is
-// invasive and out of scope here. The deferred path is tracked under
-// WW-governance-payload-extension; see the godoc on
-// onReadyUpgrade below.
+// Upgrade proposals are now wired end-to-end (closes
+// WW-governance-payload-extension). The proposer constructs the
+// proposal via governance.NewUpgradeProposal which folds the SP1
+// proof bundle (publicValues / batchData / proofBlob), current
+// state root, current block number, new covenant script, chain id,
+// and the canonical ANF hash into the proposal's UpgradePayload.
+// The bundle gossips alongside the signatures so each signer commits
+// to the exact rotation tx they are authorising. dispatchUpgrade
+// decodes the payload, builds the unlock script via
+// pkg/covenant.BuildUpgradeUnlockScript, and broadcasts via ARC.
+// The continuation output is the NEW covenant locking script (the
+// rotation's whole point — freeze/unfreeze re-use the live script
+// unchanged, upgrade swaps it).
 //
 // Failure semantics
 // -----------------
@@ -273,23 +277,127 @@ func (b *Broadcaster) dispatchFreezeUnfreeze(p *Proposal) {
 	b.assembleAndBroadcast(p, cov.LockingScript, unlock)
 }
 
-// dispatchUpgrade is the deferred upgrade path. Today the proposal
-// payload (Proposal.Params) does NOT carry the SP1 proof bundle that
-// BuildUpgradeUnlockScript requires. Until the gossip wire format is
-// extended (tracked as WW-governance-payload-extension), upgrade
-// proposals at threshold log a WARN and surface a typed error to
-// subscribers — the operator can fall back to the rotate-vk binary
-// for upgrades.
+// dispatchUpgrade handles upgrade proposals at threshold. The
+// proposal's UpgradePayload (populated by NewUpgradeProposal at the
+// proposer side and gossiped along with the signatures) carries the
+// SP1 proof bundle + rotation-target bindings that
+// pkg/covenant.BuildUpgradeUnlockScript requires. Closes
+// WW-governance-payload-extension.
+//
+// Failure semantics mirror dispatchFreezeUnfreeze: any decode error
+// (missing payload, malformed hex, wrong public-values length),
+// unlock-script build error, or ARC broadcast failure surfaces
+// through Subscribe and leaves the proposal in the workflow store
+// for retry. The proposal is NOT marked broadcast on failure.
 func (b *Broadcaster) dispatchUpgrade(p *Proposal) {
-	err := errors.New(
-		"upgrade proposal at threshold but the gossip wire format does not yet carry the SP1 proof bundle " +
-			"(publicValues/batchData/proofBlob) needed for BuildUpgradeUnlockScript. " +
-			"Fall back to deploy/covenant/rotate-vk for upgrades, or extend the proposal payload " +
-			"(tracked as WW-governance-payload-extension).",
-	)
-	b.logger.Warn("governance broadcaster: upgrade path not wired",
-		"id", p.ID, "action", p.Action, "err", err)
-	b.publish(BroadcastResult{ProposalID: p.ID, Action: p.Action, Err: err})
+	if p.UpgradePayload == nil {
+		err := errors.New(
+			"upgrade proposal at threshold but UpgradePayload is nil — proposer must use governance.NewUpgradeProposal " +
+				"to populate the SP1 proof bundle (publicValues/batchData/proofBlob), the current state root, " +
+				"and the canonical ANF hash that BuildUpgradeUnlockScript requires",
+		)
+		b.logger.Warn("governance broadcaster: upgrade payload missing",
+			"id", p.ID, "action", p.Action, "err", err)
+		b.publish(BroadcastResult{ProposalID: p.ID, Action: p.Action, Err: err})
+		return
+	}
+
+	gov := b.state.GovernanceConfig()
+	cov := b.state.Covenant()
+	if cov == nil || len(cov.LockingScript) == 0 {
+		b.publish(BroadcastResult{
+			ProposalID: p.ID,
+			Action:     p.Action,
+			Err:        errors.New("compiled covenant unavailable — node started without covenant.anf.json"),
+		})
+		return
+	}
+
+	sigs, err := decodeProposalSigsForGov(p, gov)
+	if err != nil {
+		b.publish(BroadcastResult{ProposalID: p.ID, Action: p.Action, Err: err})
+		return
+	}
+
+	req, err := buildUpgradeRequest(p.UpgradePayload, sigs)
+	if err != nil {
+		b.publish(BroadcastResult{ProposalID: p.ID, Action: p.Action, Err: err})
+		return
+	}
+
+	unlock, err := covenant.BuildUpgradeUnlockScript(req, gov)
+	if err != nil {
+		b.publish(BroadcastResult{ProposalID: p.ID, Action: p.Action, Err: fmt.Errorf("build upgrade unlock script: %w", err)})
+		return
+	}
+
+	// Continuation output for an upgrade is the NEW covenant locking
+	// script (the rotation's whole point). Freeze/unfreeze re-use the
+	// LIVE locking script unchanged; the upgrade swaps it.
+	b.assembleAndBroadcast(p, req.NewCovenantScript, unlock)
+}
+
+// buildUpgradeRequest decodes the gossip-format UpgradePayload into
+// the covenant.UpgradeRequest BuildUpgradeUnlockScript consumes.
+// Validation errors (missing fields, malformed hex, wrong
+// public-values length) surface here so dispatchUpgrade can publish
+// them to subscribers without partially-assembling a tx.
+func buildUpgradeRequest(p *UpgradePayload, sigs [][]byte) (covenant.UpgradeRequest, error) {
+	var req covenant.UpgradeRequest
+	pv, err := hex.DecodeString(p.PublicValuesHex)
+	if err != nil {
+		return req, fmt.Errorf("publicValuesHex: %w", err)
+	}
+	if len(pv) != 280 {
+		return req, fmt.Errorf("publicValuesHex must decode to 280 bytes, got %d", len(pv))
+	}
+	bd, err := hex.DecodeString(p.BatchDataHex)
+	if err != nil {
+		return req, fmt.Errorf("batchDataHex: %w", err)
+	}
+	pb, err := hex.DecodeString(p.ProofBlobHex)
+	if err != nil {
+		return req, fmt.Errorf("proofBlobHex: %w", err)
+	}
+	srBytes, err := hex.DecodeString(p.CurrentStateRootHex)
+	if err != nil {
+		return req, fmt.Errorf("currentStateRootHex: %w", err)
+	}
+	if len(srBytes) != 32 {
+		return req, fmt.Errorf("currentStateRootHex must decode to 32 bytes, got %d", len(srBytes))
+	}
+	anfBytes, err := hex.DecodeString(p.NewCovenantAnfHashHex)
+	if err != nil {
+		return req, fmt.Errorf("newCovenantAnfHashHex: %w", err)
+	}
+	if len(anfBytes) != 32 {
+		return req, fmt.Errorf("newCovenantAnfHashHex must decode to 32 bytes, got %d", len(anfBytes))
+	}
+	scriptBytes, err := hex.DecodeString(p.NewCovenantScriptHex)
+	if err != nil {
+		return req, fmt.Errorf("newCovenantScriptHex: %w", err)
+	}
+	if len(scriptBytes) == 0 {
+		return req, errors.New("newCovenantScriptHex must be non-empty")
+	}
+
+	var stateRoot [32]byte
+	copy(stateRoot[:], srBytes)
+	var anfHash [32]byte
+	copy(anfHash[:], anfBytes)
+
+	req = covenant.UpgradeRequest{
+		CurrentStateRoot:   stateRoot,
+		CurrentBlockNumber: p.CurrentBlockNumber,
+		ChainID:            p.ChainID,
+		NewCovenantScript:  scriptBytes,
+		NewCovenantAnfHash: anfHash,
+		PublicValues:       pv,
+		BatchData:          bd,
+		ProofBlob:          pb,
+		GovernanceSigs:     sigs,
+	}
+	return req, nil
 }
 
 // assembleAndBroadcast builds the spend tx + dispatches to ARC.
