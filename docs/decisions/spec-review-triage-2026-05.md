@@ -377,17 +377,17 @@ biggest concrete risk is third-party tooling that asks
 EIP-7702 delegated-call fails.
 
 **Recommended path**:
-- [ ] Push back: spec 01 needs an update first. Proposed wording
-      for spec 01 §"Source": "v1 ships Cancun (pre-Prague). EOF
-      remains explicitly excluded. Prague EIPs (7702, 2537,
-      6110, 7002, 7251, 7549) are deferred to vN; the
-      `pkg/vm.ChainConfig.PragueTime` field is reserved as a
-      forward-compat marker but does not activate any new
-      opcodes in v1." This matches the implementation's actual
-      behaviour and the comment in `cmd/bsvm/config.go:84-90`.
-- [ ] If spec 01 stays as-is, open a tracked TODO with named hook
-      `EVM-prague-delta` to land the Prague EIPs — multi-week
-      work.
+- [x] **DONE** (2026-05-03): spec 01 §"Source" updated to state
+      "v1 fork target: Cancun (Prague deferred)" and the §"EVM
+      version note" near the point-evaluation precompile section
+      mirrors the same wording. `DefaultL2Config` example in spec
+      01 now shows `PragueTime: nil` with a comment pointing at the
+      hook. The Prague delta is tracked under the
+      `WW-prague-fork-bump` named hook; bumping the
+      `supportedEVMForks` set in `cmd/bsvm/config.go` is part of
+      that work. The inline comment in `cmd/bsvm/config.go:74-99`
+      now also names `WW-prague-fork-bump` so a code reader can
+      grep for it.
 
 **Notes for the operator**: The implementation+spec mismatch is
 real. The simplest resolution is the spec update — the
@@ -460,15 +460,19 @@ exists, deploys, fails at runtime" — that is a
 contract-developer-facing failure, not a node-correctness failure.
 
 **Recommended path**:
-- [x] Push back: spec 01 §"Custom BSV Precompiles" needs a
-      clarifying sentence. Proposed wording for spec 01 line 483:
-      "**BSV Precompile Input/Output Formats** (reserved in v1
-      Milestones 1-4 as stubs that revert with
-      `ErrBSVPrecompileNotActive`; activated in Milestone 5
-      with the input/output formats below)." This resolves the
-      tension without changing any committed behaviour.
+- [x] **DONE** (2026-05-03): spec 01 §"Custom BSV Precompiles"
+      rewritten so both the lead-in paragraph and the I/O-formats
+      paragraph use consistent "reserved in v1 / activated under
+      `BSV-precompiles-activation`" wording. The earlier
+      "completed in Milestone 5" claim is gone; the spec now
+      matches the stub behaviour committed in
+      `pkg/vm/contracts.go`. The stub doc comments in
+      `pkg/vm/contracts.go` (the registration block and the
+      `stubBSVPrecompile` type comment) now name the
+      `BSV-precompiles-activation` hook so a code reader can grep
+      for it.
 - [ ] Open a tracked TODO with named hook
-      `BSV-precompiles-M5-activation` once the M5 plan is
+      `BSV-precompiles-activation` once the activation plan is
       ready — the implementation work depends on the SPV
       witness format the SP1 guest can verify.
 

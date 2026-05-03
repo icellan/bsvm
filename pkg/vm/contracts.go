@@ -75,9 +75,13 @@ func precompileMap(rules Rules) map[types.Address]PrecompiledContract {
 		m[types.BytesToAddress([]byte{0x0a})] = &pointEvaluation{}
 	}
 	// BSV precompiles: registered as stubs that revert with
-	// ErrBSVPrecompileNotActive and consume all provided gas. Per Spec 01,
-	// these must be present so that calls to 0x80-0x82 revert rather than
-	// silently succeeding with empty return data.
+	// ErrBSVPrecompileNotActive and consume gas proportional to input
+	// length. Per spec 01 §"Custom BSV Precompiles", these are
+	// reserved in v1 — the address range and I/O formats are stable,
+	// but the live implementations are deferred under the
+	// BSV-precompiles-activation hook. The stubs must be present so
+	// that calls to 0x80-0x82 revert rather than silently succeeding
+	// with empty return data.
 	//
 	// Only registered when IsBSVM is true (production L2 shards). Not
 	// registered during ethereum/tests where 0x80 is used as a regular
@@ -739,7 +743,12 @@ var pointEvaluationReturnValue = func() []byte {
 	return ret
 }()
 
-// stubBSVPrecompile returns an error for BSV precompiles that are not yet active.
+// stubBSVPrecompile is the v1 reserved-stub implementation for BSV
+// precompiles 0x80-0x82. Per spec 01 §"Custom BSV Precompiles" the
+// addresses are reserved in v1 and stay stubs until the
+// BSV-precompiles-activation hook ships; calls revert with
+// ErrBSVPrecompileNotActive and consume gas proportional to input
+// length.
 type stubBSVPrecompile struct{}
 
 // RequiredGas returns gas proportional to the input length.

@@ -6,7 +6,21 @@ Extract geth's `core/vm` package into a standalone Go module (`pkg/vm`) with zer
 ## Source
 Base extraction on the **last stable geth release tag before EOF (EVM Object Format, EIP-7692)**. EOF introduces new opcodes (RJUMP, CALLF, RETF), a container format, and deploy-time validation — a significant scope increase that is deferred to a future version of bsvm.
 
-Concretely: use a geth tag from the **Prague/Electra (Pectra) hardfork** era, before EOF activation. As of early 2026, this is likely in the v1.14.x or v1.15.x range. Document the exact tag used in the repository README.
+Concretely: clone a geth tag from the **Prague/Electra (Pectra) hardfork** era, before EOF activation (as of early 2026, the v1.14.x or v1.15.x range). Document the exact tag used in the repository README.
+
+**v1 fork target: Cancun (Prague deferred).** The extracted Go EVM
+and the Rust SP1 guest both pin Cancun for v1; the
+`pkg/vm.ChainConfig.PragueTime` field is reserved as a forward-compat
+marker but does not activate any new opcodes or precompiles in v1.
+The Prague EIPs (7702 SetCode-for-EOAs, 2537 BLS12-381 precompiles,
+6110, 7002, 7251, 7549, 7685) are a planned post-v1 upgrade tracked
+under the `WW-prague-fork-bump` hook — landing them requires changes
+in **both** EVMs (Go and the Rust SP1 guest) so the proof public-
+values layout stays byte-identical between them, and is therefore a
+deliberate phasing decision rather than an oversight. The
+`supportedEVMForks` set in `cmd/bsvm/config.go` is the authoritative
+runtime guard: it allows only `"cancun"` until `WW-prague-fork-bump`
+ships.
 
 The `core/vm` directory is the primary target.
 
@@ -95,7 +109,10 @@ type ChainConfig struct {
     FusakaTime          *uint64
 }
 
-// DefaultL2Config returns a config with all hardforks active from genesis.
+// DefaultL2Config returns a config with all v1 hardforks active from
+// genesis. Cancun is the v1 fork target; PragueTime is reserved as a
+// forward-compat marker (set non-nil only when WW-prague-fork-bump
+// ships). FusakaTime/EOF stays nil for v1.
 func DefaultL2Config(chainID int64) *ChainConfig {
     zero := big.NewInt(0)
     zeroTime := uint64(0)
@@ -113,7 +130,7 @@ func DefaultL2Config(chainID int64) *ChainConfig {
         LondonBlock:         zero,
         ShanghaiTime:        &zeroTime,
         CancunTime:          &zeroTime,
-        PragueTime:          &zeroTime,
+        PragueTime:          nil, // Reserved; activated under WW-prague-fork-bump
         FusakaTime:          nil, // Fusaka/EOF not active in v1
     }
 }
@@ -432,15 +449,23 @@ Our L2 doesn't use blob transactions natively (data goes to BSV), but
 contracts deployed on the L2 must be able to call this precompile and
 get correct results. Full EVM compatibility means no missing precompiles.
 
-**EVM version note**: We target the last pre-EOF stable geth release.
-EOF (EVM Object Format, EIP-7692) is explicitly excluded from v1 — it
+**EVM version note**: We clone a pre-EOF stable geth release as the
+extraction reference, but **v1 ships the Cancun ruleset only**. EOF
+(EVM Object Format, EIP-7692) is explicitly excluded from v1 — it
 introduces RJUMP, CALLF, RETF opcodes and a container format that
-significantly increases extraction scope. All other EIPs active in the
-target geth release must be fully implemented — no partial support.
-Document which geth tag was used in the repository README.
+significantly increases extraction scope. The Prague EIPs (7702
+SetCode-for-EOAs, 2537 BLS12-381 precompiles, 6110, 7002, 7251, 7549,
+7685) are likewise excluded from v1 and tracked under the
+`WW-prague-fork-bump` hook (see §"Source"). All Cancun-and-earlier
+EIPs active in the target geth release must be fully implemented — no
+partial support. Document which geth tag was used in the repository
+README.
 
-EOF support may be added in a future version via the protocol upgrade
-mechanism (see spec 09, Milestone 10).
+EOF support and the Prague delta may be added in a future version via
+the protocol upgrade mechanism (see spec 09, Milestone 10). The
+Cancun-only stance is enforced at startup by `cmd/bsvm/config.go`'s
+`supportedEVMForks` map; bumping that map is part of the
+`WW-prague-fork-bump` work.
 
 ## Custom BSV Precompiles
 
@@ -453,16 +478,21 @@ We reserve precompile address range 0x80-0xFF for BSV-specific precompiles:
 | 0x82 | `BSV_BLOCK_HASH` | Get a BSV block hash by height |
 
 Interfaces are defined in Phase 1 (Milestone 1) alongside the standard
-precompiles. Implementations are completed in Milestone 5 (Overlay Node)
-when BSV connectivity is available. The interfaces must be complete from
-the start so the EVM can route calls to these addresses.
+precompiles. **In v1 these precompiles are reserved as stubs** that
+revert with `ErrBSVPrecompileNotActive`; live implementations that
+consult BSV connectivity are deferred to a future version under the
+`BSV-precompiles-activation` hook (the reserved address range and
+input/output formats below are stable so contracts can target them
+once the hook ships). The interfaces must be complete from the start
+so the EVM can route calls to these addresses.
 
-**Before implementation (Milestones 1-4)**: Calls to BSV precompile
-addresses (0x80-0xFF) revert with an error indicating the precompile
-is not yet active. The precompile returns `(nil, ErrBSVPrecompileNotActive)`
-and consumes all provided gas (matching Ethereum's behavior for failed
-precompile calls). This ensures contracts that attempt BSV-specific
-operations fail explicitly rather than returning incorrect data.
+**v1 stub behaviour**: Calls to BSV precompile addresses (0x80-0xFF)
+revert with an error indicating the precompile is not yet active. The
+precompile returns `(nil, ErrBSVPrecompileNotActive)` and consumes
+gas proportional to input length (see `stubBSVPrecompile.RequiredGas`
+in `pkg/vm/contracts.go`). This ensures contracts that attempt
+BSV-specific operations fail explicitly rather than returning
+incorrect data.
 
 ```go
 var ErrBSVPrecompileNotActive = errors.New("BSV precompile not active")
@@ -486,7 +516,7 @@ func (s *StubBSVPrecompile) Run(input []byte) ([]byte, error) {
 - **0x81 `BSV_VERIFY_SCRIPT`**: Input: `RLP(scriptPubKey, scriptSig, flags)`. Output: `0x01` (valid) or revert.
 - **0x82 `BSV_BLOCK_HASH`**: Input: `uint256(bsvBlockHeight)`. Output: `bytes32(blockHash)` or revert if unknown.
 
-These are stubbed with `ErrBSVPrecompileNotActive` until the precompile milestone. The interfaces are defined here to allow contract developers to target them speculatively.
+These are stubbed with `ErrBSVPrecompileNotActive` in v1 and remain reserved until the `BSV-precompiles-activation` hook ships. The interfaces and address range are defined here so contract developers can target them speculatively without the addresses moving once the hook lands.
 
 ## Testing Strategy
 

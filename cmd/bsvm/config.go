@@ -78,11 +78,16 @@ type MetricsSection struct {
 // fork it doesn't yet implement. The default is "cancun".
 //
 // Validation is enforced by ValidateFork at config-load time. Adding a
-// future fork (e.g. Prague) requires updating the supported set here
-// AND wiring the matching jump-table activation in pkg/vm.
+// future fork (Prague delta is the planned post-v1 step, tracked under
+// the WW-prague-fork-bump hook in spec 01 §"Source") requires updating
+// the supported set here AND wiring the matching jump-table activation
+// in pkg/vm AND bumping the SP1 guest's SpecId pin in
+// prover/guest/src/main.rs so the public-values layout stays
+// byte-identical between the two EVMs.
 type EVMSection struct {
 	// Fork is the EVM hardfork rule set the node runs under. Only
-	// "cancun" is supported in v1. The Rust SP1 guest pins
+	// "cancun" is supported in v1 (Prague is deferred under
+	// WW-prague-fork-bump). The Rust SP1 guest pins
 	// SpecId::CANCUN; the Go EVM defaults DefaultL2Config to
 	// CancunTime=0 (active from genesis). Mismatches between this
 	// config knob and the binary's compiled fork are a startup
@@ -93,7 +98,8 @@ type EVMSection struct {
 // supportedEVMForks lists the EVM hardfork names the binary implements.
 // The Rust guest in prover/guest/src/main.rs pins SpecId::CANCUN; the
 // Go EVM's DefaultL2Config activates Cancun from genesis. EOF (Fusaka)
-// is explicitly excluded per spec 01.
+// and the Prague delta are explicitly excluded per spec 01 — Prague
+// is tracked under the WW-prague-fork-bump hook.
 var supportedEVMForks = map[string]bool{
 	"cancun": true,
 }
