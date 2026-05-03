@@ -97,7 +97,7 @@ Output on stdout (JSON Summary, formatted):
 {
   "shardId": "bsvm-mainnet-1",
   "chainId": 8453111,
-  "vkHash": "0x008e9a57...",
+  "vkHash": "0x0021629d...",
   "vkHashSource": "prover/guest/elf/SP1VerifyingKeyHash.txt",
   "bridgeScriptHex": "<hex>",
   "bridgeScriptHash": "<sha256>",

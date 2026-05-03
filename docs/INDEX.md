@@ -73,6 +73,20 @@ For reference, the spec set:
   `tx_type` field in the guest's `revm::context::TxEnv`, which
   mis-priced EIP-2930 / EIP-1559 / EIP-4844 transactions and changed
   the post-state root the guest committed.
+- [decisions/vk-rotation-wire-format-2026-04.md](decisions/vk-rotation-wire-format-2026-04.md) —
+  SP1 verifying-key rotation (2026-04) triggered by a bincode
+  wire-format mismatch between host and guest (`alloy_primitives`
+  defaulted to length-prefixed bytes, host wrote raw fixed arrays);
+  also surfaces the SP1 ELF non-determinism caveat.
+- [decisions/sp1-reproducible-build-2026-05.md](decisions/sp1-reproducible-build-2026-05.md) —
+  Strategy + measured A/B verdict for switching `prover/host-*/build.rs`
+  to `BuildArgs { docker: true }` so the SP1 guest ELF is bit-identical
+  across operators. Phase 1 (docker-mode flip + sha256 sidecar +
+  CI gate) landed 2026-05-03.
+- [operator/sp1-build.md](operator/sp1-build.md) — Operator-side
+  workflow for building and verifying the SP1 guest ELF: docker
+  prerequisites, expected wall-clock, sha256/VK verification, restamp
+  procedure when the guest source legitimately changes.
 - [decisions/P-versioned-hash-audit.md](decisions/P-versioned-hash-audit.md) —
   Audit of the EIP-4844 versioned-hash `0x01` prefix check on the
   point-evaluation precompile (address `0x0a`); concludes the check

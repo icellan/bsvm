@@ -388,21 +388,20 @@ func runBenchCase(t *testing.T, binary string, fx equivalenceFixture, prove bool
 				"nothing, almost certainly a wire-format regression. See "+
 				"docs/decisions/vk-rotation-wire-format-2026-04.md", fx.name)
 		}
-		// VK pin diagnostic: SP1 ELF compilation is non-deterministic
-		// across rebuilds (each `sp1_build::build_program` invocation
-		// produces a fresh ELF even from byte-identical source — the
-		// rebuilt ELF carries a different verifying-key hash). That
-		// makes `prover/guest/elf/SP1VerifyingKeyHash.txt` a snapshot
-		// of one specific reference build the operator chose, NOT a
-		// gate that test runs can enforce. We log the drift so a CI
-		// run can still surface it for review, but don't fail — a
-		// fresh local rebuild always disagrees with the pin until the
-		// operator restamps. See
-		// docs/decisions/vk-rotation-wire-format-2026-04.md for the
-		// reproducible-build follow-up.
+		// VK pin check: as of 2026-05-03 (Phase 1 of
+		// docs/decisions/sp1-reproducible-build-2026-05.md) every
+		// host-*/build.rs runs `BuildArgs { docker: true }`, so the
+		// rebuilt guest ELF is bit-identical across operators and
+		// the pin in `prover/guest/elf/SP1VerifyingKeyHash.txt` is a
+		// real contract. The drift line is still informational here
+		// rather than a t.Fatalf because the gating happens on the
+		// Rust side (.github/workflows/sp1-repro.yml), and contributors
+		// who can't run docker locally would otherwise see a confusing
+		// failure during `go test`. See docs/operator/sp1-build.md for
+		// the full operator workflow.
 		pinned := loadPinnedVKHash(t)
 		if pinned != "" && !strings.EqualFold(out.VKHash, pinned) {
-			t.Logf("[bench] %s vk_hash drift (informational): bench=%s pinned=%s",
+			t.Logf("[bench] %s vk_hash drift (informational): bench=%s pinned=%s — see docs/operator/sp1-build.md",
 				fx.name, out.VKHash, pinned)
 		}
 	}

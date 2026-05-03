@@ -1,0 +1,166 @@
+# SP1 reproducible-build gate.
+#
+# See docs/decisions/sp1-reproducible-build-2026-05.md for the full
+# rationale. Summary: prover/host-*/build.rs all invoke
+# sp1_build::build_program_with_args(..., BuildArgs { docker: true })
+# so the resulting bsvm-guest ELF is bit-identical across operators.
+# This workflow rebuilds the guest in docker and asserts the resulting
+# ELF's sha256 matches prover/guest/elf/bsvm-guest.sha256, and that the
+# verifying key matches prover/guest/elf/SP1VerifyingKeyHash.txt.
+#
+# Failure modes this gate catches:
+#   - A guest source change that bumped the ELF without re-stamping
+#     the pin and sidecar (would silently drift mainnet's VK).
+#   - SP1 docker image (ghcr.io/succinctlabs/sp1:v6.0.2) gone away
+#     or re-pushed with different bytes.
+#   - sp1-build dependency bumped in a way that perturbs the build.
+#
+# What this gate does NOT do:
+#   - Run any tests against the rebuilt ELF — pkg/prover/bench_test.go
+#     covers that on the Go side.
+#   - Generate a STARK proof (multi-minute, GPU-friendly, out of scope
+#     for PR-gate CI). The bench harness in pkg/prover gates that.
+#
+# All `${{ ... }}` interpolations in this file are either GitHub-
+# controlled (runner.os, github.ref) or workflow-controlled (steps.*
+# outputs we set ourselves). No untrusted user input feeds any run:
+# block — issue/PR titles, commit messages, branch refs from forks
+# etc. are not used. The variables we DO interpolate land in env:
+# blocks rather than directly in run: scripts to follow GitHub's
+# command-injection hardening guidance.
+
+name: SP1 reproducible build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "prover/guest/**"
+      - "prover/host-bridge/build.rs"
+      - "prover/host-bridge/Cargo.toml"
+      - ".github/workflows/sp1-repro.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "prover/guest/**"
+      - "prover/host-bridge/build.rs"
+      - "prover/host-bridge/Cargo.toml"
+      - ".github/workflows/sp1-repro.yml"
+  # Weekly probe so SP1 image rot is visible even when nobody touches
+  # the guest. Tuesday 06:23 UTC (off-peak; staggered from the rust-
+  # toolchain weekly probe which runs Monday 06:17 UTC).
+  schedule:
+    - cron: "23 6 * * 2"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sp1-repro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rebuild-and-verify:
+    name: docker rebuild + sha256/VK check
+    runs-on: ubuntu-latest
+    # GitHub-hosted ubuntu-latest is amd64 native, so the SP1 image
+    # runs without emulation overhead — clean rebuild is ~2 min.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, for host build)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Confirm docker is available
+        run: |
+          set -euo pipefail
+          docker info > /dev/null
+          docker --version
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sp1repro-${{ hashFiles('prover/host-bridge/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sp1repro-
+
+      - name: Cache SP1 docker named volumes
+        uses: actions/cache@v4
+        with:
+          # sp1-build mounts these named volumes inside the SP1 image
+          # to amortise registry/git fetches across builds. Caching
+          # them on the runner halves cold-cache build time.
+          path: |
+            /var/lib/docker/volumes/sp1-cargo-registry/_data
+            /var/lib/docker/volumes/sp1-cargo-git/_data
+          key: ${{ runner.os }}-sp1-volumes-${{ hashFiles('prover/guest/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sp1-volumes-
+
+      - name: Pull SP1 docker image
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 ghcr.io/succinctlabs/sp1:v6.0.2
+
+      - name: Build host-bridge (triggers docker-mode SP1 guest build)
+        working-directory: prover/host-bridge
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+
+      - name: Locate guest ELF
+        id: elf
+        run: |
+          set -euo pipefail
+          path=prover/guest/target/elf-compilation/docker/riscv64im-succinct-zkvm-elf/release/bsvm-guest
+          if [ ! -f "$path" ]; then
+            echo "::error::guest ELF not found at $path"
+            ls -la prover/guest/target/elf-compilation || true
+            exit 1
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "ELF size: $(wc -c < "$path") bytes"
+
+      - name: Verify ELF sha256 matches prover/guest/elf/bsvm-guest.sha256
+        env:
+          ELF_PATH: ${{ steps.elf.outputs.path }}
+        run: |
+          set -euo pipefail
+          # Pin file format: "<hex>  bsvm-guest" (sha256sum-compatible)
+          expected=$(awk '{print $1}' prover/guest/elf/bsvm-guest.sha256)
+          actual=$(sha256sum "$ELF_PATH" | awk '{print $1}')
+          echo "expected sha256: $expected"
+          echo "actual   sha256: $actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::ELF sha256 drift — pin says $expected but rebuilt ELF is $actual"
+            echo "If the guest source legitimately changed, re-stamp:"
+            echo "  prover/guest/elf/SP1VerifyingKeyHash.txt"
+            echo "  prover/guest/elf/bsvm-guest.sha256"
+            echo "and broadcast a VK rotation per docs/decisions/vk-rotation-wire-format-2026-04.md"
+            exit 1
+          fi
+
+      - name: Install sp1up + cargo-prove (for vkey check)
+        run: |
+          set -euo pipefail
+          curl -L https://sp1up.succinct.xyz | bash
+          ~/.sp1/bin/sp1up --version v6.0.2
+          echo "$HOME/.sp1/bin" >> "$GITHUB_PATH"
+
+      - name: Verify VK matches prover/guest/elf/SP1VerifyingKeyHash.txt
+        env:
+          ELF_PATH: ${{ steps.elf.outputs.path }}
+        run: |
+          set -euo pipefail
+          expected=$(head -1 prover/guest/elf/SP1VerifyingKeyHash.txt)
+          actual=$(cargo prove vkey --elf "$ELF_PATH" 2>&1 \
+                    | awk '/Verification Key Hash:/ { getline; print $1 }')
+          echo "expected vk: $expected"
+          echo "actual   vk: $actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::VK drift — pin says $expected but rebuilt ELF derives $actual"
+            exit 1
+          fi

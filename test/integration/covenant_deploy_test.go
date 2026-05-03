@@ -49,10 +49,13 @@ import (
 const fixtureSinglekeyPubKeyHex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
 // fixtureVKHash mirrors the value stamped into
-// prover/guest/elf/SP1VerifyingKeyHash.txt (the post-CC-rotation
-// hash). Fixture hardcodes it because the test runs without
-// `cargo prove vkey`.
-const fixtureVKHash = "0x008e9a57422fe11b537d0d2e21c323074e2bb61f2f4d99dd41cd1d5b8a853914"
+// prover/guest/elf/SP1VerifyingKeyHash.txt (currently the docker-mode
+// reproducible-build VK from 2026-05-03; see
+// docs/decisions/sp1-reproducible-build-2026-05.md). Fixture hardcodes
+// it because the test runs without `cargo prove vkey`. The exact value
+// is irrelevant to what this test exercises (deploy-covenant fixture
+// loading); we just need a syntactically valid 32-byte hash.
+const fixtureVKHash = "0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c"
 
 // writeFixtureVKHashFile writes a single-line VK hash file into a
 // temp dir and returns its path.
