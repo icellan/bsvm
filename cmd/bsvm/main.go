@@ -148,6 +148,7 @@ func main() {
 			devCommand(),
 			adminCommand(),
 			anchorBackfillCommand(),
+			covenantCommand(),
 		},
 	}
 

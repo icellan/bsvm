@@ -61,24 +61,33 @@ You will need:
 
 3. **The live covenant UTXO coordinates** (`covenantTxId`,
    `covenantVout`, `covenantSatsLive`, `currentStateRootHex`,
-   `currentBlockNumber`).
+   `currentBlockNumber`, `lockingScriptHex`).
 
-   **TODO(WW-covenant-tip)**: `bsvm` does not yet expose a
-   `covenant tip` subcommand. Read these from your node's
-   `chaindata/` via the existing `pkg/covenant.LoadState(...)` helper,
-   or instrument `cmd/bsvm` with a small read-only subcommand. As an
-   immediate workaround you can:
+   Use the read-only `bsvm covenant tip` subcommand against any
+   node's data directory:
 
-   * Inspect the post-deploy summary written by
-     `deploy/covenant/.last-deploy.json` for the original txid (vout
-     0, sats from `covenantSats` in the OperatorConfig). For
-     subsequent advances, query the BSV chain for spends of that
-     outpoint via your BSV node's `gettxout` and follow forward.
-   * Read `currentStateRootHex` and `currentBlockNumber` from the
-     RollupState readonly via the existing
-     `pkg/covenant.ReadRollupState` helper, given the latest
-     covenant UTXO's locking script bytes. The integration test at
-     `pkg/covenant/state_test.go` shows the call shape.
+   ```bash
+   bsvm covenant tip \
+       --datadir /path/to/node/data \
+       --bsv-rpc "$BSVM_BSV_RPC" \
+       --bsv-network "$BSVM_BSV_NETWORK" \
+       > tip.json
+   ```
+
+   The emitted JSON carries every rotation-only field
+   `RotateVKConfig` requires (`covenantTxId`, `covenantVout`,
+   `covenantSatsLive`, `currentStateRootHex`, `currentBlockNumber`)
+   plus the live `lockingScriptHex` and its `lockingScriptSha256`
+   (the latter is the `StateCovenantScriptHash` shape the bridge re-
+   deploy in §7 consumes). Internally it pulls the cached covenant
+   tip from `pkg/block.ChainDB` (`ReadCovenantTxID` +
+   `ReadCovenantState`, decoded via `pkg/covenant.DecodeCovenantState`)
+   and asks the BSV node for the live UTXO's script + value via
+   `getrawtransaction verbose=1`. Stop the node before running it if
+   you want a guaranteed-stable snapshot — the daemon is the single
+   writer to chaindata, so a running daemon may apply an advance
+   between your tip read and the rotation broadcast (in which case
+   ARC will reject with `MISSING_INPUT` and you simply re-read).
 
 4. **A fresh SP1 proof bundle** (`publicValuesHex`, `batchDataHex`,
    `proofBlobHex`) that proves the no-op upgrade transition
@@ -290,9 +299,6 @@ If ARC rejects the broadcast:
 After broadcast, confirm the new covenant state matches expectations
 on every node operating this shard.
 
-**TODO(WW-covenant-tip)**: same gap as in §1. Until a
-`bsvm covenant tip` subcommand lands, the verification is:
-
 1. Query your BSV node for the broadcast txid:
    ```bash
    bitcoin-cli -testnet getrawtransaction "$UPGRADE_TXID" 1
@@ -305,6 +311,12 @@ on every node operating this shard.
    new tip via the existing structured-log emission in
    `pkg/covenant/state.go` (`level=info msg="rollup advance"
    covenantTxId=...`).
+4. On each node, re-run `bsvm covenant tip --datadir ... --bsv-rpc ...`
+   and assert that `covenantTxId == $UPGRADE_TXID` and that
+   `lockingScriptHex` equals the rotation summary's
+   `newRollupScriptHex`. Disagreement here means that node has not
+   yet observed the upgrade — restart its BSV peer connections (see
+   below).
 
 If a node disagrees with the rest of the shard's view of the
 covenant tip, that node has a stale BSV connection or has been
@@ -370,11 +382,15 @@ testnet hook).
 
 The cross-cutting helper gaps surfaced above:
 
-* **`bsvm covenant tip`** — read-only subcommand that prints
-  `covenantTxId`, `covenantVout`, `covenantSatsLive`,
-  `currentStateRootHex`, `currentBlockNumber` for the live shard.
-  Wraps `pkg/covenant.LoadState` + `pkg/covenant.ReadRollupState`.
-  Eliminates the manual chain-walking step in §1.
+* ~~**`bsvm covenant tip`**~~ — **shipped.** Read-only subcommand
+  that prints `covenantTxId`, `covenantVout`, `covenantSatsLive`,
+  `currentStateRootHex`, `currentBlockNumber`, `lockingScriptHex`,
+  and `lockingScriptSha256` for the live shard. Wraps
+  `pkg/block.ChainDB.ReadCovenantTxID` /
+  `ReadCovenantState` (decoded via
+  `pkg/covenant.DecodeCovenantState`) plus a
+  `getrawtransaction verbose=1` round-trip for the live UTXO's
+  script + sats. See `cmd/bsvm/covenant.go`.
 * **`bsvm-host-bridge --mode upgrade-proof`** — produces the
   upgrade-input proof bundle (`publicValuesHex`, `batchDataHex`,
   `proofBlobHex`) given `pre_state_root`, `new_covenant_script`,
