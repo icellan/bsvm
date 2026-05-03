@@ -83,6 +83,16 @@ type OverlayConfig struct {
 	// and therefore the safe / finalized block tags. Default: 10s.
 	// A non-positive value is treated as the default at watcher start.
 	ConfirmationPollInterval time.Duration
+
+	// ProverWorkers caps the number of concurrent SP1 proving operations
+	// the overlay's ParallelProver runs in flight. Zero or negative
+	// values are clamped to 1 (single-prover boot path). Operators with
+	// multiple GPUs / CPU cores can lift this to fan out batch proving
+	// across workers — each worker runs an independent SP1 invocation,
+	// so wall-clock throughput scales close to linearly until the
+	// bridge subprocess saturates the host. Plumbed from
+	// `[prover].workers` in the node TOML.
+	ProverWorkers int
 }
 
 // DefaultOverlayConfig returns an OverlayConfig with sensible defaults.
@@ -100,5 +110,6 @@ func DefaultOverlayConfig() OverlayConfig {
 		BlockInterval:            1,
 		RequireRealProof:         false,
 		ConfirmationPollInterval: 10 * time.Second,
+		ProverWorkers:            1,
 	}
 }

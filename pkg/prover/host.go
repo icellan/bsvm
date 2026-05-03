@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/holiman/uint256"
@@ -201,6 +203,8 @@ func (p *SP1Prover) Prove(ctx context.Context, input *ProveInput) (*ProveOutput,
 		out, err = p.proveNetwork(ctx, input)
 	case ProverMock:
 		out, err = p.proveMock(ctx, input)
+	case ProverExecute:
+		out, err = p.proveExecute(ctx, input)
 	default:
 		return nil, fmt.Errorf("unknown prover mode: %d", p.config.Mode)
 	}
@@ -275,6 +279,126 @@ func (p *SP1Prover) proveLocal(ctx context.Context, input *ProveInput) (*ProveOu
 // available in the current release. Use local or mock mode instead.
 func (p *SP1Prover) proveNetwork(_ context.Context, _ *ProveInput) (*ProveOutput, error) {
 	return nil, fmt.Errorf("network proving mode is not available: requires SP1 prover network subscription, use local or mock mode")
+}
+
+// proveExecute invokes the bsvm-host-bridge Rust binary in EXECUTE mode.
+// Execute mode runs revm inside SP1's RISC-V emulator to verify Go EVM ↔
+// Rust EVM equivalence and report a real cycle count, but does NOT generate
+// a STARK proof. The returned ProveOutput carries a real PublicValues blob
+// (committed by the guest) and Cycles, but Proof is empty — callers that
+// need a verifiable proof must use ProverLocal / ProverNetwork.
+//
+// Spec 16's `execute` devnet preset is the primary consumer: the covenant
+// runs the production state-continuity / batch-data-binding logic against
+// the real public values, but accepts a dev-key signature in place of the
+// STARK verifier. This lets operators exercise the full dual-EVM pipeline
+// without paying the prove-mode wall-clock cost.
+func (p *SP1Prover) proveExecute(ctx context.Context, input *ProveInput) (*ProveOutput, error) {
+	if p.config.HostBridgeBinary == "" {
+		return nil, fmt.Errorf("host bridge binary path not configured")
+	}
+	if p.config.GuestELFPath == "" {
+		return nil, fmt.Errorf("guest ELF path not configured")
+	}
+
+	// Apply timeout if configured. Execute mode runs the guest in the
+	// SP1 emulator (no STARK), so wall-clock is dominated by RISC-V
+	// instruction count — the same Timeout knob as proveLocal applies.
+	if p.config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.config.Timeout)
+		defer cancel()
+	}
+
+	// Force the bridge envelope into execute mode regardless of the
+	// SP1ProofMode the caller configured: this code path IS the
+	// "execute" branch and the bridge dispatches on the JSON `mode`
+	// field, not the CLI flag.
+	inputJSON, err := buildBridgeInput(input, "execute")
+	if err != nil {
+		return nil, fmt.Errorf("building bridge input: %w", err)
+	}
+
+	args := []string{"--elf", p.config.GuestELFPath, "--proof-mode", "execute"}
+	cmd := exec.CommandContext(ctx, p.config.HostBridgeBinary, args...)
+	cmd.Stdin = bytes.NewReader(inputJSON)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("sp1 execute failed: %w, stderr: %s", err, stderr.String())
+	}
+
+	// The Rust bridge emits hex-encoded `proof` / `public_values`
+	// strings (see prover/host-bridge/src/main.rs::HostOutput). Decode
+	// here rather than relying on Go's default base64 []byte decoder.
+	var raw bridgeOutput
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &raw); err != nil {
+		return nil, fmt.Errorf("parsing execute output: %w (stdout=%s, stderr=%s)",
+			err, stdout.String(), stderr.String())
+	}
+	if raw.Error != nil && *raw.Error != "" {
+		return nil, fmt.Errorf("sp1 execute reported error: %s", *raw.Error)
+	}
+
+	pvBytes, err := decodeHexString(raw.PublicValues)
+	if err != nil {
+		return nil, fmt.Errorf("decoding public_values hex: %w", err)
+	}
+	// Execute mode never produces a proof; the field stays empty even
+	// when the bridge omits it, but accept (and ignore) hex bytes if
+	// future bridge versions decide to emit a synthetic marker.
+	proofBytes, err := decodeHexString(raw.Proof)
+	if err != nil {
+		return nil, fmt.Errorf("decoding proof hex: %w", err)
+	}
+	vkHashBytes, err := decodeHexString(raw.VKHash)
+	if err != nil {
+		return nil, fmt.Errorf("decoding vk_hash hex: %w", err)
+	}
+
+	// Segments isn't on the shared bridge envelope today (only the
+	// bench harness reports it). Leave it implicit: cycles + a non-empty
+	// public-values blob is enough to drive spec 16's execute preset.
+	return &ProveOutput{
+		Mode:         p.config.ProofMode,
+		Proof:        proofBytes,
+		PublicValues: pvBytes,
+		VKHash:       types.BytesToHash(vkHashBytes),
+		Cycles:       raw.Cycles,
+		ProvingTime:  time.Duration(raw.ProvingTimeMs) * time.Millisecond,
+	}, nil
+}
+
+// bridgeOutput mirrors prover/host-bridge/src/main.rs::HostOutput. Field
+// shape MUST stay in sync; the bridge emits hex-encoded byte fields (with
+// or without "0x" prefix) so we decode them explicitly rather than
+// relying on Go's default base64 [] byte JSON decoder.
+type bridgeOutput struct {
+	Proof         string  `json:"proof"`
+	PublicValues  string  `json:"public_values"`
+	VKHash        string  `json:"vk_hash"`
+	Cycles        uint64  `json:"cycles"`
+	ProvingTimeMs uint64  `json:"proving_time_ms"`
+	SP1Version    string  `json:"sp1_version"`
+	Error         *string `json:"error,omitempty"`
+}
+
+// decodeHexString accepts an empty / "0x" / "0x..." / unprefixed hex
+// string and returns the decoded bytes (nil for empty input). Errors
+// only on actually malformed hex.
+func decodeHexString(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	s = strings.TrimPrefix(s, "0x")
+	if s == "" {
+		return nil, nil
+	}
+	return hex.DecodeString(s)
 }
 
 // proveMock generates a dummy proof with correct structure for testing.

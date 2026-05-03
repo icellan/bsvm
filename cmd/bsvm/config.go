@@ -220,22 +220,26 @@ type RPCSection struct {
 // non-mock backends that lack the binary/ELF paths the host bridge
 // needs to actually run.
 //
-// The Workers field is parsed but currently not propagated to a
-// ParallelProver instance — see the gap note in
-// docs/decisions/spec-review-triage-2026-05.md (Claim 1) for the
-// follow-up that will wire it through.
+// The Workers field is plumbed through OverlayConfig.ProverWorkers
+// into the overlay's ParallelProver constructor (see
+// pkg/overlay/node.go::NewOverlayNodeWithObservability). Setting >1
+// genuinely fans out batch proving across that many concurrent SP1
+// invocations.
 type ProverSection struct {
 	// Mode picks the backend the SP1 host uses: "mock" (default;
-	// synthetic proof bytes, no Rust subprocess), "local" (invoke
-	// the host-bridge binary as a subprocess) or "network" (submit
-	// to the SP1 prover network — currently returns an error from
-	// the host until the SDK subscription path lands).
+	// synthetic proof bytes, no Rust subprocess), "execute" (invoke
+	// the host bridge in execute mode — runs revm in SP1's RISC-V
+	// emulator, produces real public values + cycle counts but no
+	// STARK proof; spec 16's `execute` devnet preset), "local"
+	// (invoke the host-bridge binary as a subprocess and produce a
+	// real STARK), or "network" (submit to the SP1 prover network —
+	// currently returns an error from the host until the SDK
+	// subscription path lands).
 	Mode string `toml:"mode"`
 	// Workers is the maximum number of concurrent proving operations.
-	// Stored on the section but NOT yet propagated into the runtime
-	// — the single-prover boot path in cmd/bsvm/main.go does not
-	// construct a ParallelProver. Tracked as a follow-up in the
-	// triage doc; setting >1 today is a no-op.
+	// Plumbed through OverlayConfig.ProverWorkers into the overlay
+	// ParallelProver constructor. Zero / negative values are clamped
+	// to 1 (single-prover boot path).
 	Workers int `toml:"workers"`
 	// HostBridgeBinary is the absolute path to the bsvm-host-bridge
 	// Rust binary the local-mode prover invokes as a subprocess.
@@ -312,10 +316,10 @@ var validSP1ProofModes = map[string]bool{
 func (p ProverSection) Validate() error {
 	mode := strings.ToLower(strings.TrimSpace(p.Mode))
 	switch mode {
-	case "", "mock", "local", "network":
+	case "", "mock", "local", "network", "execute":
 		// ok
 	default:
-		return fmt.Errorf("[prover].mode = %q: expected mock, local, or network", p.Mode)
+		return fmt.Errorf("[prover].mode = %q: expected mock, local, network, or execute", p.Mode)
 	}
 
 	if p.Timeout != "" {
@@ -342,7 +346,7 @@ func (p ProverSection) Validate() error {
 	}
 
 	switch mode {
-	case "local":
+	case "local", "execute":
 		if p.HostBridgeBinary == "" {
 			return fmt.Errorf("[prover].mode = %q requires [prover].host_bridge_binary to be set", p.Mode)
 		}
@@ -794,6 +798,14 @@ func (c *NodeConfig) ToOverlayConfig(chainID int64) overlay.OverlayConfig {
 		oc.MaxSpeculativeDepth = c.Overlay.MaxSpeculativeDepth
 	}
 
+	// Plumb [prover].workers through to the overlay so
+	// NewOverlayNodeWithObservability constructs the ParallelProver with
+	// the operator's chosen concurrency. Zero / negative values fall
+	// back to the overlay's single-prover default.
+	if c.Prover.Workers > 0 {
+		oc.ProverWorkers = c.Prover.Workers
+	}
+
 	return oc
 }
 
@@ -827,6 +839,8 @@ func (c *NodeConfig) ToProverConfig() prover.Config {
 		pc.Mode = prover.ProverLocal
 	case "network":
 		pc.Mode = prover.ProverNetwork
+	case "execute":
+		pc.Mode = prover.ProverExecute
 	default:
 		pc.Mode = prover.ProverMock
 	}

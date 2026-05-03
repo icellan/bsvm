@@ -19,6 +19,12 @@ const (
 	ProverNetwork
 	// ProverMock skips proving and returns a dummy proof (testing only).
 	ProverMock
+	// ProverExecute runs the SP1 guest in execute mode (revm inside SP1's
+	// RISC-V emulator, no STARK proof). Returns real public values and a
+	// cycle count so spec 16's `execute` devnet preset can verify Go EVM ↔
+	// Rust EVM equivalence without paying the prove-mode wall-clock cost.
+	// Like ProverLocal, this requires HostBridgeBinary + GuestELFPath.
+	ProverExecute
 )
 
 // String returns a human-readable name for the prover mode.
@@ -30,6 +36,8 @@ func (m ProverMode) String() string {
 		return "network"
 	case ProverMock:
 		return "mock"
+	case ProverExecute:
+		return "execute"
 	default:
 		return "unknown"
 	}

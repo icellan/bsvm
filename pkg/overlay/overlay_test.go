@@ -1068,6 +1068,57 @@ func TestOverlayConfig_NewFields(t *testing.T) {
 	if cfg.MinProfitableBatchGas != 0 {
 		t.Errorf("MinProfitableBatchGas = %d, want 0", cfg.MinProfitableBatchGas)
 	}
+	if cfg.ProverWorkers != 1 {
+		t.Errorf("ProverWorkers = %d, want default 1", cfg.ProverWorkers)
+	}
+}
+
+// TestOverlayNodeProverWorkersPropagation exercises the
+// WW-prover-mode-wiring-workers fix end-to-end: setting
+// OverlayConfig.ProverWorkers must lift the embedded ParallelProver's
+// concurrency ceiling. Before the fix, NewOverlayNode hard-coded 1.
+func TestOverlayNodeProverWorkersPropagation(t *testing.T) {
+	tests := []struct {
+		name        string
+		workers     int
+		wantWorkers int
+	}{
+		{"default_clamps_to_1", 0, 1},
+		{"negative_clamps_to_1", -3, 1},
+		{"explicit_2", 2, 2},
+		{"explicit_8", 8, 8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newTestSetup(t)
+			defer ts.node.Stop()
+
+			// newTestSetup wires a default overlay; reach in via the
+			// public ParallelProverRef accessor so we don't have to
+			// rebuild the whole stack just to flip one field. The
+			// asserts below exercise the constructor path directly
+			// against a fresh OverlayNode with the field set.
+			cfg := DefaultOverlayConfig()
+			cfg.ChainID = testChainID
+			cfg.Coinbase = ts.coinbase
+			cfg.ProverWorkers = tt.workers
+
+			sp1 := prover.NewSP1Prover(prover.DefaultConfig())
+			node, err := NewOverlayNode(cfg, ts.chainDB, ts.database, ts.node.covenantMgr, sp1)
+			if err != nil {
+				t.Fatalf("NewOverlayNode: %v", err)
+			}
+			defer node.Stop()
+
+			pp := node.ParallelProverRef()
+			if pp == nil {
+				t.Fatal("ParallelProverRef returned nil")
+			}
+			if got := pp.Metrics().Workers; got != tt.wantWorkers {
+				t.Errorf("ParallelProver workers = %d, want %d", got, tt.wantWorkers)
+			}
+		})
+	}
 }
 
 func TestConfirmedTip(t *testing.T) {

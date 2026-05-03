@@ -97,7 +97,8 @@ validation that refuses `Mode=ProverLocal` without
         "groth16" / "execute")
       - `[prover].proof_mode` (string: "fri" / "groth16" / "groth16-wa";
         legacy "groth16-generic" / "groth16-witness" aliases accepted)
-      - `[prover].workers` — STILL UNWIRED, see TODO below
+      - `[prover].workers` — wired via OverlayConfig.ProverWorkers
+        (see WW-prover-mode-wiring-workers below)
       Each new field is round-tripped to `prover.Config` by
       `ToProverConfig` and exercised by
       `TestNodeConfig_ToProverConfig_Plumbing` /
@@ -130,32 +131,52 @@ validation that refuses `Mode=ProverLocal` without
       - `[prover].sp1_proof_mode` (string: "compressed" / "core" / "groth16")
       - `[prover].proof_mode` (string: "fri" / "groth16" / "groth16-wa")
       - `[prover].workers` (already exists in struct, unused) — propagate
-- [ ] **TODO (`WW-prover-mode-wiring-workers`)**: propagate
-      `[prover].workers` into a `prover.NewParallelProver(...)`
-      construction in `cmd/bsvm/main.go`. The single-prover boot path
-      currently calls `prover.NewSP1Prover(proverCfg)` directly and
-      never builds a `ParallelProver`, so the TOML knob is parsed but
-      not consumed. The `ParallelProver` type already exists at
-      `pkg/prover/parallel.go:91`; this is purely a wiring change in
-      `main.go` plus a callsite update on whoever currently invokes
-      `Prove(...)` against the bare `*SP1Prover`.
-- [ ] **TODO (`WW-prover-mode-wiring-execute`)**: add an `execute`
-      proving sub-mode to the host bridge (separate from `local` /
-      `network`) — see `pkg/prover/host.go:199-203`. Today
-      `[prover].sp1_proof_mode = "execute"` is accepted by the config
-      validator and reaches `bridgeInput.Mode`, but the prover's
-      `Mode` switch only branches on local/network/mock. Spec 16's
-      `execute` devnet preset will not actually exercise revm-in-SP1
-      until this branch lands.
+- [x] **DONE** (2026-05-03, `WW-prover-mode-wiring-workers`):
+      `[prover].workers` is now propagated through
+      `OverlayConfig.ProverWorkers` into the existing
+      `prover.NewParallelProverWithObservability(...)` call inside
+      `pkg/overlay/node.go::NewOverlayNodeWithObservability`. The
+      previous hard-coded `1` is replaced with `config.ProverWorkers`
+      (clamped to 1 when zero / negative). `cmd/bsvm/main.go` keeps
+      the single-prover construction at the call-site; the parallel
+      coordinator already lives inside the overlay so no separate
+      fan-out wrapper was needed. Coverage:
+      `TestNodeConfig_ToOverlayConfig_PropagatesProverWorkers`
+      (cmd/bsvm) and `TestOverlayNodeProverWorkersPropagation`
+      (pkg/overlay) — the latter asserts `ParallelProver.Metrics().
+      Workers` matches the configured value across {0,-3,2,8}.
+- [x] **DONE** (2026-05-03, `WW-prover-mode-wiring-execute`): a new
+      `prover.ProverExecute` mode was added next to local / network /
+      mock. Setting `[prover].mode = "execute"` (or constructing a
+      `prover.Config{Mode: ProverExecute}` directly) dispatches to
+      `proveExecute` in `pkg/prover/host.go`, which invokes the
+      host-bridge binary with envelope `mode = "execute"` so the
+      Rust side runs revm in SP1's RISC-V emulator (no STARK).
+      Output mirrors the bench harness shape: hex-decoded
+      PublicValues + cycle count + VKHash + proving-time. Validation
+      enforces the same HostBridgeBinary + GuestELFPath requirement
+      as `local`. Coverage:
+      `TestProveExecuteModeBranches_Switch` (end-to-end through a
+      stub host-bridge, asserts cycles + PublicValues shape + that
+      the bridge envelope carried `mode = "execute"`),
+      `TestProveExecuteModeBranches_RequiresPaths`,
+      `TestProveExecuteBridgeError`, `TestProveExecuteModeStringer`
+      (pkg/prover) plus `TestNodeConfig_ToProverConfig` /
+      `TestProverSection_Validate` updates (cmd/bsvm).
 
-**Notes for the operator**: Today the only way an operator can
-actually use a non-mock prover is to construct a `prover.Config` in
-Go code and pass it to the overlay node directly — the TOML path is
-broken. The two `bsv_wiring.go:347` and `deploy_shard.go:347`
-citations are best read as "the rest of the broadcast/deploy stack
-correctly refuses to lie about its capability" rather than as
-separate gaps. `BSVM_PROVE_MODE` env var is wired to `cmdInit`
-flags only; it does NOT control the runtime prover backend.
+**Notes for the operator**: With the WW-prover-mode-wiring-workers
+and WW-prover-mode-wiring-execute fixes the TOML path now drives
+the runtime prover end-to-end: `[prover].mode` selects backend
+(`mock` / `execute` / `local` / `network`), `[prover].workers`
+controls the overlay's ParallelProver concurrency, and the
+remaining knobs (`host_bridge_binary` / `guest_elf_path` /
+`network_url` / `timeout` / `proof_mode` / `sp1_proof_mode`) round-
+trip through `ToProverConfig`. The two `bsv_wiring.go:347` and
+`deploy_shard.go:347` citations remain best read as "the rest of
+the broadcast/deploy stack correctly refuses to lie about its
+capability" rather than as separate gaps. `BSVM_PROVE_MODE` env var
+is still wired to `cmdInit` flags only; it does NOT control the
+runtime prover backend (use `[prover].mode` for that).
 
 ---
 
@@ -622,7 +643,7 @@ beats a medium-blast item with M scope.
 |------|------------------------------------------------------------|--------------------------|-------|--------------|----------------------------------------|
 | 1    | #2 BEEF GET catch-up endpoint (sub-bullet a only)          | confirmed-gap            | S-M   | high         | `W6-beef-covenant-chain-get-endpoint`  |
 | 2    | #3c Multisig governance broadcast on threshold             | confirmed-gap            | M     | high         | `governance-broadcast-onready`         |
-| 3    | #1 Prover backend config + ELF / host-bridge wiring        | confirmed-gap (partial)  | M     | medium       | `WW-prover-mode-wiring`                |
+| 3    | #1 Prover backend config + ELF / host-bridge wiring        | DONE (2026-05-03)        | M     | medium       | `WW-prover-mode-wiring` (workers + execute closed) |
 | 4    | #3b Bridge-health / rescan RPC plumbing to bridge monitor  | confirmed-gap            | M     | medium       | `admin-bridge-monitor-rpc`             |
 | 5    | #4 EVM Cancun-vs-Prague spec-vs-code mismatch              | partial (spec-update)    | S     | medium       | spec 01 wording PR                     |
 | 6    | #2 four log-only BEEF consumers (sub-bullet b only)        | confirmed-gap            | L     | medium       | `W6-5/6/7/overlay-*-consumer`          |

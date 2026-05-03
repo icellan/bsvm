@@ -350,6 +350,28 @@ func TestNodeConfig_ToOverlayConfig(t *testing.T) {
 	}
 }
 
+// TestNodeConfig_ToOverlayConfig_PropagatesProverWorkers exercises the
+// WW-prover-mode-wiring-workers fix: setting [prover].workers > 1 in
+// TOML must lift the overlay's ParallelProver concurrency. The
+// overlay then uses ProverWorkers when constructing the
+// ParallelProver instead of the previous hard-coded 1.
+func TestNodeConfig_ToOverlayConfig_PropagatesProverWorkers(t *testing.T) {
+	cfg := DefaultNodeConfig()
+	cfg.Prover.Workers = 4
+
+	oc := cfg.ToOverlayConfig(1)
+	if oc.ProverWorkers != 4 {
+		t.Errorf("ProverWorkers = %d, want 4", oc.ProverWorkers)
+	}
+
+	// 0 / negative falls back to the default (single-prover boot path).
+	cfg.Prover.Workers = 0
+	oc = cfg.ToOverlayConfig(1)
+	if oc.ProverWorkers != 1 {
+		t.Errorf("ProverWorkers (workers=0) = %d, want default 1", oc.ProverWorkers)
+	}
+}
+
 func TestNodeConfig_ToRPCConfig(t *testing.T) {
 	cfg := DefaultNodeConfig()
 	cfg.RPC.HTTPAddr = "127.0.0.1:9000"
@@ -377,8 +399,10 @@ func TestNodeConfig_ToProverConfig(t *testing.T) {
 		{"mock", prover.ProverMock},
 		{"local", prover.ProverLocal},
 		{"network", prover.ProverNetwork},
+		{"execute", prover.ProverExecute},
 		{"MOCK", prover.ProverMock},
 		{"Local", prover.ProverLocal},
+		{"Execute", prover.ProverExecute},
 		{"unknown", prover.ProverMock},
 		{"", prover.ProverMock},
 	}
@@ -490,7 +514,31 @@ func TestProverSection_Validate(t *testing.T) {
 		{
 			name:    "unknown_mode_rejected",
 			section: ProverSection{Mode: "lcoal"}, // typo
-			wantErr: "expected mock, local, or network",
+			wantErr: "expected mock, local, network, or execute",
+		},
+		{
+			name: "execute_without_paths_rejected",
+			section: ProverSection{
+				Mode: "execute",
+			},
+			wantErr: "host_bridge_binary",
+		},
+		{
+			name: "execute_without_elf_rejected",
+			section: ProverSection{
+				Mode:             "execute",
+				HostBridgeBinary: hostPath,
+			},
+			wantErr: "guest_elf_path",
+		},
+		{
+			name: "execute_happy_path",
+			section: ProverSection{
+				Mode:             "execute",
+				HostBridgeBinary: hostPath,
+				GuestELFPath:     elfPath,
+				Workers:          2,
+			},
 		},
 		{
 			name: "local_without_paths_rejected",

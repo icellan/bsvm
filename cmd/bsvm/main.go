@@ -604,7 +604,12 @@ func cmdRun(ctx *cli.Context) error {
 	// (mode=none) — SetGovernanceConfig corrects that post-hoc.
 	covenantMgr.SetGovernanceConfig(boot.Governance)
 
-	// 4. Create prover.
+	// 4. Create prover. The single-prover construction is intentional —
+	// `[prover].workers` is plumbed through OverlayConfig.ProverWorkers
+	// and consumed by overlay.NewOverlayNodeWithObservability when it
+	// builds the ParallelProver, so there's no separate fan-out wrapper
+	// to construct here. Setting workers > 1 in TOML genuinely lifts
+	// the overlay's concurrent-prove ceiling.
 	proverCfg := nodeCfg.ToProverConfig()
 	sp1Prover := prover.NewSP1Prover(proverCfg)
 

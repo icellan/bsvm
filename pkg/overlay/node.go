@@ -134,10 +134,17 @@ func NewOverlayNodeWithObservability(
 	// Create the block executor.
 	executor := block.NewBlockExecutor(chainConfig, vm.Config{})
 
-	// Create the parallel prover.
+	// Create the parallel prover. Workers is plumbed from
+	// `[prover].workers` via OverlayConfig.ProverWorkers; clamp 0 / <0
+	// to the safe single-prover default so older callers that leave the
+	// field unset still get a working ParallelProver.
 	var pp *prover.ParallelProver
 	if sp1Prover != nil {
-		pp = prover.NewParallelProverWithObservability(sp1Prover, 1, registry)
+		workers := config.ProverWorkers
+		if workers < 1 {
+			workers = 1
+		}
+		pp = prover.NewParallelProverWithObservability(sp1Prover, workers, registry)
 	}
 
 	// Create the signer.

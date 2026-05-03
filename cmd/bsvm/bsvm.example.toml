@@ -25,16 +25,19 @@ cors_origins = ["*"]
 [prover]
 # Backend that runs the SP1 host. "mock" (default) returns synthetic
 # proofs without invoking any Rust subprocess — fine for unit tests
-# and Solidity-side dev. "local" launches the bsvm-host-bridge binary
-# as a subprocess (requires host_bridge_binary + guest_elf_path
-# below). "network" submits to the SP1 prover network (requires an
-# SP1 prover-network subscription; today the host returns an error
-# until the SDK subscription path lands).
+# and Solidity-side dev. "execute" runs revm inside SP1's RISC-V
+# emulator (no STARK, but real public values + cycle counts; used by
+# spec 16's `execute` devnet preset). "local" launches the
+# bsvm-host-bridge binary as a subprocess (requires host_bridge_binary
+# + guest_elf_path below) and produces a real STARK. "network"
+# submits to the SP1 prover network (requires an SP1 prover-network
+# subscription; today the host returns an error until the SDK
+# subscription path lands).
 mode = "mock"
-# Maximum concurrent proving operations. Currently parsed but NOT
-# yet propagated to a ParallelProver in the daemon boot path — set >1
-# is a no-op today. Tracked as a follow-up in the spec-review triage
-# document (Claim 1, sub-bullet ParallelProver wiring).
+# Maximum concurrent proving operations. Plumbed through
+# OverlayConfig.ProverWorkers into the overlay's ParallelProver
+# constructor — setting >1 genuinely fans out batch proving across
+# that many SP1 invocations. Zero / negative values are clamped to 1.
 workers = 1
 # Absolute path to the bsvm-host-bridge Rust binary. Empty when
 # mode = "mock"; required when mode = "local" or "network". The
