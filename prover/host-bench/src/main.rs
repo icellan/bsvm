@@ -486,7 +486,17 @@ async fn main() -> ExitCode {
     let vk_hash = vk.bytes32();
 
     // Build SP1 stdin from the converted guest input.
+    //
+    // The guest reads a single u8 mode byte FIRST (see
+    // `prover/guest/src/main.rs::main`). 0x00 selects MODE_BATCH (the
+    // existing EVM-execution path the bench exercises). 0x01 is the
+    // covenant-upgrade path consumed only by `bsvm-host-bridge --mode
+    // upgrade-proof`. Skipping the mode byte here would silently
+    // mis-read the BatchInput envelope as if its first 8 bytes were a
+    // length prefix — exactly the wire-format regression class that
+    // `docs/decisions/vk-rotation-wire-format-2026-04.md` tracks.
     let mut stdin = SP1Stdin::new();
+    stdin.write(&0u8); // MODE_BATCH
     stdin.write(&guest_input);
 
     // Execute path: cheap-perf-bench measurement. No proof. Reports

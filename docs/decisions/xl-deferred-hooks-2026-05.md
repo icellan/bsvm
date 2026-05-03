@@ -160,7 +160,12 @@ issue against runar-go citing that section.
 
 ## Hook: `WW-upgrade-proof-real-stark`
 
-**Status**: deferred (XL-scope)
+**Status**: ✓ DONE (code-side, 2026-05-03 — see
+`docs/decisions/vk-rotation-real-stark-2026-05.md`). The synthetic-stand-in
+path stays alive behind `BSVM_UPGRADE_PROOF_SYNTHETIC=1` for the
+chicken-and-egg bootstrap rotation. **Operational rotation is the
+next step** — every live shard that wants real-STARK upgrades must
+re-deploy or rotate per the runbook in `docs/operator/vk-rotation.md`.
 
 **One-liner**: Generate a real (cryptographically valid) STARK proof
 for the upgrade transition so on-chain `runar.VerifySP1FRI` accepts

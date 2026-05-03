@@ -28,7 +28,7 @@ func fixtureCompileResult() *CompileResult {
 		RollupScript: []byte{0x76, 0xa9, 0x14, 0xca, 0xfe, 0xba, 0xbe},
 		RollupANF:    json.RawMessage(`{"contractName":"R","properties":[],"methods":[]}`),
 		BridgeANF:    json.RawMessage(`{"contractName":"B","properties":[],"methods":[]}`),
-		VKHashHex:    "0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c",
+		VKHashHex:    "0x0089e86b40471ffbca344ddd6e02c4aade8d2d1676cbab381a6bedc726c964e7",
 		VKHashSource: "/tmp/SP1VerifyingKeyHash.txt",
 		GovConfig: covenant.GovernanceConfig{
 			Mode: covenant.GovernanceSingleKey,

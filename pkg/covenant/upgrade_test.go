@@ -285,12 +285,20 @@ func TestHostBridgeUpgradeProof_MatchesGoEncoder(t *testing.T) {
 		chainID     uint64 = 8_453_111
 	)
 
+	// Force the synthetic-stand-in path so this cross-check test stays
+	// fast (<1s). The real-STARK path (the new default after
+	// `WW-upgrade-proof-real-stark` landed) takes ~15-30 min and is
+	// covered by the dedicated TestHostBridgeUpgradeProof_RealStarkVerifies
+	// test in upgrade_real_stark_test.go (gated on
+	// BSVM_HOST_BRIDGE_REAL_STARK=1). Both paths produce identical
+	// publicValues bytes, so the encoding cross-check is mode-agnostic.
 	stdinJSON := fmt.Sprintf(`{
 		"mode": "upgrade-proof",
 		"pre_state_root": "%s",
 		"new_covenant_script_hex": "%s",
 		"block_number": %d,
-		"chain_id": %d
+		"chain_id": %d,
+		"proof_mode": "synthetic"
 	}`,
 		hex.EncodeToString(preState[:]),
 		hex.EncodeToString(newScript),

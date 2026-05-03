@@ -55,7 +55,7 @@ const fixtureSinglekeyPubKeyHex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dc
 // it because the test runs without `cargo prove vkey`. The exact value
 // is irrelevant to what this test exercises (deploy-covenant fixture
 // loading); we just need a syntactically valid 32-byte hash.
-const fixtureVKHash = "0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c"
+const fixtureVKHash = "0x0089e86b40471ffbca344ddd6e02c4aade8d2d1676cbab381a6bedc726c964e7"
 
 // writeFixtureVKHashFile writes a single-line VK hash file into a
 // temp dir and returns its path.

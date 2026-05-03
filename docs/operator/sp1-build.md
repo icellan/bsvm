@@ -83,10 +83,10 @@ a6737ba324871470e455b5bf72725f6e2a928b429e32277e7e46befc2b950e17
 
 $ cargo prove vkey --elf "$ELF"
 Verification Key Hash:
-0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c
+0x0089e86b40471ffbca344ddd6e02c4aade8d2d1676cbab381a6bedc726c964e7
 
 $ cat prover/guest/elf/SP1VerifyingKeyHash.txt
-0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c
+0x0089e86b40471ffbca344ddd6e02c4aade8d2d1676cbab381a6bedc726c964e7
 ```
 
 All three should match. If sha256 mismatches the sidecar:

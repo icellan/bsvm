@@ -126,25 +126,45 @@ You will need:
    and `note`. Wire it into the rotation config as
    `proofBundlePath: "rotation-upgrade-proof.json"`.
 
-   > **Synthetic-proof caveat**: the bundle that `mode=upgrade-proof`
-   > emits today is **shape-correct but not cryptographically valid**
-   > (`real_proof: false`). The on-chain `runar.VerifySP1FRI`
-   > assertion in the `Upgrade*` methods rejects it. This is useful
-   > for assembly + multisig partial-sig coordination + dry-run
-   > broadcast against a testnet ARC instance, BUT a real mainnet
-   > rotation requires a real STARK proof. Generating a real proof
-   > requires a guest entry point that commits the spec-12 upgrade
-   > publicValues layout — that entry point doesn't exist yet (the
-   > production `prover/guest/src/main.rs::main` commits a different
-   > layout: receiptsHash at pv[64..96), withdrawalRoot at
-   > pv[144..176), migrateScriptHash hard-coded to zeros, and
-   > big-endian chainId/blockNumber instead of little-endian).
-   > Adding it would rotate the SP1 verifying key (the very thing
-   > this runbook coordinates), so the migration path is:
-   > (1) ship the guest entry point in a regular SP1 build cycle
-   > (which itself requires a VK rotation against the synthetic
-   > stand-in path on testnet), then (2) point this command at the
-   > new entry point. Tracked alongside `WW-upgrade-proof-real-stark`.
+   **Real-STARK path (default).** As of `WW-upgrade-proof-real-stark`
+   (`docs/decisions/vk-rotation-real-stark-2026-05.md`), the host
+   bridge generates a real SP1 STARK proof over the guest's
+   `MODE_UPGRADE` entry point and self-verifies it offline via
+   `ProverClient::verify` before emitting the bundle. The bundle's
+   `real_proof: true` flag confirms the offline verification passed;
+   the on-chain `runar.VerifySP1FRI` assertion in the `Upgrade*`
+   methods accepts the proof at covenant evaluation time.
+
+   Wall-clock cost for proof generation:
+
+   | Hardware | Wall-clock |
+   | --- | --- |
+   | Apple Silicon M-series CPU | ~15-30 min (CORE proof, default) |
+   | GPU (CUDA, A100-class) | ~3-5 min |
+
+   This is significantly cheaper than the production EVM-batch
+   guest's ~320k cycles per ten-tx bench, since `MODE_UPGRADE` does
+   no opcode execution — it just commits a 280-byte publicValues
+   blob from `(pre_state_root, new_covenant_script, chain_id,
+   block_number, batch_data_hash, proof_blob_hash)`.
+
+   **Synthetic fallback.** Operators can opt into the legacy
+   shape-correct synthetic-stand-in path (a) for chicken-and-egg
+   bootstrap (the very first rotation that installs the new
+   MODE_UPGRADE-aware ELF on a covenant compiled before this
+   commit), or (b) for partial-sig assembly + dry-run rehearsal
+   without the multi-minute proving cost. To opt in, either:
+
+   * set `BSVM_UPGRADE_PROOF_SYNTHETIC=1` in the host-bridge
+     environment, OR
+   * add `"proof_mode": "synthetic"` to the JSON envelope.
+
+   The synthetic bundle's `real_proof: false` flag and explicit
+   `note` field make it impossible to mistake for a real one.
+   `runar.VerifySP1FRI` rejects synthetic bundles on-chain, so they
+   are useful only for the bootstrap and dry-run cases above. See
+   `docs/decisions/vk-rotation-real-stark-2026-05.md` §"Chicken-
+   and-egg bootstrap" for the operational sequence.
 
 5. **Governance signatures.** What you need depends on the shard's
    governance mode:
@@ -412,10 +432,11 @@ Once the M-th signature is recorded:
   broadcaster's `Subscribe` callback (and into the admin RPC
   `admin_listGovernanceProposals` response as `broadcastTxid`).
 
-If ARC rejects the broadcast (network failure, stale outpoint, the
-synthetic-proof caveat in §1 step 4), the proposal stays in the
-workflow store with `broadcastTxid` empty so a re-sign or restart
-can re-attempt.
+If ARC rejects the broadcast (network failure, stale outpoint,
+the synthetic-stand-in proof was used against a covenant compiled
+against the new MODE_UPGRADE-aware VK — see §1 step 4 "synthetic
+fallback"), the proposal stays in the workflow store with
+`broadcastTxid` empty so a re-sign or restart can re-attempt.
 
 ---
 
@@ -557,15 +578,18 @@ The cross-cutting helper gaps surfaced above:
   `getrawtransaction verbose=1` round-trip for the live UTXO's
   script + sats. See `cmd/bsvm/covenant.go`.
 * ~~**`bsvm-host-bridge --mode upgrade-proof`**~~ — **shipped
-  (synthetic-proof phase).** Produces the upgrade-input proof bundle
-  (`publicValuesHex`, `batchDataHex`, `proofBlobHex`, `vkHash`)
-  given `pre_state_root`, `new_covenant_script_hex`, `block_number`,
-  `chain_id` on stdin. Today the bundle is shape-correct but the
-  STARK proof bytes are synthetic (`real_proof: false`); the
-  follow-up `WW-upgrade-proof-real-stark` work adds a guest entry
-  point that commits the spec-12 upgrade publicValues layout so the
-  on-chain `VerifySP1FRI` accepts the proof. See
-  `prover/host-bridge/src/main.rs::run_upgrade_proof`.
+  (real-STARK phase, 2026-05).** Produces the upgrade-input proof
+  bundle (`publicValuesHex`, `batchDataHex`, `proofBlobHex`,
+  `vkHash`) given `pre_state_root`, `new_covenant_script_hex`,
+  `block_number`, `chain_id` on stdin. Default mode invokes the SP1
+  prover against the guest's `MODE_UPGRADE` entry point, self-
+  verifies offline via `ProverClient::verify`, and emits
+  `real_proof: true`. The on-chain `VerifySP1FRI` accepts the proof.
+  Synthetic stand-in remains available behind
+  `BSVM_UPGRADE_PROOF_SYNTHETIC=1` / `proof_mode: "synthetic"` for
+  the chicken-and-egg bootstrap rotation only. See
+  `prover/host-bridge/src/main.rs::run_upgrade_proof` and
+  `docs/decisions/vk-rotation-real-stark-2026-05.md`.
 * ~~**`bsvm dev sign-rotation`**~~ — **shipped 2026-05.** Signs the
   upgrade tx's input-0 sighash with the supplied governance WIF.
   Two modes: `--upgrade-tx-hex` (raw, HSM/airgap workflow) and

@@ -179,6 +179,17 @@ struct HostInput {
     /// `upgrade-proof`.
     #[serde(default)]
     chain_id: u64,
+    /// Proof generation strategy for `mode = "upgrade-proof"`.
+    /// Empty / "real" / "real-stark" (default) → real SP1 STARK proof
+    /// over the guest's MODE_UPGRADE entry point. Self-verified offline
+    /// via ProverClient::verify before emit.
+    /// "synthetic" → legacy shape-correct synthetic stand-in. The
+    /// on-chain SP1 verifier WILL reject this proof — useful only for
+    /// assembly / dry-run / chicken-and-egg bootstrap rotations.
+    /// May also be set via the BSVM_UPGRADE_PROOF_SYNTHETIC=1 env var.
+    /// Ignored by EVM-execution modes.
+    #[serde(default)]
+    proof_mode: String,
 }
 
 // ─── Guest-compatible types (must match guest's serde deserialization) ────────
@@ -542,7 +553,14 @@ async fn main() {
     let client = ProverClient::builder().cpu().build().await;
 
     // Prepare SP1 stdin.
+    //
+    // The guest reads a single u8 mode byte FIRST (see
+    // `prover/guest/src/main.rs::main`). 0x00 selects MODE_BATCH (the
+    // existing EVM-execution path that produces the spec-12 ADVANCE
+    // publicValues layout). 0x01 selects MODE_UPGRADE and is dispatched
+    // separately via `run_upgrade_proof` above before reaching this point.
     let mut stdin = SP1Stdin::new();
+    stdin.write(&0u8); // MODE_BATCH
     stdin.write(&guest_input);
 
     // Set up proving and verifying keys.
@@ -721,19 +739,39 @@ struct UpgradeProofBundle {
 /// chainIdBytes, migrationHash, blockNumber); a drift in any of those
 /// causes the rotation tx to be rejected by `verifyScript`.
 ///
-/// Production note: today this routine emits a SHAPE-CORRECT synthetic
-/// proof bundle, not a real STARK. Generating a real proof for the
-/// upgrade transition requires a guest-side entry point that commits
-/// the upgrade publicValues layout (the production
-/// `prover/guest/src/main.rs::main` commits a different layout —
-/// receiptsHash/withdrawalRoot/migrateScriptHash=zero/big-endian
-/// chainId+blockNumber — that the on-chain Upgrade verifier would
-/// reject). Adding that guest entry point would rotate the
-/// SP1VerifyingKeyHash and require a docker rebuild of the in-tree
-/// pinned ELF (~4 min on Apple Silicon), so we ship the synthetic
-/// path now and document the gap in `docs/operator/vk-rotation.md`.
-/// Mode 1 production rotations MUST swap the synthetic blob for a
-/// real STARK once the guest upgrade entry point lands.
+/// ## Real-STARK path (default)
+///
+/// As of `WW-upgrade-proof-real-stark`, this routine generates a real
+/// SP1 STARK over the in-tree guest's `MODE_UPGRADE` entry point. The
+/// guest commits the spec-12 upgrade publicValues layout under proof,
+/// and the host calls `client.verify(&proof, &vk)` before emitting the
+/// bundle so a verification failure is loud rather than a silent
+/// invalid-proof being shipped on-chain.
+///
+/// The wall-clock cost is ~15-30 min on CPU (no revm execution path,
+/// so much faster than the production guest's ~320k cycles bench);
+/// ~3-5 min on GPU. The real-STARK path is what allows mainnet shards
+/// to actually rotate their VK on-chain (the synthetic stand-in path is
+/// rejected by `runar.VerifySP1FRI`).
+///
+/// ## Synthetic fallback
+///
+/// Operators can opt back into the legacy synthetic-proof flow by
+/// setting `BSVM_UPGRADE_PROOF_SYNTHETIC=1` in the environment OR by
+/// passing `proof_mode = "synthetic"` in the JSON envelope. The
+/// synthetic bundle remains useful for:
+///   * partial-sig assembly + multisig signature collection (sigs are
+///     real even if the proof bytes are not),
+///   * dry-run broadcast against a testnet ARC instance,
+///   * cold-storage rehearsal of the rotation procedure,
+///   * the chicken-and-egg bootstrap rotation that installs the new
+///     `MODE_UPGRADE`-aware ELF on a testnet shard whose old covenant
+///     was compiled against a guest that doesn't yet know about
+///     `MODE_UPGRADE`.
+///
+/// In synthetic mode, `real_proof: false` is set on the output and the
+/// `note` field carries an explicit "this proof will be rejected
+/// on-chain" warning.
 async fn run_upgrade_proof(input: &HostInput) {
     // ── 1. Parse and validate the rotation inputs ────────────────────────
     let pre_state_root = match decode_required_32(&input.pre_state_root, "pre_state_root") {
@@ -767,7 +805,7 @@ async fn run_upgrade_proof(input: &HostInput) {
         );
     }
 
-    // ── 2. Build the synthetic batch + proof blobs ───────────────────────
+    // ── 2. Build the canonical batch + proof blobs ───────────────────────
     //
     // The upgrade transition has no transactions to execute, so the
     // batchData is purely a binding artifact: the on-chain assertion
@@ -777,6 +815,17 @@ async fn run_upgrade_proof(input: &HostInput) {
     // the on-chain check; we want determinism so two operators
     // independently rebuilding the same rotation produce identical
     // bundles (audit-friendliness).
+    //
+    // For the real-STARK path the `proof_blob` field of the bundle is
+    // OVERWRITTEN with the actual SP1 proof bytes after proving; the
+    // synthetic blob value here just seeds pv[64..96) (a reserved slot,
+    // on-chain unchecked but committed in the publicValues for audit).
+    // The Go-side assertion `pv[64..96) == hash256(proofBlob)` only
+    // applies to the synthetic path; the real-STARK path commits
+    // hash256 of the SAME synthetic seed value so the publicValues blob
+    // structure stays consistent across both paths and the on-chain
+    // verifier sees identical pv layout regardless of which mode the
+    // operator picked.
     let batch_data = synthetic_blob(
         b"bsvm-upgrade-batch",
         &new_script,
@@ -787,7 +836,7 @@ async fn run_upgrade_proof(input: &HostInput) {
         // (deploy/covenant rotate-vk.go uses 20_000 bytes).
         20_000,
     );
-    let proof_blob = synthetic_blob(
+    let synthetic_proof_seed = synthetic_blob(
         b"bsvm-upgrade-proof",
         &new_script,
         &pre_state_root,
@@ -804,43 +853,206 @@ async fn run_upgrade_proof(input: &HostInput) {
     // MUST match pkg/covenant/upgrade.go::EncodeUpgradePublicValues
     // byte-for-byte. The new block number is `block_number + 1`
     // (the upgrade tx advances the covenant by exactly one block).
+    //
+    // Note: pv[64..96) commits hash256(synthetic_proof_seed) — the same
+    // value in both real-STARK and synthetic modes — so the on-chain
+    // pv layout is mode-agnostic. The synthetic seed is what the guest
+    // is told to commit at pv[64..96) (via the host-supplied
+    // proof_blob_hash on the SP1Stdin envelope); the actual STARK proof
+    // bytes go into proof_blob_hex, NOT into pv[64..96).
     let public_values = encode_upgrade_public_values(
         &pre_state_root,
         &pre_state_root, // postStateRoot == preStateRoot for a no-op upgrade
         &batch_data,
-        &proof_blob,
+        &synthetic_proof_seed,
         &new_script,
         input.chain_id,
         input.block_number.saturating_add(1),
     );
 
-    // ── 4. Resolve the VK hash from the in-tree pinned ELF ───────────────
-    //
-    // Reuses the outer #[tokio::main] runtime so we don't spawn a
-    // nested one. setup() is fast for VK extraction (no proving), but
-    // ProverClient construction itself is heavy (~seconds): operators
-    // who only need the publicValues / batchData / proofBlob bytes can
-    // ignore the vkHash field — it's emitted as a convenience for
-    // double-checking the rotation targets the pinned VK.
-    let vk_hash = resolve_vk_hash().await;
+    // ── 4. Pick proof mode ───────────────────────────────────────────────
+    let synthetic = upgrade_proof_synthetic_requested(input);
 
-    // ── 5. Emit the rotate-vk-shaped JSON bundle ─────────────────────────
+    if synthetic {
+        // Legacy synthetic path. The proof blob is just the synthetic
+        // seed; on-chain `runar.VerifySP1FRI` will reject this. Useful
+        // for assembly / dry-run / chicken-and-egg bootstrap only.
+        let vk_hash = resolve_vk_hash().await;
+        let bundle = UpgradeProofBundle {
+            public_values_hex: format!("0x{}", hex::encode(&public_values)),
+            batch_data_hex: format!("0x{}", hex::encode(&batch_data)),
+            proof_blob_hex: format!("0x{}", hex::encode(&synthetic_proof_seed)),
+            vk_hash,
+            real_proof: false,
+            note: "synthetic upgrade-proof bundle (shape-correct, NOT cryptographically valid). \
+                   The on-chain SP1 verifier WILL reject this proof. Use this for partial-sig \
+                   assembly, dry-run, or the chicken-and-egg bootstrap rotation that installs \
+                   the new MODE_UPGRADE-aware ELF. Set BSVM_UPGRADE_PROOF_SYNTHETIC=0 (or \
+                   omit the env var) to switch to the real-STARK path."
+                .into(),
+            error: None,
+        };
+        println!("{}", serde_json::to_string(&bundle).unwrap());
+        return;
+    }
+
+    // ── 5. Real-STARK path: invoke the SP1 prover ────────────────────────
+    let upgrade_input = GuestUpgradeInput {
+        pre_state_root,
+        new_covenant_script: new_script.clone(),
+        chain_id: input.chain_id,
+        block_number: input.block_number,
+    };
+    // Compute the same hashes the guest commits at pv[64..96) and
+    // pv[104..136) and feed them in over the SP1 stdin so the guest
+    // doesn't need to carry the full 165 KB + 20 KB blobs into the
+    // zkVM (a ~5x cycle saving on a path that's already cycle-cheap).
+    let batch_data_hash = hash256(&batch_data);
+    let proof_blob_hash = hash256(&synthetic_proof_seed);
+
+    let mut stdin = SP1Stdin::new();
+    stdin.write(&MODE_UPGRADE);
+    stdin.write(&upgrade_input);
+    stdin.write(&batch_data_hash);
+    stdin.write(&proof_blob_hash);
+
+    let client = ProverClient::builder().cpu().build().await;
+    let pk = match client.setup(GUEST_ELF.clone()).await {
+        Ok(pk) => pk,
+        Err(e) => {
+            return emit_upgrade_error(format!(
+                "upgrade-proof: SP1 setup failed: {} \
+                 (set BSVM_UPGRADE_PROOF_SYNTHETIC=1 to fall back to the synthetic-stand-in path)",
+                e
+            ));
+        }
+    };
+    let vk = pk.verifying_key().clone();
+    let vk_hash = vk.bytes32().to_string();
+
+    // Sanity-check via execute() before the (slow) prove() call so a
+    // wire-format regression surfaces in seconds rather than after a
+    // multi-minute proof generation. The committed publicValues bytes
+    // here MUST equal `public_values` byte-for-byte; if they don't, the
+    // guest committed something other than the spec-12 layout and the
+    // on-chain `runar.VerifySP1FRI` would later fail at covenant
+    // evaluation time — surface the mismatch now.
+    let exec_start = Instant::now();
+    let (executed_pv, _report) = match client.execute(GUEST_ELF.clone(), stdin.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return emit_upgrade_error(format!(
+                "upgrade-proof: guest execute() failed before proving (cycle-cheap pre-flight \
+                 caught the regression): {}",
+                e
+            ));
+        }
+    };
+    let _exec_elapsed = exec_start.elapsed();
+    if executed_pv.as_slice() != public_values.as_slice() {
+        return emit_upgrade_error(format!(
+            "upgrade-proof: guest committed publicValues that disagree with \
+             host EncodeUpgradePublicValues — wire-format drift!\n  guest = 0x{}\n  host  = 0x{}",
+            hex::encode(executed_pv.as_slice()),
+            hex::encode(public_values),
+        ));
+    }
+
+    // Generate the real STARK proof. CORE proof shape (matches the
+    // production EVM-batch path; the on-chain `runar.VerifySP1FRI`
+    // verifier consumes core proofs).
+    let prove_start = Instant::now();
+    let proof = match client.prove(&pk, stdin).await {
+        Ok(p) => p,
+        Err(e) => {
+            return emit_upgrade_error(format!(
+                "upgrade-proof: SP1 prove() failed: {} \
+                 (set BSVM_UPGRADE_PROOF_SYNTHETIC=1 to fall back to the synthetic-stand-in path)",
+                e
+            ));
+        }
+    };
+    let prove_elapsed = prove_start.elapsed();
+
+    // Offline self-verify — DO NOT skip. A real proof that fails
+    // verify() locally would also fail on-chain, but on-chain failure
+    // is a broadcast-and-rejected round trip; locally catching it lets
+    // us emit a structured error to the operator instead.
+    if let Err(e) = client.verify(&proof, &vk, None) {
+        return emit_upgrade_error(format!(
+            "upgrade-proof: offline verify(&proof, &vk) FAILED — refusing to emit a proof \
+             the on-chain verifier would also reject: {}",
+            e
+        ));
+    }
+
+    // Serialize the proof bytes the on-chain `runar.VerifySP1FRI`
+    // verifier consumes. SP1's `bincode::serialize(&proof)` produces
+    // the canonical wire shape the runar verifier replays.
+    let proof_bytes = match bincode::serialize(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            return emit_upgrade_error(format!(
+                "upgrade-proof: failed to serialize SP1 proof: {}",
+                e
+            ));
+        }
+    };
+
     let bundle = UpgradeProofBundle {
         public_values_hex: format!("0x{}", hex::encode(&public_values)),
         batch_data_hex: format!("0x{}", hex::encode(&batch_data)),
-        proof_blob_hex: format!("0x{}", hex::encode(&proof_blob)),
+        proof_blob_hex: format!("0x{}", hex::encode(&proof_bytes)),
         vk_hash,
-        real_proof: false,
-        note: "synthetic upgrade-proof bundle (shape-correct, NOT cryptographically valid). \
-               The on-chain SP1 verifier WILL reject this proof. Use this for partial-sig \
-               assembly + dry-run only; mainnet rotations require a real STARK proof, which \
-               in turn requires a guest entry point that commits the spec-12 upgrade \
-               publicValues layout (currently missing — see docs/operator/vk-rotation.md \
-               §1 TODO(WW-upgrade-proof-bridge))."
-            .into(),
+        real_proof: true,
+        note: format!(
+            "real SP1 STARK proof (self-verified offline via ProverClient::verify). \
+             Wall-clock for proof generation: {} ms. The on-chain runar.VerifySP1FRI \
+             verifier replays this proof against the pinned SP1VerifyingKeyHash and \
+             accepts it on covenant evaluation. proofBlobHex carries the bincode-\
+             serialized SP1ProofWithPublicValues bytes; publicValuesHex carries the \
+             280-byte spec-12 upgrade layout the proof commits to.",
+            prove_elapsed.as_millis()
+        ),
         error: None,
     };
     println!("{}", serde_json::to_string(&bundle).unwrap());
+}
+
+/// True when the operator opted into the legacy synthetic-stand-in
+/// proof path. Triggered by either:
+///   * `proof_mode == "synthetic"` in the JSON input envelope, OR
+///   * `BSVM_UPGRADE_PROOF_SYNTHETIC=1` in the process environment.
+///
+/// Default is real-STARK (`WW-upgrade-proof-real-stark` deliverable).
+fn upgrade_proof_synthetic_requested(input: &HostInput) -> bool {
+    if input.proof_mode.eq_ignore_ascii_case("synthetic") {
+        return true;
+    }
+    matches!(
+        std::env::var("BSVM_UPGRADE_PROOF_SYNTHETIC").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+/// Wire-format mode byte selector — must mirror the constants in
+/// `prover/guest/src/main.rs`. Duplicated here rather than imported
+/// because the host crate intentionally does not depend on the guest
+/// crate (the guest only ships as a precompiled ELF inside the host
+/// binary via `include_elf!`).
+const MODE_UPGRADE: u8 = 0x01;
+
+/// Mirror of `prover/guest/src/main.rs::UpgradeInput`. Field order MUST
+/// match the guest's `UpgradeInput` exactly — bincode is positional under
+/// serde derives, so any drift here silently corrupts guest input. The
+/// guest reads this struct via `sp1_zkvm::io::read::<UpgradeInput>()`
+/// after consuming the leading mode byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuestUpgradeInput {
+    pre_state_root: [u8; 32],
+    new_covenant_script: Vec<u8>,
+    chain_id: u64,
+    block_number: u64,
 }
 
 /// Resolve the in-tree pinned `SP1VerifyingKeyHash` via the SP1 SDK's

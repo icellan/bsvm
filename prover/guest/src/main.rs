@@ -5,7 +5,45 @@
 //! a STARK proof covering every opcode, every storage write, every balance
 //! transfer, and every gas deduction.
 //!
-//! Public values layout (280 bytes, spec 12):
+//! ## Wire-format dispatch (mode byte)
+//!
+//! The guest reads a single `u8` mode byte from `sp1_zkvm::io::read::<u8>()`
+//! BEFORE any other input. The mode selects one of two execution paths:
+//!
+//!   * `0x00 = MODE_BATCH` — full EVM execution (production path). The guest
+//!     then reads a `BatchInput`, runs revm against every transaction, and
+//!     commits the 280-byte spec-12 ADVANCE public values layout (described
+//!     immediately below).
+//!   * `0x01 = MODE_UPGRADE` — covenant VK rotation (closes
+//!     `WW-upgrade-proof-real-stark`). The guest reads an `UpgradeInput`
+//!     `{ pre_state_root, new_covenant_script, chain_id, block_number }`,
+//!     performs NO EVM execution (the upgrade transition is a no-op state
+//!     transition by design — `postStateRoot == preStateRoot`), and commits
+//!     the 280-byte spec-12 UPGRADE public values layout that
+//!     `pkg/covenant.EncodeUpgradePublicValues` mirrors byte-for-byte:
+//!
+//!     ```text
+//!       [  0..32 )   preStateRoot
+//!       [ 32..64 )   postStateRoot           (== preStateRoot)
+//!       [ 64..96 )   hash256(proofBlob)       [reserved; on-chain unchecked]
+//!       [ 96..104)   8 zero bytes
+//!       [104..136)   hash256(batchData)
+//!       [136..144)   chainId little-endian (8 bytes)
+//!       [144..240)   96 zero bytes
+//!       [240..272)   hash256(newCovenantScript)
+//!       [272..280)   newBlockNumber little-endian (8 bytes)
+//!     ```
+//!
+//!     The on-chain `Upgrade*` methods in
+//!     `pkg/covenant/contracts/rollup_fri.runar.go` assert specific Substr
+//!     offsets against this blob. A drift in any field is caught by
+//!     `runar.VerifySP1FRI` failing on-chain.
+//!
+//! Both modes commit through the SAME guest ELF, so both share the SAME
+//! pinned `SP1VerifyingKeyHash` — keeping the on-chain covenant's
+//! one-VK-per-shard contract intact.
+//!
+//! Public values layout for MODE_BATCH (280 bytes, spec 12):
 //!   [0..32]    preStateRoot
 //!   [32..64]   postStateRoot
 //!   [64..96]   receiptsHash (keccak256 of RLP-encoded receipts)
@@ -56,6 +94,16 @@ use sha2::{Digest, Sha256};
 /// This ensures the guest ELF (and therefore the SP1 verifying key)
 /// is unique per shard. See spec 12 "Cross-shard proof replay prevention".
 const CHAIN_ID: u64 = 8453111;
+
+/// Wire-format mode byte: full EVM batch execution (production path).
+/// Followed by a `BatchInput` on the SP1 stdin stream.
+const MODE_BATCH: u8 = 0x00;
+
+/// Wire-format mode byte: covenant VK rotation / no-op upgrade transition.
+/// Followed by an `UpgradeInput` on the SP1 stdin stream. The guest does
+/// NO EVM execution and commits the spec-12 upgrade publicValues layout
+/// (see module-level docs and `pkg/covenant.EncodeUpgradePublicValues`).
+const MODE_UPGRADE: u8 = 0x01;
 
 /// The L2 bridge predeploy address (spec 12: bridge contract at 0x4200...0010).
 const BRIDGE_CONTRACT_ADDRESS: Address = Address::new([
@@ -253,6 +301,41 @@ pub struct BatchInput {
     pub state_proofs: Vec<AccountProofWitness>,
 }
 
+/// Inputs for `MODE_UPGRADE` — covenant VK rotation. The guest commits
+/// the spec-12 upgrade publicValues layout under a STARK proof so the
+/// on-chain `Upgrade*` methods accept it via `runar.VerifySP1FRI`.
+///
+/// No EVM execution happens for an upgrade transition; `postStateRoot`
+/// is bound to `pre_state_root`, and the publicValues blob carries the
+/// `hash256(new_covenant_script)` migration binding at pv[240..272).
+///
+/// Field order MUST match the host-side mirror in
+/// `prover/host-bridge/src/main.rs::GuestUpgradeInput` and
+/// `prover/host-bench/src/main.rs::GuestUpgradeInput` exactly — bincode
+/// is positional under serde derives, so any drift here silently
+/// corrupts guest input (the same regression class the wire_format
+/// helpers were introduced to catch; see
+/// `docs/decisions/vk-rotation-wire-format-2026-04.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeInput {
+    /// Pre-upgrade state root, copied into pv[0..32) AND pv[32..64). For
+    /// an upgrade transition the post-state-root equals the pre-state-
+    /// root by construction (no opcode executes).
+    pub pre_state_root: [u8; 32],
+    /// New covenant locking script bytes. The guest commits
+    /// hash256(new_covenant_script) at pv[240..272) so the on-chain
+    /// upgrade method can bind the rotation target to the proof.
+    pub new_covenant_script: Vec<u8>,
+    /// EIP-155 chain id, copied little-endian into pv[136..144). MUST
+    /// match the live covenant's `ChainId` readonly.
+    pub chain_id: u64,
+    /// Pre-upgrade covenant `BlockNumber` readonly. The upgrade tx
+    /// advances this to `block_number + 1`, encoded little-endian into
+    /// pv[272..280) so the on-chain `pvBlockNumber == c.BlockNumber+1`
+    /// assertion passes.
+    pub block_number: u64,
+}
+
 /// A simplified receipt for RLP encoding and hashing.
 #[derive(Debug, Clone)]
 struct Receipt {
@@ -272,6 +355,85 @@ struct Log {
 // ─── Main entry point ────────────────────────────────────────────────────────
 
 pub fn main() {
+    // ── 0. Wire-format dispatch on the leading mode byte ─────────────────
+    //
+    // The guest reads a single u8 BEFORE any other input. The byte
+    // selects between the EVM-batch path (existing production behaviour)
+    // and the no-op-state covenant-upgrade path that closes
+    // `WW-upgrade-proof-real-stark`. Hosts that predate the mode byte
+    // are not supported — every `prover/host-*` consumer of this ELF
+    // writes the mode byte first; an envelope that omits it is treated
+    // as a fatal wire-format regression and surfaces as commit_error
+    // 0x08 (mirrors the 0x07 zero-batch canary).
+    let mode: u8 = sp1_zkvm::io::read::<u8>();
+    match mode {
+        MODE_BATCH => run_batch(),
+        MODE_UPGRADE => run_upgrade(),
+        _ => {
+            // Unknown mode byte — surface as a structured error so a
+            // future wire-format drift is loud rather than silent.
+            let mut probe = [0u8; 32];
+            probe[0] = mode;
+            commit_error(0x08, &[0u8; 32], &probe);
+        }
+    }
+}
+
+/// MODE_UPGRADE handler — commits the spec-12 upgrade publicValues
+/// layout (see module-level docs and
+/// `pkg/covenant.EncodeUpgradePublicValues`). No revm execution happens;
+/// the upgrade transition is a no-op state transition by definition.
+///
+/// The committed bytes MUST be byte-for-byte identical to the Go-side
+/// `EncodeUpgradePublicValues(pre, pre, batch, proof, new_script,
+/// chain_id, block_number+1)`, where `batch` and `proof` are the same
+/// canonical synthetic blobs the host bridge writes. The host computes
+/// `batch_data_hash` and `proof_blob_hash` and feeds them into the guest
+/// rather than re-deriving the blobs inside the zkVM (cheaper — the
+/// 165 KB proof and 20 KB batch are already known to the host).
+fn run_upgrade() {
+    let input: UpgradeInput = sp1_zkvm::io::read();
+    // Read the host-supplied hashes that bind the batch and proof
+    // blobs into pv[64..96) and pv[104..136). The guest CANNOT
+    // independently verify these correspond to the host's actual
+    // batch/proof bytes (that would require the full blobs as input,
+    // which costs ~185 KB of guest stdin and gains nothing — both
+    // fields are reserved/audit slots, not consumed by the on-chain
+    // verifier). The on-chain `Upgrade*` method asserts
+    // `pv[104..136) == hash256(batchData)` against the SAME
+    // batchData blob the host emits in the rotation bundle, so a
+    // host that ships mismatched bytes here would be caught at
+    // covenant evaluation time, not inside the proof.
+    let batch_data_hash: [u8; 32] = sp1_zkvm::io::read::<[u8; 32]>();
+    let proof_blob_hash: [u8; 32] = sp1_zkvm::io::read::<[u8; 32]>();
+
+    // ── Commit the 280-byte spec-12 upgrade publicValues blob ────────────
+    //
+    // ORDER MUST MATCH `pkg/covenant.EncodeUpgradePublicValues` exactly.
+    // A drift here → on-chain `Upgrade*` Substr offsets disagree → the
+    // rotation tx is rejected by `verifyScript` → the shard is stuck on
+    // its current VK forever (until a SECOND fix-the-fix rotation, which
+    // requires the synthetic-stand-in path on a freshly-deployed
+    // testnet shard since this very ELF would be the bad one).
+    sp1_zkvm::io::commit_slice(&input.pre_state_root); // [0..32)   preStateRoot
+    sp1_zkvm::io::commit_slice(&input.pre_state_root); // [32..64)  postStateRoot == pre
+    sp1_zkvm::io::commit_slice(&proof_blob_hash); // [64..96)   hash256(proofBlob)
+    sp1_zkvm::io::commit_slice(&[0u8; 8]); // [96..104)  reserved zeros
+    sp1_zkvm::io::commit_slice(&batch_data_hash); // [104..136) hash256(batchData)
+    sp1_zkvm::io::commit_slice(&input.chain_id.to_le_bytes()); // [136..144) chainId LE
+    sp1_zkvm::io::commit_slice(&[0u8; 96]); // [144..240) reserved zeros
+    let mig_hash = hash256(&input.new_covenant_script);
+    sp1_zkvm::io::commit_slice(&mig_hash); // [240..272) hash256(newCovenantScript)
+    let new_block = input.block_number.saturating_add(1);
+    sp1_zkvm::io::commit_slice(&new_block.to_le_bytes()); // [272..280) newBlockNumber LE
+}
+
+/// MODE_BATCH handler — full EVM execution (production path). This is
+/// the body that `main()` ran directly before the mode-byte dispatch
+/// landed; refactored into a function so the new MODE_UPGRADE path could
+/// share the same `main()` entry point and therefore the same SP1
+/// verifying key.
+fn run_batch() {
     // ── 1. Read inputs from the SP1 host ─────────────────────────────────
     let input: BatchInput = sp1_zkvm::io::read();
 
@@ -1173,6 +1335,90 @@ mod tests {
         let err = verify_pre_state(&pre_state_root, &accounts, &witnesses)
             .expect_err("must reject account without matching witness");
         assert_eq!(err, 0x06);
+    }
+
+    /// MODE_UPGRADE publicValues layout — host-side mirror of the
+    /// committed bytes. This is the byte-pattern the in-zkVM `run_upgrade`
+    /// commits via `sp1_zkvm::io::commit_slice`. Mirroring the layout in
+    /// a host-runnable function lets us assert the spec-12 contract
+    /// without needing to actually invoke the SP1 zkVM.
+    ///
+    /// MUST stay byte-for-byte identical to `run_upgrade` AND to the
+    /// Go-side `pkg/covenant.EncodeUpgradePublicValues`.
+    fn upgrade_publicvalues_for_test(
+        pre_state_root: &[u8; 32],
+        new_covenant_script: &[u8],
+        chain_id: u64,
+        block_number: u64,
+        batch_data: &[u8],
+        proof_blob: &[u8],
+    ) -> [u8; 280] {
+        let mut out = [0u8; 280];
+        out[0..32].copy_from_slice(pre_state_root);
+        out[32..64].copy_from_slice(pre_state_root);
+
+        let proof_hash = hash256(proof_blob);
+        out[64..96].copy_from_slice(&proof_hash);
+        // out[96..104) reserved zeros.
+
+        let batch_hash = hash256(batch_data);
+        out[104..136].copy_from_slice(&batch_hash);
+
+        out[136..144].copy_from_slice(&chain_id.to_le_bytes());
+        // out[144..240) reserved zeros.
+
+        let mig_hash = hash256(new_covenant_script);
+        out[240..272].copy_from_slice(&mig_hash);
+
+        let new_block = block_number.saturating_add(1);
+        out[272..280].copy_from_slice(&new_block.to_le_bytes());
+        out
+    }
+
+    /// MODE_UPGRADE: the publicValues blob must be exactly 280 bytes
+    /// and pin every spec-12 slot at the offset
+    /// `pkg/covenant/contracts/rollup_fri.runar.go::Upgrade*` reads.
+    /// A drift here breaks every VK rotation on every live shard.
+    #[test]
+    fn upgrade_publicvalues_layout_matches_spec_12() {
+        let mut pre = [0u8; 32];
+        for i in 0..32 {
+            pre[i] = i as u8;
+        }
+        let new_script: [u8; 7] = [0x76, 0xa9, 0x14, 0xde, 0xad, 0xbe, 0xef];
+        let chain_id: u64 = 8_453_111;
+        let block_number: u64 = 12_847;
+        let batch = b"batch-blob";
+        let proof = b"proof-blob";
+
+        let pv = upgrade_publicvalues_for_test(
+            &pre,
+            &new_script,
+            chain_id,
+            block_number,
+            batch,
+            proof,
+        );
+        assert_eq!(pv.len(), 280);
+
+        // pv[0..32) preStateRoot
+        assert_eq!(&pv[0..32], &pre[..]);
+        // pv[32..64) postStateRoot == preStateRoot for upgrade
+        assert_eq!(&pv[32..64], &pre[..]);
+        // pv[64..96) hash256(proofBlob)
+        assert_eq!(&pv[64..96], &hash256(proof));
+        // pv[96..104) reserved zeros
+        assert_eq!(&pv[96..104], &[0u8; 8]);
+        // pv[104..136) hash256(batchData)
+        assert_eq!(&pv[104..136], &hash256(batch));
+        // pv[136..144) chainId little-endian
+        assert_eq!(&pv[136..144], &chain_id.to_le_bytes());
+        // pv[144..240) reserved zeros
+        assert!(pv[144..240].iter().all(|&b| b == 0));
+        // pv[240..272) hash256(newCovenantScript)
+        assert_eq!(&pv[240..272], &hash256(&new_script));
+        // pv[272..280) (block_number + 1) little-endian
+        assert_eq!(&pv[272..280], &(block_number + 1).to_le_bytes());
     }
 
     /// Same coverage gate when ONE of N accounts is missing a witness.

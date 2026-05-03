@@ -20,7 +20,7 @@ are wall-ms (logged but informational).
 - macOS 26.3
 - SP1 SDK 6.1.0 (Cargo resolved up from the 6.0.2 floor)
 - SP1 toolchain `gkgUAXxgDg`
-- VK pin: `0x0021629d5e6f7ca0b77d3b4cdd305e46a3a756ee9752ff476a99fdf21374d26c`
+- VK pin: `0x0089e86b40471ffbca344ddd6e02c4aade8d2d1676cbab381a6bedc726c964e7`
   (docker-mode build, Phase 1 of `docs/decisions/sp1-reproducible-build-2026-05.md`)
 
 ## New fixtures
