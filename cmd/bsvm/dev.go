@@ -41,6 +41,7 @@ func devCommand() *cli.Command {
 				},
 				Action: cmdDevMine,
 			},
+			devSignRotationCommand(),
 		},
 	}
 }

@@ -157,13 +157,38 @@ You will need:
    * `multisig` (M-of-N): collect M signatures via the partial-sig
      bundle flow described in §4 below.
 
-   **TODO(WW-rotation-sign)**: `bsvm` does not yet expose a
-   `dev sign-rotation` (or equivalent) helper. For now use the
-   bsv-blockchain go-sdk's `transaction.Sign(...)` against the
-   sighash that `pkg/covenant.BuildUpgradeUnlockScript` would
-   consume, OR use any standard secp256k1 signer (the sighash is
-   the upgrade tx's BIP-143 SigHash for input 0 with the live
-   covenant's locking script as `prevLockScript`).
+   Use `bsvm dev sign-rotation` to compute the sighash and sign it
+   with a governance WIF. The helper has two input modes:
+
+   ```bash
+   # Mode A — sign a fully-built unsigned upgrade tx (HSM/airgap):
+   bsvm dev sign-rotation \
+       --wif path/to/governance.wif \
+       --upgrade-tx-hex "$UPGRADE_TX_HEX" \
+       --prev-locking-script-hex "$LIVE_COVENANT_LOCK_HEX" \
+       --prev-sats "$COVENANT_SATS_LIVE"
+   # → prints the BSV-canonical signature hex (DER + 0x41 sighashType
+   #   byte) on stdout. Paste into governanceSigsHex in rotation.json.
+
+   # Mode B — sign + append into an in-flight rotate-vk.partial.json:
+   bsvm dev sign-rotation \
+       --wif path/to/governance.wif \
+       --partial-bundle rotate-vk.partial.json \
+       --covenant-txid "$COVENANT_TXID" \
+       --covenant-vout 0 \
+       --covenant-sats "$COVENANT_SATS_LIVE" \
+       --prev-locking-script-hex "$LIVE_COVENANT_LOCK_HEX" \
+       --out rotate-vk.partial.json
+   # → appends the new signature to the bundle's governanceSigsHex
+   #   and prints the same hex on stdout for audit.
+   ```
+
+   Both modes compute BIP-143 `SIGHASH_ALL | SIGHASH_FORKID = 0x41`
+   over input 0 with `prevLockScript = current covenant locking
+   script`, `prevSats = covenantSatsLive`. The emitted signature
+   is DER + sighashType byte, matching what
+   `covenant.BuildUpgradeUnlockScript` consumes for the
+   `Upgrade*` methods.
 
 6. **Optional**: stop the live prover node(s) on the shard during
    the rotation. Strictly not required (the upgrade tx race-loses
@@ -274,8 +299,10 @@ Each subsequent operator:
 2. Verifies the bundle's `publicValuesHex` and `batchDataHex` match
    the rotation they expected to sign (avoid blind signing).
 3. Computes their signature against the upgrade tx's sighash for
-   input 0 (see TODO(WW-rotation-sign) in §1 for the sighash details
-   until a `bsvm dev sign-rotation` helper lands).
+   input 0 via `bsvm dev sign-rotation --partial-bundle ...` (Mode B
+   in §1 step 5). The helper appends the signature directly to the
+   bundle's `governanceSigsHex` when `--out` is set, OR prints the
+   signature hex on stdout for hand-off into the rotation config.
 4. Appends the new signature to `governanceSigsHex` in the
    ROTATION CONFIG (not the partial bundle).
 5. Re-runs `rotate-vk --broadcast` with the now-fuller config.
@@ -432,10 +459,11 @@ The cross-cutting helper gaps surfaced above:
   point that commits the spec-12 upgrade publicValues layout so the
   on-chain `VerifySP1FRI` accepts the proof. See
   `prover/host-bridge/src/main.rs::run_upgrade_proof`.
-* **`bsvm dev sign-rotation`** — signs the upgrade tx's input-0
-  sighash with the supplied governance WIF. Either standalone or
-  takes the `rotate-vk.partial.json` and emits the signature hex.
-  Eliminates the cross-tool secp256k1-signing step.
+* ~~**`bsvm dev sign-rotation`**~~ — **shipped 2026-05.** Signs the
+  upgrade tx's input-0 sighash with the supplied governance WIF.
+  Two modes: `--upgrade-tx-hex` (raw, HSM/airgap workflow) and
+  `--partial-bundle` (chains into the rotate-vk M-of-N partial-sig
+  flow). See §1 step 5 for invocation.
 * **`bsvm covenant tail` / structured-log helper** — surfaces the
   existing `rollup advance` log lines in a format suitable for
   copy-paste auditing.
@@ -459,5 +487,8 @@ ergonomics" milestone; tracking them here so they don't get lost.
 * `pkg/covenant/upgrade.go` — the on-chain `Upgrade` method
   semantics; reading this is the way to understand which fields are
   asserted on-chain.
+* `cmd/bsvm/dev_sign_rotation.go` — the `bsvm dev sign-rotation`
+  helper that closes the operator-side signing gap (covered by
+  `cmd/bsvm/dev_sign_rotation_test.go`).
 * `test/integration/rotate_vk_test.go` — assembly-path coverage
   (real testnet rotation gated behind `BSVM_TESTNET=1`).

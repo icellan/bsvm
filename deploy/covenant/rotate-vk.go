@@ -366,7 +366,13 @@ func runBroadcastUpgrade(
 	}
 	summary.UpgradeUnlockHex = hex.EncodeToString(unlock)
 
-	tx, err := buildUpgradeSpendTx(cfg, resNew.RollupScript, unlock)
+	tx, err := BuildUpgradeSpendTx(
+		cfg.CovenantTxID,
+		cfg.CovenantVout,
+		cfg.CovenantSatsLive,
+		resNew.RollupScript,
+		unlock,
+	)
 	if err != nil {
 		return fmt.Errorf("buildUpgradeSpendTx: %w", err)
 	}
@@ -471,23 +477,61 @@ func expectedSigsForGov(g covenant.GovernanceConfig) int {
 	}
 }
 
+// PartialSigBundle is the on-disk JSON shape rotate-vk emits when fewer
+// than the threshold governance signatures have been collected. A
+// follow-up operator reads this back, appends their signature to
+// GovernanceSigsHex, and re-runs --broadcast with the now-fuller config.
+//
+// Exported so the `bsvm dev sign-rotation` helper (and any other
+// follow-up signing tool) can read + write the same on-disk shape
+// without duplicating field names.
+type PartialSigBundle struct {
+	Note               string   `json:"note"`
+	ChainID            uint64   `json:"chainId"`
+	CurrentStateRoot   string   `json:"currentStateRootHex"`
+	CurrentBlockNumber uint64   `json:"currentBlockNumber"`
+	NewCovenantScript  string   `json:"newCovenantScriptHex"`
+	NewCovenantAnfHash string   `json:"newCovenantAnfHashHex"`
+	PublicValues       string   `json:"publicValuesHex"`
+	BatchData          string   `json:"batchDataHex"`
+	ProofBlob          string   `json:"proofBlobHex"`
+	GovernanceSigs     []string `json:"governanceSigsHex"`
+}
+
+// LoadPartialSigBundle reads + parses a partial-sig bundle JSON file
+// previously produced by rotate-vk's --broadcast flow.
+func LoadPartialSigBundle(path string) (*PartialSigBundle, error) {
+	raw, err := os.ReadFile(path) //nolint:gosec // path is operator-controlled by design
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var b PartialSigBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &b, nil
+}
+
+// WritePartialSigBundle serialises a PartialSigBundle to disk with the
+// canonical formatting rotate-vk uses (2-space indented JSON, 0600
+// permissions to keep the in-flight signature set out of world-readable
+// scratch dirs).
+func WritePartialSigBundle(path string, b *PartialSigBundle) error {
+	data, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal partial bundle: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
 // writePartialSigBundle serialises an in-flight UpgradeRequest to JSON
 // so a follow-up operator run can read it back, append their signature,
 // and resume.
 func writePartialSigBundle(path string, req *covenant.UpgradeRequest) error {
-	type partial struct {
-		Note               string   `json:"note"`
-		ChainID            uint64   `json:"chainId"`
-		CurrentStateRoot   string   `json:"currentStateRootHex"`
-		CurrentBlockNumber uint64   `json:"currentBlockNumber"`
-		NewCovenantScript  string   `json:"newCovenantScriptHex"`
-		NewCovenantAnfHash string   `json:"newCovenantAnfHashHex"`
-		PublicValues       string   `json:"publicValuesHex"`
-		BatchData          string   `json:"batchDataHex"`
-		ProofBlob          string   `json:"proofBlobHex"`
-		GovernanceSigs     []string `json:"governanceSigsHex"`
-	}
-	out := partial{
+	out := &PartialSigBundle{
 		Note: "rotate-vk partial bundle. Append your signature to governanceSigsHex " +
 			"and re-run with --broadcast and the same config to assemble + broadcast.",
 		ChainID:            req.ChainID,
@@ -503,24 +547,26 @@ func writePartialSigBundle(path string, req *covenant.UpgradeRequest) error {
 	for _, s := range req.GovernanceSigs {
 		out.GovernanceSigs = append(out.GovernanceSigs, hex.EncodeToString(s))
 	}
-	data, err := json.MarshalIndent(out, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal partial bundle: %w", err)
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	return nil
+	return WritePartialSigBundle(path, out)
 }
 
-// buildUpgradeSpendTx assembles a single-input single-output BSV tx
+// BuildUpgradeSpendTx assembles a single-input single-output BSV tx
 // that spends the live covenant UTXO under the supplied unlock script
 // and re-pins the value under the new locking script. The result is
 // only as on-chain-valid as the supplied unlock script — broadcasting
 // a synthetic-proof variant will be rejected by the SP1 verifier in
 // the rollup contract's upgrade method.
-func buildUpgradeSpendTx(
-	cfg *RotateVKConfig,
+//
+// The unlockBytes argument may be empty (or a single 0x00 placeholder)
+// when the caller only needs the tx skeleton for sighash computation
+// (e.g. the `bsvm dev sign-rotation` helper). The BIP-143 sighash for
+// input 0 is independent of the input's UnlockingScript bytes — it is
+// derived from the previous output's locking script — so the same
+// builder is reused by both paths.
+func BuildUpgradeSpendTx(
+	covenantTxID string,
+	covenantVout uint32,
+	covenantSatsLive uint64,
 	newRollupScript []byte,
 	unlockBytes []byte,
 ) (*transaction.Transaction, error) {
@@ -531,19 +577,21 @@ func buildUpgradeSpendTx(
 	// supplies the live UTXO's locking script via the same channel
 	// as covenantTxId.
 	if err := tx.AddInputFrom(
-		cfg.CovenantTxID,
-		cfg.CovenantVout,
+		covenantTxID,
+		covenantVout,
 		"00", // placeholder — sigOps are already encoded into unlockBytes
-		cfg.CovenantSatsLive,
+		covenantSatsLive,
 		nil,
 	); err != nil {
 		return nil, fmt.Errorf("AddInputFrom: %w", err)
 	}
-	unlockScript, err := sdkscript.NewFromHex(hex.EncodeToString(unlockBytes))
-	if err != nil {
-		return nil, fmt.Errorf("unlock script: %w", err)
+	if len(unlockBytes) > 0 {
+		unlockScript, err := sdkscript.NewFromHex(hex.EncodeToString(unlockBytes))
+		if err != nil {
+			return nil, fmt.Errorf("unlock script: %w", err)
+		}
+		tx.Inputs[0].UnlockingScript = unlockScript
 	}
-	tx.Inputs[0].UnlockingScript = unlockScript
 
 	// Continuation output: same satoshi value, new covenant lock.
 	newLS, err := sdkscript.NewFromHex(hex.EncodeToString(newRollupScript))
@@ -551,7 +599,7 @@ func buildUpgradeSpendTx(
 		return nil, fmt.Errorf("new rollup locking script: %w", err)
 	}
 	tx.AddOutput(&transaction.TransactionOutput{
-		Satoshis:      cfg.CovenantSatsLive,
+		Satoshis:      covenantSatsLive,
 		LockingScript: newLS,
 	})
 	return tx, nil
