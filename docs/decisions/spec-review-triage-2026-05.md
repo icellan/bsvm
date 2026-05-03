@@ -217,19 +217,77 @@ The log-only consumers are lower-priority because there's no
 intent that touches L2 balances, and that one is real.
 
 **Recommended path**:
-- [ ] Open a tracked TODO with named hook
-      `W6-beef-covenant-chain-get-endpoint` for the GET catch-up
-      handler.
-- [ ] Open separate tracked TODOs `W6-5-inbox-consumer`,
-      `W6-5-governance-consumer`, `W6-7-fee-wallet-consumer`,
-      `W6-overlay-covenant-consumer` for the four log-only sinks.
-- [ ] Push back: spec 17 line 949 names the route but does not
-      pin the wire format of the GET response. Suggested wording
-      for spec 17 §"Bootstrap": "GET /bsvm/beef/covenant-chain
-      ?from=<txid>&limit=<n> returns a length-prefixed concatenation
-      of BEEF envelopes in covenant-chain order, oldest first; the
-      cursor `from` is the txid of the last-known good covenant
-      tip on the requesting node."
+- [x] **DONE** (2026-05-03 via daec23c):
+      `W6-beef-covenant-chain-get-endpoint` — `GET /bsvm/beef/
+      covenant-chain?from=<txid>&limit=<n>` returns a length-prefixed
+      concatenation of confirmed (intent 0x02) advance envelopes in
+      receive order, strictly after the cursor; bootstrap-from-peers
+      now works without falling back to spec 11's `SyncFromBSV`.
+      Wire format pinned in `docs/decisions/W6-beef-covenant-chain-
+      get.md`. Documented separately so a follower implementer
+      doesn't have to reverse-engineer the response shape from the
+      handler. Default limit 100, hard cap 500.
+- [-] **DEFERRED** (2026-05-03): `WW-inbox-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeInboxConsumer` plumbs the
+      InboxMonitor handle through `beefWireOpts` and logs every
+      received intent-0x05 envelope at INFO with the
+      `todo_hook=WW-inbox-consumer` field. The receiver subsystem
+      (`pkg/overlay.InboxMonitor.AddInboxTransaction(txRLP []byte)`)
+      is ready, but the cmd-side dispatcher cannot extract `txRLP`
+      from a BEEF target tx without a Rúnar unlock-script decoder —
+      `pkg/beef.ParseBEEF` returns raw tx bytes, not structured
+      input/unlock-script views. Future graduation = one
+      `opts.InboxMonitor.AddInboxTransaction(extractedRLP)` call
+      site once the decoder lands.
+- [-] **DEFERRED** (2026-05-03): `WW-governance-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeGovernanceConsumer` plumbs the
+      `governance.Workflow` handle through `beefWireOpts` and logs
+      every received intent-0x06 envelope at INFO with the
+      `todo_hook=WW-governance-consumer` field. The receiver
+      subsystem (overlay's GovernanceMonitor + the proposal workflow)
+      is ready, but the cmd-side dispatcher must first decode the
+      covenant continuation output's CovenantState push-data via
+      `pkg/covenant.DecodeCovenantState` and diff against
+      `currentState` before invoking the freeze/unfreeze/upgrade
+      handlers — naive dispatch would double-fire alongside the
+      existing `covenantMgr.SetStateChangeCallback` wired in
+      `pkg/overlay/node.go`. Future graduation = one diff-then-
+      dispatch helper once the BSV-tx output walker exists.
+- [-] **DEFERRED** (2026-05-03): `WW-fee-wallet-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeFeeWalletConsumer` plumbs the
+      `*overlay.FeeWallet` handle through `beefWireOpts` and logs
+      every received intent-0x04 envelope at INFO with the
+      `todo_hook=WW-fee-wallet-consumer` field. The receiver
+      subsystem (`pkg/overlay.FeeWallet.AddUTXO(*FeeUTXO)`) is
+      ready, but the cmd-side dispatcher must first walk the BSV
+      target tx's outputs and match each output's locking script
+      against the fee wallet's expected script — the wallet does
+      not currently expose a published locking script for matching.
+      Future graduation = output-walker + per-output `AddUTXO` calls
+      keyed off `env.Confirmed`.
+- [-] **DEFERRED** (2026-05-03): `WW-overlay-covenant-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeCovenantConsumer` plumbs the
+      `*covenant.CovenantManager` + `*overlay.OverlayNode` handles
+      through `beefWireOpts` and logs every received intent-0x01 /
+      intent-0x02 envelope at INFO with the
+      `todo_hook=WW-overlay-covenant-consumer` field. The receiver
+      subsystem (`overlayNode.RaceDetector().HandleCovenantAdvance`)
+      is ready, but the cmd-side dispatcher must first extract the
+      spec-12 OP_RETURN payload (`BSVM\x02 || withdrawalRoot ||
+      batchData`) from the BSV target tx's outputs and decode the
+      embedded `block.BatchData` to recover post-state-root + L2
+      block number. The dispatcher must also coordinate with the
+      existing libp2p `MsgCovenantAdvance` path
+      (`pkg/network/sync.go`) to avoid double-fed RaceDetector
+      events for the same advance. Future graduation = OP_RETURN
+      walker + `block.DecodeBatchData` + dedup-by-txid before the
+      `RaceDetector.HandleCovenantAdvance` call.
+- [ ] Push back (still open): spec 17 line 949 names the route but
+      did not pin the wire format of the GET response until
+      `docs/decisions/W6-beef-covenant-chain-get.md` landed. The
+      original push-back wording should be folded into spec 17
+      §"Bootstrap" so future readers see the contract inline rather
+      than via a decisions doc cross-reference.
 
 **Notes for the operator**: The reviewer's bullet-3 phrasing
 ("consumers are mostly log-only") understates how intentional this

@@ -994,6 +994,15 @@ func cmdRun(ctx *cli.Context) error {
 		BridgeMonitor:    bridgeMonitor,
 		BridgeScriptHash: bridgeScriptHash,
 		LocalShardID:     uint32(chainID),
+		// Receiver handles for the four deferred consumers. Each is
+		// non-nil here; the consumers stay log-only until their
+		// respective extractor lands (see beef_wiring.go for the
+		// per-consumer WW hook).
+		InboxMonitor:           overlayNode.InboxMonitor(),
+		ProposalWorkflow:       proposalWorkflow,
+		FeeWallet:              overlayNode.FeeWallet(),
+		OverlayCovenantManager: covenantMgr,
+		OverlayNode:            overlayNode,
 	}, rpcServer)
 
 	// 8. Start services.
