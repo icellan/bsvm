@@ -24,6 +24,13 @@ func main() {
 	flag.BoolVar(&opts.DryRun, "dry-run", true, "compile + emit summary; do NOT broadcast (default)")
 	flag.BoolVar(&opts.Broadcast, "broadcast", false, "compile + sign + broadcast via ARC")
 	flag.StringVar(&opts.OutPath, "out", "", "write JSON summary to this path in addition to stdout")
+	flag.BoolVar(&opts.ANFPublish, "anf-publish", false,
+		"in --broadcast mode, ALSO publish the canonical ANF inscription tx to BSV. "+
+			"The on-chain hash256(NewCovenantAnfHash) is bound regardless; this flag controls "+
+			"only whether the JSON document is broadcast so off-chain observers can fetch it. "+
+			"Default: false (operator dry-runs, inspects --anf-doc, then opts in)")
+	flag.StringVar(&opts.AnfDocPath, "anf-doc", "",
+		"write the canonical ANF document JSON to this path (default: <config-dir>/rotate-vk.anf.json)")
 	flag.Parse()
 
 	if err := covenantdeploy.RunRotateVK(opts); err != nil {

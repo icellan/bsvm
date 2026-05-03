@@ -352,10 +352,20 @@ func encodeBigintLE(v int64) []byte {
 }
 
 // UpgradeAnfPlaceholder returns hash256(b) as a 32-byte array. Exposed
-// to keep deploy/covenant from re-implementing the BSV double-SHA256
-// when it derives its placeholder ANF hash for the spec-10 migration
-// OP_RETURN. Replace with a real ANF-JSON-binding once the canonical
-// ANF inscription publish path lands (TODO(WW-anf-publish)).
+// for legacy tests / dry-runs that derive the spec-10 migration
+// OP_RETURN binding from the script bytes alone.
+//
+// DEPRECATED for production rotations. The canonical ANF inscription
+// path now lives in pkg/covenant/anf and is driven by
+// deploy/covenant.BuildANFDocument + deploy/covenant.PublishANFDocument
+// — the on-chain UpgradeRequest.NewCovenantAnfHash now binds to
+// hash256(canonical-JSON(anf.Document)), NOT to a script-derived
+// placeholder. New callers should use
+// covenantanf.Hash256(canonicalBytes); this helper remains only
+// because the deploy/covenant rotate-vk.go fallback still needs a
+// stable hash when an OperatorConfig is unavailable (e.g. unit tests
+// that exercise the unlock-script assembly without a full document
+// pipeline).
 func UpgradeAnfPlaceholder(b []byte) [32]byte {
 	return hash256Bytes(b)
 }

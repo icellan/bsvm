@@ -66,6 +66,7 @@ import (
 
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/covenant"
+	covenantanf "github.com/icellan/bsvm/pkg/covenant/anf"
 )
 
 // RotateVKConfig is the input shape for the rotate-vk binary. It is
@@ -158,8 +159,20 @@ type RotateSummary struct {
 	UpgradeTxAwaitingSigs int    `json:"upgradeTxAwaitingSigs,omitempty"`
 	UpgradeUnlockHex      string `json:"upgradeUnlockHex,omitempty"`
 	UpgradeMethod         string `json:"upgradeMethod,omitempty"`
-	Broadcast             bool   `json:"broadcast"`
-	GeneratedAt           string `json:"generatedAt"`
+	// AnfHash is the hex-encoded hash256 of the canonical ANF document
+	// the rotation binds to (== hex(UpgradeRequest.NewCovenantAnfHash)).
+	// Always populated in --broadcast mode; consumers cross-check the
+	// value against the inscription tx's OP_RETURN payload.
+	AnfHash string `json:"anfHash,omitempty"`
+	// AnfDocPath is the on-disk path the canonical ANF document was
+	// written to. The dry-run path always writes; --broadcast writes
+	// AND publishes when --anf-publish is set.
+	AnfDocPath string `json:"anfDocPath,omitempty"`
+	// AnfPublishTxID is the broadcast txid of the ANF inscription tx,
+	// populated only when --anf-publish was set AND broadcast succeeded.
+	AnfPublishTxID string `json:"anfPublishTxid,omitempty"`
+	Broadcast      bool   `json:"broadcast"`
+	GeneratedAt    string `json:"generatedAt"`
 }
 
 // RotateOptions packages the CLI flag set used by the rotate-vk
@@ -170,6 +183,18 @@ type RotateOptions struct {
 	DryRun     bool
 	Broadcast  bool
 	OutPath    string
+	// ANFPublish, when true, broadcasts the canonical ANF inscription
+	// transaction to BSV (in addition to the rotation upgrade tx). The
+	// document's hash256 is always baked into UpgradeRequest.NewCovenantAnfHash
+	// regardless of this flag — flipping it only controls whether the
+	// document itself is published on-chain so off-chain observers can
+	// retrieve it from a BSV indexer. Defaults to false; operators
+	// typically dry-run, inspect AnfDocPath, then opt in.
+	ANFPublish bool
+	// AnfDocPath, when non-empty, is where the canonical ANF document
+	// JSON is written (for operator inspection before --anf-publish).
+	// Defaults to "<config-dir>/rotate-vk.anf.json" when empty.
+	AnfDocPath string
 }
 
 // RunRotateVK is the rotation binary's main loop. The cmd/rotate-vk
@@ -309,13 +334,29 @@ func runBroadcastUpgrade(
 				"a production shard.")
 	}
 
-	// Compute the ANF hash for the new covenant. Without a real
-	// runar-go ANF emitter the deploy tool only carries the script; we
-	// derive a stable 32-byte ANF placeholder by hashing the script
-	// bytes prefixed with a fixed marker. Production rotations should
-	// override this with the published ANF JSON's hash256 once the
-	// canonical ANF inscription path lands (TODO(WW-anf-publish)).
-	anfHash := anfHashPlaceholder(resNew.RollupScript)
+	// WW-anf-publish (resolved): build the canonical ANF document for
+	// the NEW covenant, compute hash256(canonical-JSON), and bind it
+	// into the on-chain UpgradeRequest. The document is also written
+	// to disk so the operator can inspect it before opting in to the
+	// optional --anf-publish broadcast (the inscription tx itself is
+	// emitted later in this function).
+	anfDoc, anfCanonical, err := BuildANFDocument(&cfg.OperatorConfig, resNew, ANFOptions{
+		Kind: covenantanf.KindRotation,
+	})
+	if err != nil {
+		return fmt.Errorf("build ANF document: %w", err)
+	}
+	anfHash := covenantanf.Hash256(anfCanonical)
+	anfDocPath := opts.AnfDocPath
+	if anfDocPath == "" {
+		anfDocPath = filepath.Join(filepath.Dir(opts.ConfigPath), "rotate-vk.anf.json")
+	}
+	if writeErr := WriteANFDocument(anfDocPath, anfCanonical); writeErr != nil {
+		return fmt.Errorf("write ANF document: %w", writeErr)
+	}
+	summary.AnfHash = hex.EncodeToString(anfHash[:])
+	summary.AnfDocPath = anfDocPath
+	_ = anfDoc // keep the variable live; the canonical bytes carry the binding
 
 	req := covenant.UpgradeRequest{
 		CurrentStateRoot:   preStateRoot,
@@ -401,6 +442,35 @@ func runBroadcastUpgrade(
 	}
 	summary.Broadcast = true
 	summary.UpgradeTxIDActual = hex.EncodeToString(resp.TxID[:])
+
+	// Optional ANF inscription broadcast. The on-chain upgrade tx is
+	// already committed at this point; failing to publish the ANF
+	// JSON does NOT roll the rotation back. We log the publish error
+	// and emit the summary so the operator can retry the inscription
+	// alone via `deploy-covenant --anf-publish` (the deploy binary's
+	// equivalent flag) without re-rotating.
+	if opts.ANFPublish {
+		// Use a fresh context for the inscription tx so the upgrade
+		// timeout doesn't bleed across into a slower BSV indexer.
+		anfCtx, anfCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer anfCancel()
+		// Re-marshal anfDoc for the broadcast bytes. The canonical-JSON
+		// is deterministic so the bytes match what was written to
+		// AnfDocPath and what was hashed into AnfHash.
+		anfTxID, anfErr := PublishANFDocument(anfCtx, &cfg.OperatorConfig, anfCanonical)
+		if anfErr != nil {
+			summary.AnfPublishTxID = ""
+			fmt.Fprintf(os.Stderr,
+				"rotate-vk: WARN ANF inscription broadcast failed: %v. "+
+					"Rotation upgrade tx %s is already on-chain. Re-run "+
+					"deploy-covenant --anf-publish against the same ANF doc "+
+					"at %s to retry the inscription alone.\n",
+				anfErr, summary.UpgradeTxIDActual, summary.AnfDocPath)
+		} else {
+			summary.AnfPublishTxID = anfTxID
+		}
+	}
+
 	return EmitRotateSummary(summary, opts.OutPath)
 }
 
@@ -636,12 +706,18 @@ func decodeHexBundle(hexes []string) ([][]byte, error) {
 
 // anfHashPlaceholder returns a stable 32-byte hash binding the new
 // covenant script identity into the spec-10 migration OP_RETURN.
-// Production rotations should replace this with the published ANF
-// JSON's hash256 once the canonical ANF inscription path lands
-// (TODO(WW-anf-publish)). The placeholder still binds the migration
-// to the script bytes — observers that recompile the new contract
-// from source can recompute hash256 of their compiled artifact and
-// confirm match.
+//
+// DEPRECATED for production use. The real broadcast path now goes
+// through BuildANFDocument + covenantanf.Hash256 (see runBroadcastUpgrade
+// and anf_publish.go) — the canonical ANF document bundles the script
+// AND the runar-go ANF IR AND governance + chain bindings, so
+// observers can fetch the published JSON from any BSV indexer and
+// re-derive the on-chain commitment without recompiling the contract.
+//
+// This helper is kept for tests and dry-runs that do not have an
+// OperatorConfig in scope; it produces a deterministic 32-byte value
+// from the script bytes alone, which is enough to exercise unlock-
+// script assembly without the full document pipeline.
 func anfHashPlaceholder(newScript []byte) [32]byte {
 	const tag = "BSVM-ANF-PLACEHOLDER\x01"
 	buf := make([]byte, 0, len(tag)+len(newScript))

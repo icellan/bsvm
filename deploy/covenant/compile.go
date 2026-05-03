@@ -48,6 +48,7 @@ import (
 
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/covenant"
+	covenantanf "github.com/icellan/bsvm/pkg/covenant/anf"
 
 	gocompiler "github.com/icellan/runar/compilers/go/compiler"
 	runar "github.com/icellan/runar/packages/runar-go"
@@ -140,8 +141,20 @@ type Summary struct {
 	VerificationMode   string `json:"verificationMode"`
 	GenesisTxIDPredict string `json:"genesisTxidPredicted,omitempty"`
 	GenesisTxIDActual  string `json:"genesisTxidActual,omitempty"`
-	Broadcast          bool   `json:"broadcast"`
-	GeneratedAt        string `json:"generatedAt"`
+	// AnfHash is the hex-encoded hash256 of the canonical ANF document
+	// for the genesis covenant pair. Always populated when Compile()
+	// succeeds; observers cross-check the value against the inscription
+	// tx's OP_RETURN payload (see AnfPublishTxID).
+	AnfHash string `json:"anfHash,omitempty"`
+	// AnfDocPath is the on-disk path the canonical ANF document was
+	// written to. Dry-run always writes; --broadcast writes AND
+	// publishes when --anf-publish is set.
+	AnfDocPath string `json:"anfDocPath,omitempty"`
+	// AnfPublishTxID is the broadcast txid of the ANF inscription tx,
+	// populated only when --anf-publish was set AND broadcast succeeded.
+	AnfPublishTxID string `json:"anfPublishTxid,omitempty"`
+	Broadcast      bool   `json:"broadcast"`
+	GeneratedAt    string `json:"generatedAt"`
 }
 
 // RunOptions packages the CLI flag set used by the deploy entry point
@@ -152,6 +165,17 @@ type RunOptions struct {
 	DryRun     bool
 	Broadcast  bool
 	OutPath    string
+	// ANFPublish, when true, broadcasts the canonical ANF inscription
+	// tx alongside the genesis tx. The genesis manifest's vkHash field
+	// already binds to the rollup script bytes; this flag publishes
+	// the FULL document (script + runar-go ANF IR + governance) so
+	// off-chain observers can fetch and audit the contract source
+	// without re-running the deploy tool. Default: false.
+	ANFPublish bool
+	// AnfDocPath, when non-empty, is where the canonical ANF document
+	// JSON is written for operator inspection. Defaults to
+	// "<config-dir>/deploy.anf.json" when empty.
+	AnfDocPath string
 }
 
 // RunDeploy is the deploy binary's main loop. The cmd/deploy/main.go
@@ -192,6 +216,28 @@ func RunDeploy(opts RunOptions) error {
 		GenesisTxIDPredict: res.PredictedTxID,
 	}
 
+	// Build the canonical ANF document for the genesis covenant pair.
+	// Always done — even in dry-run — so the operator can inspect the
+	// JSON before opting in to --anf-publish. The on-chain genesis tx
+	// itself does not carry an explicit AnfHash readonly (the bridge
+	// pins to hash256(rollup script), not to an ANF doc), so the
+	// AnfHash field in the summary is informational; rotations are
+	// where the on-chain commitment kicks in (see rotate-vk.go).
+	_, anfCanonical, anfErr := BuildANFDocument(cfg, res, ANFOptions{
+		Kind: covenantanf.KindGenesis,
+	})
+	if anfErr != nil {
+		return fmt.Errorf("build ANF document: %w", anfErr)
+	}
+	summary.AnfHash = covenantanf.HexHash256(anfCanonical)
+	if opts.AnfDocPath == "" {
+		opts.AnfDocPath = filepath.Join(filepath.Dir(opts.ConfigPath), "deploy.anf.json")
+	}
+	if writeErr := WriteANFDocument(opts.AnfDocPath, anfCanonical); writeErr != nil {
+		return fmt.Errorf("write ANF document: %w", writeErr)
+	}
+	summary.AnfDocPath = opts.AnfDocPath
+
 	if !opts.Broadcast {
 		summary.Broadcast = false
 		return EmitSummary(summary, opts.OutPath)
@@ -205,6 +251,27 @@ func RunDeploy(opts RunOptions) error {
 	}
 	summary.Broadcast = true
 	summary.GenesisTxIDActual = txid
+
+	// Optional ANF inscription broadcast. Same contract as the
+	// rotate-vk path: the inscription tx is independent of the
+	// genesis tx and a publish failure does not roll the genesis
+	// back. The deploy operator can re-publish later via the same
+	// flag against the same AnfDocPath.
+	if opts.ANFPublish {
+		anfCtx, anfCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer anfCancel()
+		anfTxID, pubErr := PublishANFDocument(anfCtx, cfg, anfCanonical)
+		if pubErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"deploy-covenant: WARN ANF inscription broadcast failed: %v. "+
+					"Genesis tx %s is already on-chain. Re-run with --anf-publish "+
+					"against the same ANF doc at %s to retry.\n",
+				pubErr, txid, opts.AnfDocPath)
+		} else {
+			summary.AnfPublishTxID = anfTxID
+		}
+	}
+
 	return EmitSummary(summary, opts.OutPath)
 }
 
@@ -212,8 +279,19 @@ func RunDeploy(opts RunOptions) error {
 // validation test in test/integration/covenant_deploy_test.go can
 // assert against the same shape the CLI returns.
 type CompileResult struct {
-	BridgeScript  []byte
-	RollupScript  []byte
+	BridgeScript []byte
+	RollupScript []byte
+	// RollupANF is the runar-go ANF IR (canonical JSON) for the rollup
+	// covenant. Populated by the rollup compile path; nil when the
+	// upstream compiler did not emit one (rare — only happens for
+	// stateless contracts, which BSVM does not deploy). Used by the ANF
+	// inscription helper (anf_publish.go) to seed the published ANF
+	// document.
+	RollupANF []byte
+	// BridgeANF mirrors RollupANF for the bridge covenant. Populated on
+	// genesis compiles; nil for rotate-vk (the bridge is not auto-
+	// rotated; see rotate-vk.go's package doc).
+	BridgeANF     []byte
 	VKHashHex     string
 	VKHashSource  string
 	GovConfig     covenant.GovernanceConfig
@@ -290,7 +368,7 @@ func Compile(cfg *OperatorConfig) (*CompileResult, error) {
 	// to emit a zero-length bridge script — that condition is a hard
 	// failure rather than a warning.
 	rollupScriptDoubleHash := hash256(rollup.LockingScript)
-	bridgeScript, bridgeErr := compileBridge(rollupScriptDoubleHash[:])
+	bridgeScript, bridgeANF, bridgeErr := compileBridge(rollupScriptDoubleHash[:])
 	if bridgeErr != nil {
 		return nil, fmt.Errorf("bridge compile: %w", bridgeErr)
 	}
@@ -301,6 +379,8 @@ func Compile(cfg *OperatorConfig) (*CompileResult, error) {
 	res := &CompileResult{
 		BridgeScript: bridgeScript,
 		RollupScript: rollup.LockingScript,
+		RollupANF:    rollup.ANF,
+		BridgeANF:    bridgeANF,
 		VKHashHex:    "0x" + hex.EncodeToString(vkBytes),
 		VKHashSource: vkPath,
 		GovConfig:    gov,
@@ -350,10 +430,13 @@ func compileRollup(mode covenant.VerificationMode, vk []byte, chainID uint64, go
 //
 // Mirrors the pkg/covenant compileRollupContract pipeline so the
 // resulting script is byte-identical to what a future
-// covenant.CompileBridge helper would emit.
-func compileBridge(stateCovenantScriptHash []byte) ([]byte, error) {
+// covenant.CompileBridge helper would emit. Returns the locking
+// script bytes AND the runar-go ANF IR JSON; the latter is fed into
+// the ANF inscription document published alongside the genesis tx
+// (see anf_publish.go).
+func compileBridge(stateCovenantScriptHash []byte) ([]byte, []byte, error) {
 	if len(stateCovenantScriptHash) != 32 {
-		return nil, fmt.Errorf("stateCovenantScriptHash must be 32 bytes, got %d", len(stateCovenantScriptHash))
+		return nil, nil, fmt.Errorf("stateCovenantScriptHash must be 32 bytes, got %d", len(stateCovenantScriptHash))
 	}
 	srcPath := findBridgeContractSource()
 	args := map[string]interface{}{
@@ -363,7 +446,7 @@ func compileBridge(stateCovenantScriptHash []byte) ([]byte, error) {
 		ConstructorArgs: args,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("compile bridge.runar.go: %w", err)
+		return nil, nil, fmt.Errorf("compile bridge.runar.go: %w", err)
 	}
 	scriptHex := strings.TrimPrefix(artifact.Script, "0x")
 	if len(scriptHex)%2 != 0 {
@@ -371,9 +454,16 @@ func compileBridge(stateCovenantScriptHash []byte) ([]byte, error) {
 	}
 	scriptBytes, err := hex.DecodeString(scriptHex)
 	if err != nil {
-		return nil, fmt.Errorf("decode bridge script hex: %w", err)
+		return nil, nil, fmt.Errorf("decode bridge script hex: %w", err)
 	}
-	return scriptBytes, nil
+	var anfJSON []byte
+	if artifact.ANF != nil {
+		anfJSON, err = json.Marshal(artifact.ANF)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal bridge ANF: %w", err)
+		}
+	}
+	return scriptBytes, anfJSON, nil
 }
 
 // findBridgeContractSource locates pkg/covenant/contracts/bridge.runar.go
