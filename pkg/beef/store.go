@@ -123,7 +123,31 @@ type Store interface {
 	// Iterate visits every envelope of the given intent in
 	// receive-time order (oldest first). intent == 0 visits all.
 	Iterate(intent byte, visit func(*Envelope) bool) error
+	// IterateSince walks envelopes of the given intent in receive-
+	// time order (oldest first), starting strictly after the envelope
+	// whose TargetTxID matches fromTxID, and visits up to limit of
+	// them. The first return value reports whether fromTxID was
+	// found among the matching-intent envelopes; if false, no visits
+	// are made and limit/visit are ignored.
+	//
+	// fromTxID == zero is treated as the "genesis" sentinel: walk
+	// from the very beginning of the chain (no skip), and the found
+	// flag is reported true even when the store is empty so callers
+	// can return 200 with an empty body rather than 404.
+	//
+	// limit <= 0 visits no envelopes (but still returns the correct
+	// found flag). intent == 0 visits all intents.
+	//
+	// IterateSince serves the spec-17 §949
+	// `GET /bsvm/beef/covenant-chain?from=<txid>&limit=<n>` catch-up
+	// endpoint that lets a fresh follower bootstrap by pulling
+	// confirmed covenant-advance envelopes from a peer.
+	IterateSince(intent byte, fromTxID [32]byte, limit int, visit func(*Envelope) bool) (found bool, err error)
 }
+
+// genesisCursor is the all-zero TargetTxID sentinel that IterateSince
+// recognises as "start from the beginning of the chain".
+var genesisCursor = [32]byte{}
 
 // MemoryStore is an in-memory Store implementation backed by a
 // concurrent map. Suitable for dev and tests; production wiring uses
@@ -198,6 +222,21 @@ func (s *MemoryStore) Iterate(intent byte, visit func(*Envelope) bool) error {
 		}
 	}
 	return nil
+}
+
+// IterateSince implements Store.
+func (s *MemoryStore) IterateSince(intent byte, fromTxID [32]byte, limit int, visit func(*Envelope) bool) (bool, error) {
+	s.mu.RLock()
+	envs := make([]*Envelope, 0, len(s.m))
+	for _, e := range s.m {
+		if intent != 0 && e.Header.Intent != intent {
+			continue
+		}
+		envs = append(envs, cloneEnvelope(e))
+	}
+	s.mu.RUnlock()
+	sortEnvelopes(envs)
+	return walkSince(envs, fromTxID, limit, visit), nil
 }
 
 // LevelStore is a durable Store backed by an internal/db.Database
@@ -275,9 +314,32 @@ func (s *LevelStore) Delete(txid [32]byte) error {
 // Iterate implements Store. It uses the underlying database's prefix
 // iterator if available; otherwise it returns ErrIterateUnsupported.
 func (s *LevelStore) Iterate(intent byte, visit func(*Envelope) bool) error {
+	envs, err := s.collect(intent)
+	if err != nil {
+		return err
+	}
+	for _, e := range envs {
+		if !visit(e) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// IterateSince implements Store.
+func (s *LevelStore) IterateSince(intent byte, fromTxID [32]byte, limit int, visit func(*Envelope) bool) (bool, error) {
+	envs, err := s.collect(intent)
+	if err != nil {
+		return false, err
+	}
+	return walkSince(envs, fromTxID, limit, visit), nil
+}
+
+// collect returns every stored envelope of intent, sorted oldest-first.
+func (s *LevelStore) collect(intent byte) ([]*Envelope, error) {
 	it, ok := s.db.(db.Iteratee)
 	if !ok {
-		return ErrIterateUnsupported
+		return nil, ErrIterateUnsupported
 	}
 	iter := it.NewIterator(levelKeyPrefix, nil)
 	defer iter.Release()
@@ -293,15 +355,10 @@ func (s *LevelStore) Iterate(intent byte, visit func(*Envelope) bool) error {
 		envs = append(envs, env)
 	}
 	if err := iter.Error(); err != nil {
-		return fmt.Errorf("beef: iterate: %w", err)
+		return nil, fmt.Errorf("beef: iterate: %w", err)
 	}
 	sortEnvelopes(envs)
-	for _, e := range envs {
-		if !visit(e) {
-			return nil
-		}
-	}
-	return nil
+	return envs, nil
 }
 
 // ErrIterateUnsupported is returned by LevelStore.Iterate when the
@@ -338,4 +395,57 @@ func sortEnvelopes(envs []*Envelope) {
 			envs[j-1], envs[j] = envs[j], envs[j-1]
 		}
 	}
+}
+
+// walkSince walks envs (assumed already sorted oldest-first) starting
+// strictly after the entry whose TargetTxID matches fromTxID, visiting
+// up to limit successors. It returns whether fromTxID was located in
+// envs (or whether fromTxID is the genesis-cursor sentinel, which is
+// always considered "found" so callers can serve a 200 with an empty
+// body when the store is fresh).
+//
+// limit <= 0 short-circuits the visit loop but still reports the
+// found flag honestly so callers can validate the cursor before
+// streaming.
+func walkSince(envs []*Envelope, fromTxID [32]byte, limit int, visit func(*Envelope) bool) bool {
+	if fromTxID == genesisCursor {
+		if limit <= 0 || visit == nil {
+			return true
+		}
+		emitted := 0
+		for _, e := range envs {
+			if emitted >= limit {
+				break
+			}
+			if !visit(e) {
+				return true
+			}
+			emitted++
+		}
+		return true
+	}
+	startIdx := -1
+	for i, e := range envs {
+		if e.TargetTxID == fromTxID {
+			startIdx = i
+			break
+		}
+	}
+	if startIdx < 0 {
+		return false
+	}
+	if limit <= 0 || visit == nil {
+		return true
+	}
+	emitted := 0
+	for i := startIdx + 1; i < len(envs); i++ {
+		if emitted >= limit {
+			break
+		}
+		if !visit(envs[i]) {
+			return true
+		}
+		emitted++
+	}
+	return true
 }

@@ -1,11 +1,15 @@
 package rpc
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/beef"
@@ -74,8 +78,154 @@ func (b *BEEFEndpoints) Mount(mux *http.ServeMux) {
 // script ancestor (~1 MB) plus a generous BUMP and frontier set.
 const maxBEEFRequestSize = 10 * 1024 * 1024
 
+// covenantChainCatchUpDefaultLimit is the default value of the `limit`
+// query parameter on GET /bsvm/beef/covenant-chain when the client
+// omits it. Picked to bound a single response to a few MB of BEEFs in
+// practice while remaining useful for steady-state catch-up.
+const covenantChainCatchUpDefaultLimit = 100
+
+// covenantChainCatchUpMaxLimit is the hard cap on the `limit` query
+// parameter on GET /bsvm/beef/covenant-chain. Requests exceeding this
+// are rejected with 400 so peers can't induce unbounded server work.
+// See docs/decisions/W6-beef-covenant-chain-get.md.
+const covenantChainCatchUpMaxLimit = 500
+
+// handleCovenantChain dispatches the spec-17 §949 covenant-chain
+// endpoint based on HTTP method:
+//   - GET serves the catch-up stream
+//     (`?from=<txid>&limit=<n>` → length-prefixed BEEF envelopes,
+//     oldest first, strictly after `from`).
+//   - POST is the existing gossip-receive path (intent 0x01/0x02
+//     covenant-advance envelopes).
+//
+// TODO(spec-17): once spec 17 §949 is updated to pin the wire format,
+// drop this comment in favour of a spec reference. The format is
+// captured in docs/decisions/W6-beef-covenant-chain-get.md.
 func (b *BEEFEndpoints) handleCovenantChain(w http.ResponseWriter, r *http.Request) {
-	b.handle(w, r, b.cfg.CovenantConsumer, "covenant-chain", true)
+	switch r.Method {
+	case http.MethodGet:
+		b.handleCovenantChainCatchUp(w, r)
+	case http.MethodPost:
+		b.handle(w, r, b.cfg.CovenantConsumer, "covenant-chain", true)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCovenantChainCatchUp serves the spec-17 §949 GET endpoint that
+// lets a follower bootstrap by pulling confirmed covenant-advance
+// BEEFs from a peer. Wire format:
+//
+//	GET /bsvm/beef/covenant-chain?from=<txid>&limit=<n>
+//	Response 200 OK, Content-Type: application/octet-stream
+//	Body: repeated <u32 BE length><envelope bytes>, oldest first,
+//	      strictly after the envelope identified by `from`.
+//
+// Errors:
+//   - missing `from`     → 400 "from query param required"
+//   - malformed `from`   → 400 "from must be 32-byte hex txid"
+//   - unknown `from`     → 404 "from txid not found"
+//   - oversized `limit`  → 400 "limit must be 1..500"
+//
+// Only IntentCovenantAdvanceConfirmed envelopes are returned;
+// unconfirmed advances have no SPV proof yet so a fresh follower
+// cannot validate them, per spec 17 §"Bootstrap".
+//
+// The all-zero `from` txid is accepted as the "genesis" cursor and
+// returns every confirmed covenant-advance envelope from the start.
+func (b *BEEFEndpoints) handleCovenantChainCatchUp(w http.ResponseWriter, r *http.Request) {
+	if b.cfg.Store == nil {
+		http.Error(w, "beef store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	q := r.URL.Query()
+	fromRaw := strings.TrimSpace(q.Get("from"))
+	if fromRaw == "" {
+		http.Error(w, "from query param required", http.StatusBadRequest)
+		return
+	}
+	fromTxID, ok := parseTxIDHex(fromRaw)
+	if !ok {
+		http.Error(w, "from must be 32-byte hex txid", http.StatusBadRequest)
+		return
+	}
+	limit := covenantChainCatchUpDefaultLimit
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > covenantChainCatchUpMaxLimit {
+			http.Error(w,
+				fmt.Sprintf("limit must be 1..%d", covenantChainCatchUpMaxLimit),
+				http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	// Buffer the framed body in memory before writing. Keeps the
+	// 200/404 distinction clean: if the cursor is unknown we emit a
+	// 404 *without* having sent any bytes yet. The buffer is bounded
+	// by limit (max 500) * envelope-size, well below the 10 MB
+	// gossip cap a peer is already willing to accept.
+	body := make([]byte, 0)
+	count := 0
+	found, err := b.cfg.Store.IterateSince(
+		beef.IntentCovenantAdvanceConfirmed,
+		fromTxID,
+		limit,
+		func(env *beef.Envelope) bool {
+			encoded, encErr := beef.EncodeEnvelope(env.Header, env.Beef)
+			if encErr != nil {
+				slog.Warn("beef catch-up: skip unencodable envelope",
+					"txid", hex.EncodeToString(env.TargetTxID[:]),
+					"err", encErr)
+				return true
+			}
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(encoded)))
+			body = append(body, lenBuf[:]...)
+			body = append(body, encoded...)
+			count++
+			return true
+		},
+	)
+	if err != nil {
+		slog.Error("beef catch-up: store error", "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "from txid not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, werr := w.Write(body); werr != nil {
+		slog.Warn("beef catch-up: write failed", "err", werr)
+		return
+	}
+	slog.Debug("beef catch-up served",
+		"from", hex.EncodeToString(fromTxID[:]),
+		"limit", limit,
+		"returned", count,
+		"bytes", len(body),
+	)
+}
+
+// parseTxIDHex parses a 32-byte hex txid (with or without 0x prefix).
+// Returns the decoded bytes and true on success.
+func parseTxIDHex(s string) ([32]byte, bool) {
+	var out [32]byte
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	if len(s) != 64 {
+		return out, false
+	}
+	decoded, err := hex.DecodeString(s)
+	if err != nil {
+		return out, false
+	}
+	copy(out[:], decoded)
+	return out, true
 }
 
 func (b *BEEFEndpoints) handleBridgeDeposit(w http.ResponseWriter, r *http.Request) {

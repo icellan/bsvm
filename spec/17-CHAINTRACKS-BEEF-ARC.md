@@ -946,12 +946,20 @@ When a peer receives a covenant-advance BEEF (intent 0x01 or 0x02):
 ```
 
 When a node joins a shard fresh, it bootstraps by repeatedly calling
-a peer's `GET /bsvm/beef/covenant-chain?from=<tip>` RPC (exposed on
-the same HTTP server as the explorer UI, spec 15) to pull the
-covenant BEEFs sequentially, verifying each via the follower path
+a peer's `GET /bsvm/beef/covenant-chain?from=<tip>&limit=<n>` RPC
+(exposed on the same HTTP server as the explorer UI, spec 15) to pull
+the covenant BEEFs sequentially, verifying each via the follower path
 above, until it has caught up to the shard tip. This entirely
 replaces spec 11's `SyncFromBSV` walk via `findNextCovenantAdvance` —
 no BSV node or block-body source is consulted at all.
+
+The wire format of this catch-up endpoint is pinned in
+`docs/decisions/W6-beef-covenant-chain-get.md`: a length-prefixed
+concatenation of confirmed covenant-advance BEEF envelopes, oldest
+first, strictly after the supplied `from` cursor; `limit` defaults
+to 100 and is capped at 500. The all-zero `from` sentinel is the
+genesis cursor for first-ever bootstrap. POST on the same path keeps
+the existing covenant-advance gossip-receive semantics.
 
 ### Distinguishing race-loss from BSV reorg
 
