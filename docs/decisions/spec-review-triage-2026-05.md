@@ -248,61 +248,120 @@ intent that touches L2 balances, and that one is real.
       get.md`. Documented separately so a follower implementer
       doesn't have to reverse-engineer the response shape from the
       handler. Default limit 100, hard cap 500.
-- [-] **DEFERRED** (2026-05-03): `WW-inbox-consumer` —
-      `cmd/bsvm/beef_wiring.go::makeInboxConsumer` plumbs the
-      InboxMonitor handle through `beefWireOpts` and logs every
-      received intent-0x05 envelope at INFO with the
-      `todo_hook=WW-inbox-consumer` field. The receiver subsystem
-      (`pkg/overlay.InboxMonitor.AddInboxTransaction(txRLP []byte)`)
-      is ready, but the cmd-side dispatcher cannot extract `txRLP`
-      from a BEEF target tx without a Rúnar unlock-script decoder —
-      `pkg/beef.ParseBEEF` returns raw tx bytes, not structured
-      input/unlock-script views. Future graduation = one
-      `opts.InboxMonitor.AddInboxTransaction(extractedRLP)` call
-      site once the decoder lands.
-- [-] **DEFERRED** (2026-05-03): `WW-governance-consumer` —
-      `cmd/bsvm/beef_wiring.go::makeGovernanceConsumer` plumbs the
-      `governance.Workflow` handle through `beefWireOpts` and logs
-      every received intent-0x06 envelope at INFO with the
-      `todo_hook=WW-governance-consumer` field. The receiver
-      subsystem (overlay's GovernanceMonitor + the proposal workflow)
-      is ready, but the cmd-side dispatcher must first decode the
-      covenant continuation output's CovenantState push-data via
-      `pkg/covenant.DecodeCovenantState` and diff against
-      `currentState` before invoking the freeze/unfreeze/upgrade
-      handlers — naive dispatch would double-fire alongside the
-      existing `covenantMgr.SetStateChangeCallback` wired in
-      `pkg/overlay/node.go`. Future graduation = one diff-then-
-      dispatch helper once the BSV-tx output walker exists.
-- [-] **DEFERRED** (2026-05-03): `WW-fee-wallet-consumer` —
-      `cmd/bsvm/beef_wiring.go::makeFeeWalletConsumer` plumbs the
-      `*overlay.FeeWallet` handle through `beefWireOpts` and logs
-      every received intent-0x04 envelope at INFO with the
-      `todo_hook=WW-fee-wallet-consumer` field. The receiver
-      subsystem (`pkg/overlay.FeeWallet.AddUTXO(*FeeUTXO)`) is
-      ready, but the cmd-side dispatcher must first walk the BSV
-      target tx's outputs and match each output's locking script
-      against the fee wallet's expected script — the wallet does
-      not currently expose a published locking script for matching.
-      Future graduation = output-walker + per-output `AddUTXO` calls
-      keyed off `env.Confirmed`.
-- [-] **DEFERRED** (2026-05-03): `WW-overlay-covenant-consumer` —
-      `cmd/bsvm/beef_wiring.go::makeCovenantConsumer` plumbs the
-      `*covenant.CovenantManager` + `*overlay.OverlayNode` handles
-      through `beefWireOpts` and logs every received intent-0x01 /
-      intent-0x02 envelope at INFO with the
-      `todo_hook=WW-overlay-covenant-consumer` field. The receiver
-      subsystem (`overlayNode.RaceDetector().HandleCovenantAdvance`)
-      is ready, but the cmd-side dispatcher must first extract the
-      spec-12 OP_RETURN payload (`BSVM\x02 || withdrawalRoot ||
-      batchData`) from the BSV target tx's outputs and decode the
-      embedded `block.BatchData` to recover post-state-root + L2
-      block number. The dispatcher must also coordinate with the
-      existing libp2p `MsgCovenantAdvance` path
-      (`pkg/network/sync.go`) to avoid double-fed RaceDetector
-      events for the same advance. Future graduation = OP_RETURN
-      walker + `block.DecodeBatchData` + dedup-by-txid before the
-      `RaceDetector.HandleCovenantAdvance` call.
+- [x] **DONE** (2026-05-03): `WW-inbox-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeInboxConsumer` now extracts the
+      EVM `txRLP` from the BEEF target tx's input-0 unlock script
+      (the inbox covenant Submit() call) via the in-tree decoder in
+      `cmd/bsvm/beef_extractors.go::extractInboxTxRLP`, then queues
+      it via `InboxMonitor.AddInboxTransaction`. A consumer-side
+      dedup set keyed on target txid drops duplicate envelopes
+      (re-broadcast, unconfirmed/confirmed pair) so the queue is not
+      double-extended.
+      Upstream gap: runar-go does not expose a public unlock-script
+      decoder for the Submit() shape; the in-tree extractor relies
+      on the codegen invariant `[codePart, opPushTxSig, txRLP]`
+      (3 pushes for a single-public-method stateful contract). When
+      runar-go grows its own decoder we should swap to it; that gap
+      is tracked as `WW-runar-inbox-decoder`.
+      Coverage: `TestWireBEEFEndpointsInboxConsumerWires` posts a
+      Submit()-shaped envelope twice and asserts PendingCount goes
+      0 → 1 → 1 (dedup); `TestWireBEEFEndpointsInboxConsumerNotWired`
+      keeps the structured-log fallback path covered.
+- [x] **DONE** (2026-05-03): `WW-governance-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeGovernanceConsumer` now decodes
+      the new CovenantState from the BEEF target tx's output-0
+      locking script via
+      `cmd/bsvm/beef_extractors.go::extractCovenantStateFromTx`,
+      diffs against `OverlayCovenantManager.CurrentState()`, and
+      calls `governance.Workflow.CreateOrMerge` with a freeze /
+      unfreeze proposal when the Frozen flag transitions. The
+      content-addressed `Proposal.ID` dedups identical proposals
+      across BEEF replays AND across the existing
+      `covenantMgr.SetStateChangeCallback` path — the double-fire
+      concern is structurally resolved by Workflow's content-hash
+      ID derivation.
+      Sub-gap (still open): the BEEF path does not yet emit
+      `ActionUpgrade` proposals — recovering the new covenant
+      script hash requires walking the BSV-tx output 0 for the
+      pre-state covenant continuation script (different from the
+      `CovenantState` push) and hashing it. Tracked separately as
+      `WW-governance-upgrade-extractor`. When a 0x06 envelope
+      records a state change that isn't a freeze/unfreeze
+      transition, the consumer logs that named hook + skips
+      proposal creation.
+      Coverage: `TestWireBEEFEndpointsGovernanceConsumerWires`
+      posts an envelope whose new state has Frozen=1 against an
+      empty local tip; asserts a single freeze proposal is created
+      and a re-POST is content-hash-deduped.
+      `TestWireBEEFEndpointsGovernanceConsumerNotWired` keeps the
+      structured-log fallback path covered.
+- [x] **DONE** (2026-05-03): `WW-fee-wallet-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeFeeWalletConsumer` now reads
+      the wallet's expected locking script via the new
+      `FeeWallet.ExpectedScriptPubKey()` accessor, walks the BEEF
+      target tx's outputs via
+      `cmd/bsvm/beef_extractors.go::extractFeeWalletOutputs`, and
+      credits each matching output as a FeeUTXO via the wallet's
+      idempotent `AddUTXO` method. The cmd-side bsv_wiring.go
+      publishes the wallet's expected script at boot
+      (`feeWallet.SetExpectedScriptPubKey(bsv.BuildP2PKH(pkh))`)
+      after deriving the fee-wallet key.
+      AddUTXO is idempotent on (txid, vout) so a re-broadcast
+      envelope is a wallet-level no-op without extra consumer-side
+      dedup.
+      Coverage: `TestWireBEEFEndpointsFeeWalletConsumerWires`
+      posts an envelope with a matching output and asserts Balance
+      goes 0 → matched-sats → matched-sats (idempotent re-credit).
+      `TestWireBEEFEndpointsFeeWalletConsumerNoScript` keeps the
+      structured-log fallback path covered for the boot edge case
+      where the wallet has not yet published its script.
+- [x] **DONE** (2026-05-03): `WW-overlay-covenant-consumer` —
+      `cmd/bsvm/beef_wiring.go::makeCovenantConsumer` now extracts
+      the spec-12 OP_RETURN payload (`BSVM\x02 || withdrawalRoot ||
+      batchData`) from the BEEF target tx outputs via
+      `cmd/bsvm/beef_extractors.go::extractCovenantAdvance`,
+      decodes the embedded `block.BatchData`, constructs a
+      `CovenantAdvanceEvent` with the target txid + IsOurs flag
+      computed against `CovenantManager.CurrentTxID()`, and calls
+      `RaceDetector.HandleCovenantAdvance`. A consumer-side dedup
+      set keyed on target txid drops duplicate envelopes; the
+      libp2p `MsgCovenantAdvance` path
+      (`pkg/network/sync.go`) is independent and the RaceDetector
+      itself tolerates two events for the same advance (the second
+      is a no-op vs. consecutive-loss tracking).
+      `L2BlockNum` is left zero by the BEEF-driven path: the
+      `block.BatchData` blob carries `ParentHash` not block-number,
+      and the race detector compares by txid not by height — the
+      libp2p path keeps the height-precise dispatch when both
+      sources are wired.
+      Coverage: `TestWireBEEFEndpointsCovenantConsumerWires` feeds
+      a real spec-12 OP_RETURN envelope twice through the consumer
+      with a bare RaceDetector; asserts OnRaceLost fires once,
+      observed event has the right txid + non-empty BatchData, and
+      the dedup blocks the second call.
+      `TestWireBEEFEndpointsCovenantConsumerNotWired` keeps the
+      structured-log fallback path covered.
+- [ ] **TODO** (`WW-runar-inbox-decoder`): runar-go does not expose
+      a public unlock-script decoder for the inbox covenant's
+      Submit() shape; the in-tree extractor in
+      `cmd/bsvm/beef_extractors.go::extractInboxTxRLP` reverse-
+      engineers the codegen invariant `[codePart, opPushTxSig,
+      txRLP]` for stateful single-public-method contracts. When
+      runar-go grows its own decoder (or exposes the artifact's ABI
+      so the call site can be method-name-aware) the in-tree
+      extractor should swap to the upstream API. No cross-repo
+      edits in this PR — the gap is documented inline at the
+      extractor's package comment.
+- [ ] **TODO** (`WW-governance-upgrade-extractor`): the BEEF
+      governance consumer does not yet emit `ActionUpgrade`
+      proposals because the new covenant script hash is not in the
+      `CovenantState` push — recovering it requires walking output
+      0's locking script for the pre-state covenant continuation
+      script (different from the 42-byte CovenantState push) and
+      hashing it. When the upgrade flow lands the consumer's switch
+      gains a third arm; the named hook is logged today when a
+      state change isn't a freeze/unfreeze transition so an
+      operator sees why an upgrade-shaped envelope wasn't enqueued.
 - [ ] Push back (still open): spec 17 line 949 names the route but
       did not pin the wire format of the GET response until
       `docs/decisions/W6-beef-covenant-chain-get.md` landed. The
@@ -311,11 +370,13 @@ intent that touches L2 balances, and that one is real.
       than via a decisions doc cross-reference.
 
 **Notes for the operator**: The reviewer's bullet-3 phrasing
-("consumers are mostly log-only") understates how intentional this
-is — the wiring file at lines 137-141 explicitly enumerates which
-sinks are still TODOs and which wave they belong to. The bridge
-consumer is *not* log-only as of W6-4. Cite both gaps separately
-in any tracking issue.
+("consumers are mostly log-only") was correct at the time of the
+review but no longer applies — all four log-only consumers were
+graduated to real receiver dispatches in the 2026-05-03 follow-up
+(see DONE bullets above). Two named upstream gaps remain
+(`WW-runar-inbox-decoder`, `WW-governance-upgrade-extractor`); both
+are surfaced via structured-log `todo_hook` fields the operator can
+grep when an envelope shape isn't yet handled.
 
 ---
 
@@ -662,7 +723,7 @@ beats a medium-blast item with M scope.
 | 3    | #1 Prover backend config + ELF / host-bridge wiring        | DONE (2026-05-03)        | M     | medium       | `WW-prover-mode-wiring` (workers + execute closed) |
 | 4    | #3b Bridge-health / rescan RPC plumbing to bridge monitor  | confirmed-gap            | M     | medium       | `admin-bridge-monitor-rpc`             |
 | 5    | #4 EVM Cancun-vs-Prague spec-vs-code mismatch              | partial (spec-update)    | S     | medium       | spec 01 wording PR                     |
-| 6    | #2 four log-only BEEF consumers (sub-bullet b only)        | confirmed-gap            | L     | medium       | `W6-5/6/7/overlay-*-consumer`          |
+| 6    | #2 four log-only BEEF consumers (sub-bullet b only)        | DONE 2026-05-03          | L     | medium       | `WW-{inbox,governance,fee-wallet,overlay-covenant}-consumer` (graduated; two named follow-ups: `WW-runar-inbox-decoder`, `WW-governance-upgrade-extractor`) |
 | 7    | #3a admin_setConfig live-reload whitelist                  | partial (spec-implies)   | M     | low          | `admin-setConfig-live-reload`          |
 | 8    | #5 BSV precompile status ambiguity                         | not-a-gap (spec wording) | S     | low          | spec 01 wording PR (line 483)          |
 

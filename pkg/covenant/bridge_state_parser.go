@@ -63,6 +63,15 @@ func ParseBridgeStateFromScriptBytes(script []byte) (*BridgeState, error) {
 	return nil, fmt.Errorf("bridge state parser: no valid 48-byte BridgeState pushdata found in script (len=%d)", len(script))
 }
 
+// WalkScriptPushdata is the exported alias of walkScriptPushdata.
+// External callers (cmd/bsvm BEEF extractors, etc.) need to walk push
+// payloads of arbitrary BSV scripts (covenant unlocks, OP_RETURN
+// outputs). Re-exporting under a stable name keeps the parser in one
+// place rather than copying it across packages.
+func WalkScriptPushdata(script []byte) ([][]byte, error) {
+	return walkScriptPushdata(script)
+}
+
 // walkScriptPushdata returns every pushdata payload found in script
 // in source order. Non-push opcodes are skipped silently. Returns an
 // error only on a truncated push (the script claims more bytes than

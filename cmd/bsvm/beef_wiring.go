@@ -8,63 +8,69 @@
 // The actual envelope parsing, shard-binding check, and store write
 // live inside pkg/rpc/beef_routes.go — this file is the cmd-side glue
 // that decides which consumer fires for each intent and what policy
-// applies. As of W6-4 the bridge-deposit consumer runs full BRC-62
-// graph verification (ancestry against chaintracks, BUMP against
-// confirmed headers, every input script re-executed) before crediting
-// the bridge monitor.
+// applies.
 //
-// The other four consumers (inbox, governance, fee-wallet, covenant-
-// advance) accept the receiver-subsystem handle through beefWireOpts so
-// the consumer factory can dispatch directly when the matching
-// extractor lands. Today each factory still logs the envelope and
-// records a tracked-WW-hook field in the log line so operators can
-// grep for which subsystem is still deferred. The named hooks are:
+// As of W6-4 the bridge-deposit consumer runs full BRC-62 graph
+// verification (ancestry against chaintracks, BUMP against confirmed
+// headers, every input script re-executed) before crediting the
+// bridge monitor.
 //
-//   - WW-inbox-consumer            — needs a BSV-tx Rúnar unlock-script
-//     decoder to recover the EVM txRLP
-//     argument from the inbox covenant
-//     Submit() call before the queue can
-//     be extended via
+// As of the 2026-05-03 follow-up, all four previously log-only
+// consumers (inbox, governance, fee-wallet, covenant-advance) now
+// dispatch to their real receivers via the per-extractor helpers in
+// cmd/bsvm/beef_extractors.go:
+//
+//   - WW-inbox-consumer            — recovers the EVM txRLP from input
+//     0's unlock script (inbox covenant
+//     Submit() call) and queues it via
 //     InboxMonitor.AddInboxTransaction.
-//   - WW-governance-consumer       — needs a covenant-output state
-//     decoder + diff against the local
-//     covenant tip before the
-//     GovernanceMonitor.HandleGovernance{
-//     Freeze,Unfreeze,Upgrade} can be
-//     invoked. The cmd-side state-change
-//     callback already fires these
-//     handlers when the local covenant
-//     manager applies the advance, so a
-//     naive BEEF-driven dispatch would
-//     double-fire — the extractor MUST
-//     diff against currentState first.
-//   - WW-fee-wallet-consumer       — needs a BSV-tx output walker that
-//     matches outputs to the fee
-//     wallet's locking script before
-//     FeeWallet.AddUTXO can be called.
-//     The fee wallet handle is plumbed
-//     through opts so the future change
-//     is one call site.
-//   - WW-overlay-covenant-consumer — needs an OP_RETURN extractor to
-//     recover the spec-12 advance payload
-//     (BSVM\x02 || withdrawalRoot ||
-//     batchData) and a batch-data decoder
-//     to recover the post-state-root +
-//     L2 block number before
-//     RaceDetector.HandleCovenantAdvance
-//     can be called with a fully-
-//     populated CovenantAdvanceEvent.
+//     Consumer-side dedup by target txid
+//     prevents re-broadcast double-fire.
+//   - WW-governance-consumer       — decodes the new CovenantState
+//     from output 0, diffs Frozen against
+//     the local covenant tip, and creates
+//     a freeze/unfreeze proposal via
+//     governance.Workflow.CreateOrMerge.
+//     Workflow content-hash IDs dedup
+//     across the existing
+//     covenantMgr.SetStateChangeCallback
+//     path. Upgrade actions still need
+//     the new-script-hash extractor —
+//     tracked as
+//     WW-governance-upgrade-extractor.
+//   - WW-fee-wallet-consumer       — walks tx outputs against the fee
+//     wallet's published expected script
+//     (FeeWallet.ExpectedScriptPubKey,
+//     set at boot in bsv_wiring.go) and
+//     credits matching outputs via the
+//     idempotent FeeWallet.AddUTXO.
+//   - WW-overlay-covenant-consumer — extracts the spec-12 OP_RETURN
+//     payload (BSVM\x02 || withdrawalRoot
+//     || batchData), decodes the batch
+//     data, and notifies the race
+//     detector via
+//     RaceDetector.HandleCovenantAdvance.
+//     Consumer-side dedup blocks the
+//     unconfirmed/confirmed pair from
+//     double-firing; the libp2p
+//     MsgCovenantAdvance path
+//     (pkg/network/sync.go) is
+//     independent and the race detector
+//     itself tolerates the secondary
+//     event.
 //
-// Each deferred sink is therefore intentionally not a half-wired
-// dispatch — the envelope is logged + persisted in the BEEF store, and
-// the receiver handle is held ready for the one-line graduation the
-// extractor unlocks.
+// One upstream gap remains as a documented inline note:
+// `WW-runar-inbox-decoder` — runar-go does not expose a public
+// unlock-script decoder for the Submit() shape; the in-tree extractor
+// reverse-engineers the codegen invariant. When runar-go lands a
+// public decoder we should swap to it.
 package main
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/icellan/bsvm/internal/db"
@@ -78,6 +84,36 @@ import (
 	"github.com/icellan/bsvm/pkg/rpc"
 	"github.com/icellan/bsvm/pkg/types"
 )
+
+// txDedupSet is a small concurrency-safe set of BEEF target txids
+// used by the inbox + covenant-advance consumers to drop duplicate
+// envelopes (e.g. an unconfirmed envelope followed by the matching
+// confirmed envelope, or the same envelope re-broadcast by two
+// peers). Sized at sixteen for the typical race-detection cadence;
+// the consumer wraps it in a sync.Mutex.
+type txDedupSet struct {
+	mu  sync.Mutex
+	set map[[32]byte]struct{}
+}
+
+// newTxDedupSet returns an empty dedup set ready for concurrent use.
+func newTxDedupSet() *txDedupSet {
+	return &txDedupSet{set: make(map[[32]byte]struct{}, 16)}
+}
+
+// addOnce returns true the first time txid is observed and false on
+// every subsequent call with the same txid. Used to gate consumer
+// dispatch so a re-broadcast envelope does not double-fire the
+// receiver.
+func (s *txDedupSet) addOnce(txid [32]byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.set[txid]; ok {
+		return false
+	}
+	s.set[txid] = struct{}{}
+	return true
+}
 
 // beefWireOpts gathers everything WireBEEFEndpoints needs. Splitting
 // the call site from the construction makes the cmdRun glue smaller
@@ -162,10 +198,19 @@ type beefWireOpts struct {
 	// OverlayNode is the receiver subsystem hook for the covenant-
 	// advance consumer's race-resolution path
 	// (RaceDetector.HandleCovenantAdvance). Held alongside the
-	// covenant manager so the future WW-overlay-covenant-consumer
-	// graduation can reach both APIs from a single handle. Nil is
+	// covenant manager so the WW-overlay-covenant-consumer
+	// dispatch can reach both APIs from a single handle. Nil is
 	// acceptable — the consumer logs and records the missing wiring.
 	OverlayNode *overlay.OverlayNode
+
+	// RaceDetector is the direct race-detector handle the covenant-
+	// advance consumer dispatches to. When nil the consumer falls
+	// back to overlay.RaceDetector() (production wiring); the
+	// explicit field exists so tests that don't want to stand up a
+	// full OverlayNode can still exercise the consumer's race-
+	// detector handoff. Production callers leave this nil and let
+	// the consumer pull through OverlayNode.
+	RaceDetector *overlay.RaceDetector
 }
 
 // WireBEEFEndpoints constructs the spec-17 BEEF endpoint surface and
@@ -408,36 +453,61 @@ func buildBridgeViewFromVerifiedBEEF(
 // store by the rpc layer; this callback is the cmd-side handoff to
 // the InboxMonitor.
 //
-// # Status: deferred (WW-inbox-consumer)
+// The consumer:
 //
-// Graduating this consumer to a real AddInboxTransaction call requires
-// a BSV-tx Rúnar unlock-script decoder that recovers the EVM txRLP
-// argument from the inbox covenant Submit() call (see
-// pkg/covenant/contracts/inbox.runar.go). That decoder does not exist
-// yet — the existing pkg/beef ParseBEEF returns the raw target tx
-// bytes but no structured input/unlock-script view.
+//  1. Drops duplicate envelopes (same target txid) via dedupe.
+//  2. Walks the BEEF target tx and extracts the EVM txRLP push from
+//     input 0's unlock script (the inbox covenant's Submit() call).
+//     The unlock-script shape is a 3-push sequence ([codePart,
+//     opPushTxSig, txRLP]) emitted by runar-go's BuildUnlockingScript
+//     for a stateful single-public-method contract.
+//  3. Hands the recovered txRLP to InboxMonitor.AddInboxTransaction
+//     so the next batch can drain it under the spec-10 forced-
+//     inclusion rules.
 //
-// Until WW-inbox-consumer lands, the consumer logs the envelope at INFO
-// with the tracked hook name in the structured fields so operators
-// grepping daemon logs can confirm the BEEF was received and stored
-// (it is — the rpc handler runs Store.Put before invoking us). When
-// opts.InboxMonitor is non-nil the log line surfaces the queue depth
-// at receive time so the operator can correlate a BEEF arrival with
-// the next batch's drain event.
+// When opts.InboxMonitor is nil the consumer falls back to a
+// structured log (the receiver isn't wired yet) so operators see why
+// a posted envelope did not extend the queue.
+//
+// Upstream gap: runar-go does not expose an unlock-script decoder for
+// the inbox Submit() shape. The minimal in-tree extractor in
+// cmd/bsvm/beef_extractors.go::extractInboxTxRLP fills that gap. When
+// runar-go grows its own decoder this consumer should swap to the
+// upstream API; the gap is tracked as `WW-runar-inbox-decoder` in
+// docs/decisions/spec-review-triage-2026-05.md.
 func makeInboxConsumer(opts beefWireOpts) func(*beef.Envelope) {
+	dedup := newTxDedupSet()
 	return func(env *beef.Envelope) {
 		fields := []any{
-			"todo_hook", "WW-inbox-consumer",
+			"hook", "WW-inbox-consumer",
 			"intent", beef.IntentName(env.Header.Intent),
 			"target_txid", env.TargetTxID,
 			"shard_id", env.Header.ShardID,
 			"confirmed", env.Confirmed,
 			"inbox_monitor_wired", opts.InboxMonitor != nil,
 		}
-		if opts.InboxMonitor != nil {
-			fields = append(fields, "pending_inbox_txs", opts.InboxMonitor.PendingCount())
+		if opts.InboxMonitor == nil {
+			fields = append(fields, "todo_hook", "WW-inbox-consumer")
+			slog.Info("beef inbox-submission envelope received but inbox monitor not wired", fields...)
+			return
 		}
-		slog.Info("beef inbox-submission envelope received (deferred consumer)", fields...)
+		if !dedup.addOnce(env.TargetTxID) {
+			fields = append(fields, "skipped", "duplicate-target-txid")
+			slog.Debug("beef inbox-submission envelope duplicate, skipping", fields...)
+			return
+		}
+		txRLP, err := extractInboxTxRLP(env)
+		if err != nil {
+			fields = append(fields, "err", err.Error())
+			slog.Warn("beef inbox-submission extractor failed", fields...)
+			return
+		}
+		opts.InboxMonitor.AddInboxTransaction(txRLP)
+		fields = append(fields,
+			"tx_rlp_size", len(txRLP),
+			"pending_inbox_txs", opts.InboxMonitor.PendingCount(),
+		)
+		slog.Info("beef inbox-submission txRLP queued", fields...)
 	}
 }
 
@@ -445,86 +515,195 @@ func makeInboxConsumer(opts beefWireOpts) func(*beef.Envelope) {
 // endpoint dispatches when a /bsvm/governance/action envelope
 // (intent 0x06) is accepted. The envelope is always logged +
 // persisted to the BEEF store by the rpc layer; this callback is
-// the cmd-side handoff to the governance proposal workflow / overlay
-// governance monitor.
+// the cmd-side handoff to the governance proposal workflow.
 //
-// # Status: deferred (WW-governance-consumer)
+// The consumer:
 //
-// Graduating this consumer requires a covenant-output state decoder
-// that walks the BSV target tx, finds the covenant continuation
-// output, extracts the CovenantState push-data via
-// covenant.DecodeCovenantState, and diffs against the local covenant
-// tip before invoking GovernanceMonitor.HandleGovernanceFreeze /
-// HandleGovernanceUnfreeze / HandleGovernanceUpgrade (per spec 17
-// §"Governance-Event Detection via BEEF Gossip").
+//  1. Walks the BEEF target tx output 0 and extracts the new
+//     CovenantState (frozen flag + state root + block number).
+//  2. Diffs against the local covenant manager's currentState. When
+//     opts.OverlayCovenantManager is wired the diff is taken against
+//     CurrentState(); when nil we still emit a proposal so a
+//     governance-only deployment (no overlay) records the action.
+//  3. Constructs a governance.Proposal for the observed action
+//     (freeze when curr.Frozen=1 and prev.Frozen=0; unfreeze when
+//     curr.Frozen=0 and prev.Frozen=1) and calls
+//     ProposalWorkflow.CreateOrMerge(p). The workflow's content-
+//     addressed Proposal.ID dedups identical proposals across BEEF
+//     replays and across the cmd-side state-change callback path
+//     (covenantMgr.SetStateChangeCallback in pkg/overlay/node.go) —
+//     no double-fire is possible because both paths produce the
+//     same content hash.
 //
-// The naive dispatch — call the handlers unconditionally on every
-// 0x06 envelope — would double-fire alongside the existing state-
-// change callback wired in pkg/overlay/node.go (covenantMgr.
-// SetStateChangeCallback), so the extractor MUST diff against
-// currentState first. That diff is also what allows the consumer to
-// reject a stale or reorged 0x06 envelope without disrupting an
-// active session.
+// Upgrade actions are not yet emitted from the BEEF path because
+// they require recovering the new covenant script hash, which the
+// CovenantState struct does not carry. That sub-gap is tracked as
+// `WW-governance-upgrade-extractor` and the consumer logs +
+// short-circuits when it sees a state change that is not a
+// freeze/unfreeze transition.
 //
-// Until WW-governance-consumer lands, the consumer logs the envelope
-// at INFO with the tracked hook name. When opts.ProposalWorkflow is
-// non-nil the log line surfaces the workflow's current proposal
-// count so the operator can correlate a BEEF arrival with the
-// matching local proposal record.
+// When opts.ProposalWorkflow is nil the consumer falls back to a
+// structured log so operators see why a posted envelope did not
+// surface in the proposal store.
 func makeGovernanceConsumer(opts beefWireOpts) func(*beef.Envelope) {
 	return func(env *beef.Envelope) {
 		fields := []any{
-			"todo_hook", "WW-governance-consumer",
+			"hook", "WW-governance-consumer",
 			"intent", beef.IntentName(env.Header.Intent),
 			"target_txid", env.TargetTxID,
 			"shard_id", env.Header.ShardID,
 			"confirmed", env.Confirmed,
 			"proposal_workflow_wired", opts.ProposalWorkflow != nil,
 		}
-		if opts.ProposalWorkflow != nil {
-			if proposals, err := opts.ProposalWorkflow.List(); err == nil {
-				fields = append(fields, "local_proposal_count", len(proposals))
-			}
+		if opts.ProposalWorkflow == nil {
+			fields = append(fields, "todo_hook", "WW-governance-consumer")
+			slog.Info("beef governance-action envelope received but proposal workflow not wired", fields...)
+			return
 		}
-		slog.Info("beef governance-action envelope received (deferred consumer)", fields...)
+		curr, err := extractCovenantStateFromTx(env)
+		if err != nil {
+			fields = append(fields, "err", err.Error())
+			slog.Warn("beef governance-action extractor failed", fields...)
+			return
+		}
+		var prev covenant.CovenantState
+		if opts.OverlayCovenantManager != nil {
+			prev = opts.OverlayCovenantManager.CurrentState()
+		}
+		// Identify the action by diffing Frozen. Other fields
+		// (StateRoot, BlockNumber) advance on every covenant tick
+		// and are not governance signals on their own.
+		var action governance.Action
+		switch {
+		case prev.Frozen == 0 && curr.Frozen == 1:
+			action = governance.ActionFreeze
+		case prev.Frozen == 1 && curr.Frozen == 0:
+			action = governance.ActionUnfreeze
+		default:
+			fields = append(fields,
+				"prev_frozen", prev.Frozen != 0,
+				"curr_frozen", curr.Frozen != 0,
+				"todo_hook", "WW-governance-upgrade-extractor",
+			)
+			slog.Debug("beef governance-action: no freeze/unfreeze diff against local tip; not yet emitting upgrade proposals", fields...)
+			return
+		}
+		// required=1 here is a placeholder for the content-hash
+		// derivation — CreateOrMerge dedups by ID, and the proposal
+		// store's Required count is irrelevant to dispatch
+		// correctness (the broadcast path enforces the real
+		// threshold from cluster config). 24h expiry matches
+		// governance.DefaultExpiry.
+		p, err := governance.NewProposal(action, nil, 1, governance.DefaultExpiry)
+		if err != nil {
+			fields = append(fields, "err", err.Error())
+			slog.Warn("beef governance-action: NewProposal failed", fields...)
+			return
+		}
+		if _, merr := opts.ProposalWorkflow.CreateOrMerge(p); merr != nil {
+			fields = append(fields, "err", merr.Error())
+			slog.Warn("beef governance-action: CreateOrMerge failed", fields...)
+			return
+		}
+		proposals, _ := opts.ProposalWorkflow.List()
+		fields = append(fields,
+			"action", string(action),
+			"proposal_id", p.ID,
+			"local_proposal_count", len(proposals),
+		)
+		slog.Info("beef governance-action proposal merged", fields...)
 	}
 }
 
 // makeFeeWalletConsumer returns the consumer callback the BEEF
-// endpoint dispatches when a /bsvm/inbox/submission envelope is
-// accepted with intent 0x04 (fee-wallet-funding). The envelope is
-// always logged + persisted to the BEEF store by the rpc layer; this
-// callback is the cmd-side handoff to the FeeWallet.
+// endpoint dispatches when a fee-wallet-funding envelope (intent
+// 0x04) is accepted. The envelope is always logged + persisted to the
+// BEEF store by the rpc layer; this callback is the cmd-side handoff
+// to the FeeWallet.
 //
-// # Status: deferred (WW-fee-wallet-consumer)
+// The consumer:
 //
-// Graduating this consumer to a real AddUTXO call requires a BSV-tx
-// output walker that matches outputs against the fee wallet's locking
-// script. The fee wallet does not currently expose its locking script
-// (see pkg/overlay/fee_wallet.go — the wallet is keyed by FeeUTXO
-// {TxID, Vout, Satoshis, ScriptPubKey} but does not publish the
-// expected ScriptPubKey for matching). The cmd-side wiring would also
-// need to convert env.Confirmed into the FeeUTXO.Confirmed flag and
-// call AddUTXO once per matching output.
+//  1. Reads the wallet's expected locking script via
+//     FeeWallet.ExpectedScriptPubKey(). When nil (the cmd wiring has
+//     not yet derived the wallet's script — only happens in tests)
+//     the consumer falls back to a structured log without crediting.
+//  2. Walks the BEEF target tx outputs and matches each output's
+//     locking script against the expected script byte-for-byte.
+//  3. Constructs a FeeUTXO per matched output and calls
+//     FeeWallet.AddUTXO. The Confirmed flag inherits from
+//     env.Confirmed so a still-unconfirmed funding tx is held as
+//     unconfirmed in the wallet (the existing reconciler eventually
+//     promotes it once chaintracks observes the BUMP).
 //
-// Until WW-fee-wallet-consumer lands, the consumer logs the envelope
-// at INFO with the tracked hook name. When opts.FeeWallet is non-nil
-// the log line surfaces the wallet's current spendable balance so the
-// operator can correlate a BEEF arrival with the future credit.
+// AddUTXO is idempotent on (txid, vout) so a re-broadcast envelope
+// safely no-ops at the wallet level — no consumer-side dedup is
+// needed for correctness. The structured log distinguishes
+// first-time credits from re-broadcasts.
+//
+// When opts.FeeWallet is nil the consumer falls back to a structured
+// log (the receiver isn't wired yet) so operators see why a posted
+// envelope did not credit.
 func makeFeeWalletConsumer(opts beefWireOpts) func(*beef.Envelope) {
 	return func(env *beef.Envelope) {
 		fields := []any{
-			"todo_hook", "WW-fee-wallet-consumer",
+			"hook", "WW-fee-wallet-consumer",
 			"intent", beef.IntentName(env.Header.Intent),
 			"target_txid", env.TargetTxID,
 			"shard_id", env.Header.ShardID,
 			"confirmed", env.Confirmed,
 			"fee_wallet_wired", opts.FeeWallet != nil,
 		}
-		if opts.FeeWallet != nil {
-			fields = append(fields, "fee_wallet_balance_sats", opts.FeeWallet.Balance())
+		if opts.FeeWallet == nil {
+			fields = append(fields, "todo_hook", "WW-fee-wallet-consumer")
+			slog.Info("beef fee-wallet-funding envelope received but fee wallet not wired", fields...)
+			return
 		}
-		slog.Info("beef fee-wallet-funding envelope received (deferred consumer)", fields...)
+		expected := opts.FeeWallet.ExpectedScriptPubKey()
+		if len(expected) == 0 {
+			fields = append(fields,
+				"todo_hook", "WW-fee-wallet-consumer-script",
+				"reason", "fee wallet has not published its expected ScriptPubKey",
+			)
+			slog.Info("beef fee-wallet-funding envelope received but wallet script not set", fields...)
+			return
+		}
+		matches, err := extractFeeWalletOutputs(env, expected)
+		if err != nil {
+			fields = append(fields, "err", err.Error())
+			slog.Warn("beef fee-wallet-funding extractor failed", fields...)
+			return
+		}
+		if len(matches) == 0 {
+			fields = append(fields, "matched_outputs", 0)
+			slog.Debug("beef fee-wallet-funding envelope: no outputs match wallet script", fields...)
+			return
+		}
+		var totalSats uint64
+		for _, m := range matches {
+			utxo := &overlay.FeeUTXO{
+				TxID:         types.Hash(env.TargetTxID),
+				Vout:         m.Vout,
+				Satoshis:     m.Satoshis,
+				ScriptPubKey: m.Script,
+				Confirmed:    env.Confirmed,
+			}
+			if addErr := opts.FeeWallet.AddUTXO(utxo); addErr != nil {
+				slog.Warn("beef fee-wallet-funding AddUTXO failed",
+					"hook", "WW-fee-wallet-consumer",
+					"target_txid", env.TargetTxID,
+					"vout", m.Vout,
+					"err", addErr.Error(),
+				)
+				continue
+			}
+			totalSats += m.Satoshis
+		}
+		fields = append(fields,
+			"matched_outputs", len(matches),
+			"credited_sats", totalSats,
+			"fee_wallet_balance_sats", opts.FeeWallet.Balance(),
+		)
+		slog.Info("beef fee-wallet-funding outputs credited", fields...)
 	}
 }
 
@@ -532,35 +711,41 @@ func makeFeeWalletConsumer(opts beefWireOpts) func(*beef.Envelope) {
 // endpoint dispatches when a /bsvm/beef/covenant-chain POST envelope
 // (intents 0x01 + 0x02) is accepted. The envelope is always logged +
 // persisted to the BEEF store by the rpc layer; this callback is the
-// cmd-side handoff to the overlay covenant manager / race detector.
+// cmd-side handoff to the overlay race detector.
 //
-// # Status: deferred (WW-overlay-covenant-consumer)
+// The consumer:
 //
-// Graduating this consumer to a real RaceDetector.HandleCovenantAdvance
-// call requires:
+//  1. Drops duplicate envelopes (same target txid) via dedupe — the
+//     unconfirmed/confirmed pair for the same tx, or a re-broadcast
+//     from a peer, must not double-fire RaceDetector handlers.
+//  2. Walks the BEEF target tx and extracts the spec-12 OP_RETURN
+//     payload (BSVM\x02 || withdrawalRoot(32) || batchData). The
+//     batch is decoded via block.DecodeBatchData to recover the
+//     transaction list + parent hash + bsv block hash (the post-
+//     state root is computed downstream by re-execution; the BEEF
+//     envelope is purely a heads-up that an advance landed).
+//  3. Constructs a CovenantAdvanceEvent and calls
+//     RaceDetector.HandleCovenantAdvance. IsOurs is set by comparing
+//     the target txid against the covenant manager's currentTxID so
+//     a re-broadcast of our own advance correctly trips the
+//     race-won path. PostStateRoot is left zero — re-execution at
+//     the overlay level fills it in via process.go.
 //
-//  1. An OP_RETURN extractor that recovers the spec-12 advance payload
-//     (BSVM\x02 || withdrawalRoot(32) || batchData) from the BSV
-//     target tx's outputs. pkg/bridge/withdrawer.go already has
-//     extractRefsFromAdvanceTx for the withdrawal-root path; we'd
-//     reuse the OP_RETURN walker but extract the full payload, not
-//     just the first 32 bytes.
-//  2. A batch-data decoder that recovers the post-state-root + L2
-//     block number from the embedded block.BatchData blob. The
-//     overlay's process.go path already has block.DecodeBatchData;
-//     this consumer would use it identically.
-//  3. A naive dispatch would also need to coordinate with the
-//     existing libp2p MsgCovenantAdvance path (pkg/network/sync.go)
-//     to avoid double-fed RaceDetector events for the same advance.
+// When the covenant manager or overlay node isn't wired, the
+// consumer falls back to a structured log so operators see why a
+// posted envelope did not reach the race detector.
 //
-// Until WW-overlay-covenant-consumer lands, the consumer logs the
-// envelope at INFO with the tracked hook name + the local covenant
-// manager's current tip / block number so the operator can correlate
-// a BEEF-driven advance arrival with the local execution tip.
+// Coordination with the libp2p MsgCovenantAdvance path
+// (pkg/network/sync.go): both feed the same RaceDetector. The dedup
+// set inside RaceDetector itself (consecutiveLosses logic) tolerates
+// two events for the same advance — the first wins, the second is a
+// no-op. Our consumer-level dedup is an early short-circuit that
+// avoids the second call entirely.
 func makeCovenantConsumer(opts beefWireOpts) func(*beef.Envelope) {
+	dedup := newTxDedupSet()
 	return func(env *beef.Envelope) {
 		fields := []any{
-			"todo_hook", "WW-overlay-covenant-consumer",
+			"hook", "WW-overlay-covenant-consumer",
 			"intent", beef.IntentName(env.Header.Intent),
 			"target_txid", env.TargetTxID,
 			"shard_id", env.Header.ShardID,
@@ -579,7 +764,53 @@ func makeCovenantConsumer(opts beefWireOpts) func(*beef.Envelope) {
 		if opts.OverlayNode != nil {
 			fields = append(fields, "local_execution_tip", opts.OverlayNode.ExecutionTip())
 		}
-		slog.Info("beef covenant-advance envelope received (deferred consumer)", fields...)
+		// Resolve the race-detector handle. Tests may pass it
+		// directly via opts.RaceDetector to avoid standing up a
+		// full OverlayNode; production wiring leaves it nil and we
+		// pull through OverlayNode.
+		rd := opts.RaceDetector
+		if rd == nil && opts.OverlayNode != nil {
+			rd = opts.OverlayNode.RaceDetector()
+		}
+		if rd == nil {
+			fields = append(fields, "todo_hook", "WW-overlay-covenant-consumer")
+			slog.Info("beef covenant-advance envelope received but race detector not wired", fields...)
+			return
+		}
+		if !dedup.addOnce(env.TargetTxID) {
+			fields = append(fields, "skipped", "duplicate-target-txid")
+			slog.Debug("beef covenant-advance envelope duplicate, skipping", fields...)
+			return
+		}
+		adv, err := extractCovenantAdvance(env)
+		if err != nil {
+			fields = append(fields, "err", err.Error())
+			slog.Warn("beef covenant-advance extractor failed", fields...)
+			return
+		}
+		var isOurs bool
+		if opts.OverlayCovenantManager != nil {
+			localTx := opts.OverlayCovenantManager.CurrentTxID()
+			isOurs = types.Hash(env.TargetTxID) == localTx
+		}
+		event := &overlay.CovenantAdvanceEvent{
+			BSVTxID:    types.Hash(env.TargetTxID),
+			L2BlockNum: 0, // see extractCovenantAdvance: block number is not in BatchData
+			BatchData:  adv.BatchData,
+			IsOurs:     isOurs,
+		}
+		if herr := rd.HandleCovenantAdvance(event); herr != nil {
+			fields = append(fields, "err", herr.Error())
+			slog.Warn("beef covenant-advance HandleCovenantAdvance failed", fields...)
+			return
+		}
+		fields = append(fields,
+			"is_ours", isOurs,
+			"batch_tx_count", len(adv.Decoded.Transactions),
+			"deposit_horizon", adv.Decoded.DepositHorizon,
+			"withdrawal_root", adv.WithdrawalRoot,
+		)
+		slog.Info("beef covenant-advance race detector notified", fields...)
 	}
 }
 

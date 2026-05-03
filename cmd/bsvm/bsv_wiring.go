@@ -20,14 +20,25 @@ import (
 
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/arc"
+	"github.com/icellan/bsvm/pkg/bsv"
 	"github.com/icellan/bsvm/pkg/covenant"
 	"github.com/icellan/bsvm/pkg/metrics"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/shard"
 
+	sdkhash "github.com/bsv-blockchain/go-sdk/primitives/hash"
 	gocompiler "github.com/icellan/runar/compilers/go/compiler"
 	runar "github.com/icellan/runar/packages/runar-go"
 )
+
+// bsvHash160 computes RIPEMD160(SHA256(data)) — Bitcoin's standard
+// pubkey hash function. Used at boot time to derive the fee wallet's
+// expected P2PKH locking script from its compressed public key, then
+// published via FeeWallet.SetExpectedScriptPubKey for the BEEF
+// fee-wallet-funding consumer to match against.
+func bsvHash160(data []byte) []byte {
+	return sdkhash.Hash160(data)
+}
 
 // bsvWireOpts gathers every input wireBSVBroadcast needs. Keeps the
 // main.go call site tidy and makes unit-testing (a future task) easier.
@@ -115,7 +126,18 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 	if err := feeWallet.LoadFromDB(); err != nil {
 		return nil, fmt.Errorf("fee-wallet load from DB: %w", err)
 	}
-	slog.Info("fee-wallet initialized", "balance_sats", feeWallet.Balance())
+	// Publish the wallet's expected P2PKH locking script so the BEEF
+	// fee-wallet-funding consumer can match outputs against it (see
+	// cmd/bsvm/beef_wiring.go::makeFeeWalletConsumer). The wallet's
+	// address is the standard P2PKH derived from feeKey via go-sdk;
+	// we hash160 the compressed pubkey and wrap with the canonical
+	// OP_DUP OP_HASH160 <pkh20> OP_EQUALVERIFY OP_CHECKSIG envelope.
+	pubKeyBytes := feeKey.PubKey().Compressed()
+	pkh := bsvHash160(pubKeyBytes)
+	feeWallet.SetExpectedScriptPubKey(bsv.BuildP2PKH(pkh))
+	slog.Info("fee-wallet initialized",
+		"balance_sats", feeWallet.Balance(),
+		"expected_script_published", true)
 
 	// 3. Attach to overlay.
 	opts.OverlayNode.SetFeeWallet(feeWallet)

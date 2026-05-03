@@ -36,6 +36,20 @@ type FeeWallet struct {
 	consolidationThreshold         int    // Number of UTXOs before consolidation (default: 50)
 	advancesSinceConsolidation     int    // Track advances for periodic consolidation
 	maxAdvancesBeforeConsolidation int    // Default: 100
+
+	// expectedScriptPubKey is the locking script the wallet expects to
+	// receive funds at — i.e. the P2PKH locking script derived from
+	// the wallet's BSV address. Set at boot via SetExpectedScriptPubKey
+	// once the cmd-side fee-wallet key has been loaded.
+	//
+	// Callers that need to ingest fee-wallet-funding outputs from a
+	// freshly-arrived BSV transaction (e.g. the BEEF
+	// fee-wallet-funding consumer at intent 0x04) compare each output
+	// script against this value and credit only matching ones via
+	// AddUTXO. When unset (nil), the wallet does not advertise any
+	// matching script; callers MUST treat that state as "do not credit
+	// anything" rather than crediting blindly.
+	expectedScriptPubKey []byte
 }
 
 // NewFeeWallet creates a new fee wallet backed by the given database.
@@ -266,6 +280,43 @@ func (fw *FeeWallet) IsStarved() bool {
 // placeholder until the actual BSV key derivation is implemented.
 func (fw *FeeWallet) Address() string {
 	return ""
+}
+
+// SetExpectedScriptPubKey records the locking script the wallet
+// expects to receive funds at. The cmd-side wiring calls this once at
+// boot after the fee-wallet key has been derived, so the BEEF
+// fee-wallet-funding consumer can match outputs without re-deriving
+// the wallet's address. Passing nil clears the script (the consumer
+// then declines to credit anything).
+//
+// The supplied slice is copied so subsequent caller-side mutations
+// can't poison the wallet's matching key.
+func (fw *FeeWallet) SetExpectedScriptPubKey(script []byte) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if script == nil {
+		fw.expectedScriptPubKey = nil
+		return
+	}
+	cp := make([]byte, len(script))
+	copy(cp, script)
+	fw.expectedScriptPubKey = cp
+}
+
+// ExpectedScriptPubKey returns a defensive copy of the locking script
+// the wallet expects to receive funds at, or nil when none has been
+// configured. The BEEF fee-wallet-funding consumer compares each
+// output of an inbound BSV transaction against this value to decide
+// whether to credit the wallet.
+func (fw *FeeWallet) ExpectedScriptPubKey() []byte {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.expectedScriptPubKey == nil {
+		return nil
+	}
+	out := make([]byte, len(fw.expectedScriptPubKey))
+	copy(out, fw.expectedScriptPubKey)
+	return out
 }
 
 // RecordAdvance increments the advance counter for consolidation timing.
