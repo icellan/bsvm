@@ -362,12 +362,15 @@ func TestBridgeBlockScanner_ProcessesDepositOnNewTip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	closer, err := startBridgeBlockScanner(ctx, monitor, cht, nil, rpc, slog.Default(), 0)
+	closer, handle, err := startBridgeBlockScanner(ctx, monitor, cht, nil, rpc, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}
 	if closer == nil {
 		t.Fatal("expected non-nil closer")
+	}
+	if handle == nil {
+		t.Fatal("expected non-nil handle")
 	}
 	defer func() { _ = closer() }()
 
@@ -421,12 +424,15 @@ func TestBridgeBSVClient_RequiresChaintracks(t *testing.T) {
 // TestStartBridgeBlockScanner_NilMonitorIsNoOp asserts the wiring
 // helper degrades gracefully when no bridge is configured.
 func TestStartBridgeBlockScanner_NilMonitorIsNoOp(t *testing.T) {
-	closer, err := startBridgeBlockScanner(context.Background(), nil, chaintracks.NewInMemoryClient(), nil, nil, slog.Default(), 0)
+	closer, handle, err := startBridgeBlockScanner(context.Background(), nil, chaintracks.NewInMemoryClient(), nil, nil, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}
 	if closer != nil {
 		t.Fatal("expected nil closer when monitor is nil")
+	}
+	if handle != nil {
+		t.Fatal("expected nil handle when monitor is nil")
 	}
 }
 
@@ -435,11 +441,14 @@ func TestStartBridgeBlockScanner_NilMonitorIsNoOp(t *testing.T) {
 func TestStartBridgeBlockScanner_NilChaintracksIsNoOp(t *testing.T) {
 	cfg := bridge.DefaultConfig()
 	mon := bridge.NewBridgeMonitor(cfg, nil, db.NewMemoryDB())
-	closer, err := startBridgeBlockScanner(context.Background(), mon, nil, nil, nil, slog.Default(), 0)
+	closer, handle, err := startBridgeBlockScanner(context.Background(), mon, nil, nil, nil, slog.Default(), 0)
 	if err != nil {
 		t.Fatalf("startBridgeBlockScanner: %v", err)
 	}
 	if closer != nil {
 		t.Fatal("expected nil closer when chaintracks is nil")
+	}
+	if handle != nil {
+		t.Fatal("expected nil handle when chaintracks is nil")
 	}
 }

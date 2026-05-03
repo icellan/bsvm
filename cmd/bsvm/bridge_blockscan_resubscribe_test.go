@@ -70,7 +70,7 @@ func (f *fakeSubscriber) GetBlockTransactions(height uint64) ([]*bridge.BSVTrans
 // recordingProcessor implements blockScannerProcessor. ProcessBlock
 // just records the height seen so the test can assert ordering.
 type recordingProcessor struct {
-	mu     sync.Mutex
+	mu      sync.Mutex
 	heights []uint64
 }
 
@@ -148,7 +148,7 @@ func TestBridgeScannerReconnectsAfterChannelClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runBridgeScannerWithReconnect(ctx, fake, proc, initial, slog.Default())
+		runBridgeScannerWithReconnect(ctx, fake, proc, initial, nil, slog.Default())
 	}()
 
 	// Push three heights on the first connection, then close.
@@ -219,7 +219,7 @@ func TestBridgeScannerExpBackoffOnSubscribeError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runBridgeScannerWithReconnect(ctx, fake, proc, closedCh, slog.Default())
+		runBridgeScannerWithReconnect(ctx, fake, proc, closedCh, nil, slog.Default())
 	}()
 
 	// Now feed a height through the eventually-healthy channel.
@@ -268,7 +268,7 @@ func TestBridgeScannerCleanExitOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runBridgeScannerWithReconnect(ctx, fake, proc, closedCh, slog.Default())
+		runBridgeScannerWithReconnect(ctx, fake, proc, closedCh, nil, slog.Default())
 	}()
 
 	// Let the supervisor enter its first backoff sleep.
@@ -309,7 +309,7 @@ func TestBridgeScannerResumeCursorSkipsAlreadyProcessed(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runBridgeScannerWithReconnect(ctx, fake, proc, initial, slog.Default())
+		runBridgeScannerWithReconnect(ctx, fake, proc, initial, nil, slog.Default())
 	}()
 
 	// First epoch processes 50, 51.

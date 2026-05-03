@@ -29,7 +29,7 @@ proving modes — see `cmd/bsvm/main.go` and `pkg/rpc/auth/`).
 | `admin_pauseProving` / `admin_resumeProving` | Flip the batcher. New txs are rejected while paused. |
 | `admin_forceFlushBatch` | Flush the current pending batch immediately. |
 | `admin_bridgeHealth` | Returns the live BridgeUTXO snapshot, deposit horizon, pending-deposit count, and shard ID. When `[bridge].bridge_script_hex` is empty surfaces `monitorAttached=false` with operator guidance. |
-| `admin_rescanDeposits` | Re-scans BSV blocks from `fromHeight`. Requires both the bridge monitor AND the cmd-side rescanner callback to be wired. Until the rescanner lands the call returns an error referencing tracking ID `WW-bridge-rescanner-attach`. |
+| `admin_rescanDeposits` | Rewinds the bridge block-scanner's resume cursor to `fromHeight - 1` so subsequent chaintracks events at-or-above `fromHeight` flow through `BridgeMonitor.ProcessBlock` again instead of being short-circuited by the resume-cursor dedup. Returns `{success, fromHeight, scheduled}` where `scheduled = currentTip - fromHeight`. Requires both the bridge monitor AND the rescanner callback wired (the latter is wired automatically in `cmd/bsvm/main.go` once `startBridgeBlockScanner` returns a non-nil handle). |
 | `admin_createGovernanceProposal` | Create + gossip a freeze/unfreeze/upgrade proposal (see below). |
 | `admin_listGovernanceProposals` | Local view of the proposal queue. |
 | `admin_signGovernanceProposal` | Verify a governance signature against an existing proposal. |
@@ -77,7 +77,7 @@ immediately after construction.
 ```jsonc
 {
   "monitorAttached": true,
-  "rescannerWired":  false,            // true once cmd-side wires SetBridgeRescanner
+  "rescannerWired":  true,             // true once cmd-side wires SetBridgeRescanner (wired by default in main.go when startBridgeBlockScanner returns a handle)
   "subCovenants": [
     {
       "bsvTxid":          "abc...",     // hex
@@ -102,18 +102,58 @@ response surfaces `monitorAttached=false` and includes a `note`
 field directing the operator at this runbook. The shape is otherwise
 the same so the explorer UI doesn't need to special-case "no bridge".
 
-`admin_rescanDeposits` accepts `[fromHeight]` and returns
-`{success, fromHeight, scheduled}`. The rescanner callback itself is
-**still TODO** — it requires touching `cmd/bsvm/bridge_blockscan_wiring.go`
-to expose a "rewind resume cursor + replay" entry point. Until that
-ships the call returns:
+`admin_rescanDeposits` accepts `[fromHeight]` (hex-encoded uint64) and
+returns `{success, fromHeight, scheduled}`. The rescanner is wired
+automatically by `cmd/bsvm/main.go` whenever `startBridgeBlockScanner`
+returns a non-nil `BlockScannerHandle` (i.e. whenever the bridge AND
+chaintracks are both configured). Internally the call rewinds the
+block-scanner's in-memory resume cursor to `fromHeight - 1` so the
+next chaintracks event at-or-above `fromHeight` is processed rather
+than skipped by the resume-cursor dedup.
+
+Wire path:
 
 ```
-admin_rescanDeposits: bridge rescanner not wired (cmd-side wire missing; tracked as WW-bridge-rescanner-attach)
+admin_rescanDeposits        (pkg/rpc/admin_bridge.go)
+   → BridgeRescanFn closure (cmd/bsvm/main.go)
+   → BlockScannerHandle.RewindToHeight  (cmd/bsvm/bridge_blockscan_wiring.go)
+   → channel-based command into the supervisor goroutine
+   → supervisor mutates its private resume-cursor + publishes the
+     new value for CurrentCursor() readers
 ```
 
-This is intentional: shipping a half-wired rescanner that silently
-no-ops would be worse than a clear "not yet" error.
+Important properties:
+
+* **One-shot, not persistent.** The rewind only mutates the in-memory
+  cursor of the running supervisor goroutine. It does NOT change the
+  daemon's resume-after-restart semantics — restarting the daemon
+  will resume from wherever the BridgeMonitor's persisted
+  DepositHorizon left off, not from the rescan cursor. Use the rescan
+  RPC for "operator wants to replay a window of historical blocks
+  RIGHT NOW", not for "operator wants the daemon to start at height N
+  on the next boot".
+* **Concurrency-safe.** `RewindToHeight` is safe to call from the RPC
+  goroutine while the supervisor is mid-scan; commands serialise via
+  a buffered channel that the supervisor drains between block events,
+  during reconnect-backoff sleeps, and around chaintracks subscribe
+  attempts.
+* **Idempotent.** Rewinding to a height at-or-above the current cursor
+  is a no-op (the cursor stays put). The `scheduled` count is still
+  computed and returned so the operator UI's progress indicator gets
+  a meaningful estimate either way.
+* **Tip-failure-tolerant.** If the chaintracks tip lookup fails the
+  rewind STILL applies (the operator's intent wins) but the response's
+  `scheduled` field falls back to `0` and the wrapped error is
+  surfaced through the RPC error channel so the operator sees the
+  degraded mode rather than a silent "scheduled zero blocks" success.
+
+Errors:
+
+| Condition | RPC error |
+|---|---|
+| `[bridge].bridge_script_hex` not configured | `admin_rescanDeposits: bridge monitor not attached (configure [bridge].bridge_script_hex; see docs/operator/admin.md)` |
+| Bridge configured but no chaintracks anchor | `admin_rescanDeposits: bridge rescanner not wired (cmd-side wire missing; tracked as WW-bridge-rescanner-attach)` (the cmd-side wire is conditional on `startBridgeBlockScanner` returning a handle, which requires chaintracks) |
+| Daemon shutting down (supervisor goroutine exited) | `admin_rescanDeposits: bridge block scanner: handle closed (daemon shutting down)` |
 
 ## Multisig governance proposals
 

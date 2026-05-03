@@ -425,12 +425,28 @@ is logged-only." Cited lines: `pkg/rpc/admin_api.go:92`,
       lastClaimedNonce, depositHorizon, pendingDeposits, shardId)
       tuple instead of zero-state. When `[bridge].bridge_script_hex`
       is empty the response surfaces `monitorAttached=false` with
-      operator guidance. The rescanner callback
-      (`admin_rescanDeposits`) still requires a cmd-side wire that
-      knows how to rewind the block-scanner's resume cursor — that
-      gap is tracked separately as `WW-bridge-rescanner-attach` and
-      surfaces a clear typed error from the RPC until it lands.
-      See `docs/operator/admin.md` §"Bridge admin".
+      operator guidance. See `docs/operator/admin.md` §"Bridge admin".
+- [x] **DONE** (2026-05-03): `WW-bridge-rescanner-attach` —
+      `cmd/bsvm/bridge_blockscan_wiring.go` now exposes a
+      `BlockScannerHandle` with channel-based command pattern
+      (`RewindToHeight(uint64) (scheduled, error)` +
+      `CurrentCursor() uint64`). The supervisor goroutine retains
+      sole ownership of the resume cursor; the handle's methods
+      enqueue typed `rewindCmd`s the goroutine drains in its select
+      loop, between block events, during reconnect-backoff sleeps,
+      and around chaintracks subscribe attempts. `cmd/bsvm/main.go`
+      installs a closure on `AdminAPI.SetBridgeRescanner` that calls
+      `handle.RewindToHeight(fromHeight)` whenever
+      `startBridgeBlockScanner` returns a non-nil handle (i.e.
+      whenever bridge AND chaintracks are configured). The rewind
+      is one-shot (does NOT alter resume-after-restart semantics);
+      idempotent (rewinds to ≥ current cursor are no-ops);
+      tip-failure-tolerant (cursor change still applies, scheduled
+      degrades to 0 with the wrapped error). Coverage in
+      `cmd/bsvm/bridge_blockscan_rescan_test.go` drives the full
+      AdminAPI → closure → handle → cursor-rewind path with a fake
+      chaintracks subscriber. See `docs/operator/admin.md`
+      §"Bridge admin".
 - [x] **DONE** (2026-05-03): `governance-broadcast-onready` —
       `cmd/bsvm/main.go`'s `OnReady` callback is no longer log-only.
       Freeze + unfreeze proposals at threshold now build a real BSV

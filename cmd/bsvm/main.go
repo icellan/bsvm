@@ -1081,7 +1081,7 @@ func cmdRun(ctx *cli.Context) error {
 		}
 	}
 
-	bridgeScannerClose, err := startBridgeBlockScanner(
+	bridgeScannerClose, bridgeScannerHandle, err := startBridgeBlockScanner(
 		bgCtx,
 		bridgeMonitor,
 		chaintracksClient,
@@ -1099,6 +1099,26 @@ func cmdRun(ctx *cli.Context) error {
 				slog.Warn("bridge block scanner: shutdown error", "err", cerr)
 			}
 		}()
+	}
+
+	// Wire the block-scanner's rewind cursor into admin_rescanDeposits
+	// so an operator can request a deposit-replay starting at any
+	// historical BSV height. The closure rewinds the supervisor's
+	// resume cursor (a one-shot operator action — does NOT change the
+	// persistent resume-after-restart semantics) and surfaces the
+	// scheduled-block count back through the RPC. When the scanner
+	// isn't wired (no bridge / no chaintracks) the closure is not
+	// installed and admin_rescanDeposits keeps returning the typed
+	// "not wired" error from pkg/rpc/admin_bridge.go.
+	//
+	// Closes WW-bridge-rescanner-attach. See:
+	//   - cmd/bsvm/bridge_blockscan_wiring.go (BlockScannerHandle)
+	//   - pkg/rpc/admin_bridge.go (BridgeRescanFn)
+	//   - docs/operator/admin.md §"Bridge admin"
+	if bridgeScannerHandle != nil {
+		rpcServer.AdminAPI().SetBridgeRescanner(func(fromHeight uint64) (uint64, error) {
+			return bridgeScannerHandle.RewindToHeight(fromHeight)
+		})
 	}
 
 	// 8.2 Bridge.Withdrawer claim loop. Walks the L2 chain for
