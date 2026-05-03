@@ -100,10 +100,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-sp1-volumes-
 
-      - name: Pull SP1 docker image
+      - name: Pull SP1 docker image (digest-pinned)
         run: |
           set -euo pipefail
-          docker pull --platform linux/amd64 ghcr.io/succinctlabs/sp1:v6.0.2
+          # Phase 3: pin by content digest instead of the v6.0.2 tag
+          # (tags are mutable — Succinct could re-push them silently
+          # changing every operator's VK). The digest below must match
+          # the SP1_IMAGE_DIGEST constant in prover/host-*/build.rs.
+          docker pull --platform linux/amd64 \
+            ghcr.io/succinctlabs/sp1@sha256:61bbcdb0cd096004303f25f042813f4b947571c454fb5247197a1bd9c91e01ad
+          # Re-tag for sp1-build's default image-name resolution. The
+          # build.rs files set SP1_DOCKER_IMAGE to the digest form, but
+          # this re-tag means an operator who runs `cargo build`
+          # without that env var still hits the same image bytes.
+          docker tag \
+            ghcr.io/succinctlabs/sp1@sha256:61bbcdb0cd096004303f25f042813f4b947571c454fb5247197a1bd9c91e01ad \
+            ghcr.io/succinctlabs/sp1:v6.0.2
+
+      - name: Force docker rebuild (move in-tree ELF aside)
+        run: |
+          set -euo pipefail
+          # Path C in build.rs would short-circuit to the in-tree ELF
+          # if it's present, so this gate would only verify the in-tree
+          # blob against itself. Move the blob aside so the build.rs
+          # falls back to the docker rebuild we actually want to gate.
+          if [ -f prover/guest/elf/bsvm-guest ]; then
+            mv prover/guest/elf/bsvm-guest /tmp/bsvm-guest.in-tree
+            echo "moved in-tree ELF to /tmp for the duration of the rebuild"
+          else
+            echo "no in-tree ELF present (already absent)"
+          fi
 
       - name: Build host-bridge (triggers docker-mode SP1 guest build)
         working-directory: prover/host-bridge
@@ -139,9 +165,34 @@ jobs:
             echo "If the guest source legitimately changed, re-stamp:"
             echo "  prover/guest/elf/SP1VerifyingKeyHash.txt"
             echo "  prover/guest/elf/bsvm-guest.sha256"
+            echo "  prover/guest/elf/bsvm-guest                  (the binary blob)"
             echo "and broadcast a VK rotation per docs/decisions/vk-rotation-wire-format-2026-04.md"
             exit 1
           fi
+
+      - name: Verify in-tree ELF matches docker-rebuilt ELF byte-for-byte
+        env:
+          ELF_PATH: ${{ steps.elf.outputs.path }}
+        run: |
+          set -euo pipefail
+          # The in-tree blob (Path C, prover/guest/elf/bsvm-guest) is
+          # what operators without docker actually run. If it drifts
+          # from the docker-rebuilt ELF, we'd silently ship two
+          # different ELFs to different operators.
+          if [ ! -f /tmp/bsvm-guest.in-tree ]; then
+            echo "::warning::no in-tree ELF was present before the gate; skipping cmp"
+            exit 0
+          fi
+          if ! cmp -s "$ELF_PATH" /tmp/bsvm-guest.in-tree; then
+            echo "::error::in-tree ELF differs from docker-rebuilt ELF"
+            echo "  in-tree:  $(sha256sum /tmp/bsvm-guest.in-tree | awk '{print $1}')"
+            echo "  rebuilt:  $(sha256sum "$ELF_PATH" | awk '{print $1}')"
+            echo "Re-copy the docker-rebuilt ELF to prover/guest/elf/bsvm-guest"
+            echo "and update prover/guest/elf/bsvm-guest.sha256."
+            exit 1
+          fi
+          # Restore the in-tree ELF for any later steps that look at it.
+          mv /tmp/bsvm-guest.in-tree prover/guest/elf/bsvm-guest
 
       - name: Install sp1up + cargo-prove (for vkey check)
         run: |

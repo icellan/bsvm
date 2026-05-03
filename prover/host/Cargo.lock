@@ -461,6 +461,7 @@ dependencies = [
  "bincode",
  "hex",
  "serde",
+ "sha2",
  "sp1-build",
  "sp1-sdk",
  "tokio",
