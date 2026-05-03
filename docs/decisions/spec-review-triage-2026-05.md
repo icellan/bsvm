@@ -326,10 +326,32 @@ is logged-only." Cited lines: `pkg/rpc/admin_api.go:92`,
   defeats the spec 15 §"Multisig governance actions" UX.
 
 **Recommended path**:
-- [ ] Open a tracked TODO with named hook
-      `admin-setConfig-live-reload` for the whitelist subset.
-- [ ] Open a tracked TODO with named hook
-      `admin-bridge-monitor-rpc` once the bridge monitor lands.
+- [x] **DONE** (2026-05-03): `admin-setConfig-live-reload` —
+      `pkg/rpc/admin_live_reload.go` defines a `LiveReloader` with a
+      whitelist that `admin_setConfig` consults. Initial entry is
+      `log_level` (mutates the slog `*LevelVar` in-place; persisted
+      to `<datadir>/admin_overrides.json` and re-applied on the next
+      boot). Non-whitelisted keys return `admin_setConfig: key %q
+      requires restart (not in live-reload whitelist; whitelisted
+      keys: [...])`. Additional whitelist candidates
+      (`metrics.scrape_interval`, `network.gossip_max_peers`) stay
+      deferred — those subsystems don't yet expose runtime setters,
+      and shipping a half-wired applier would silently no-op. See
+      `docs/operator/admin.md` §"Live-reload whitelist".
+- [x] **DONE** (2026-05-03): `admin-bridge-monitor-rpc` —
+      `pkg/rpc/admin_bridge.go` exposes `SetBridgeMonitor` /
+      `SetBridgeRescanner` on `AdminAPI`. `cmd/bsvm/main.go` calls
+      `SetBridgeMonitor` immediately after `BuildBridgeMonitor`.
+      `admin_bridgeHealth` now reports the live (txid, balance,
+      lastClaimedNonce, depositHorizon, pendingDeposits, shardId)
+      tuple instead of zero-state. When `[bridge].bridge_script_hex`
+      is empty the response surfaces `monitorAttached=false` with
+      operator guidance. The rescanner callback
+      (`admin_rescanDeposits`) still requires a cmd-side wire that
+      knows how to rewind the block-scanner's resume cursor — that
+      gap is tracked separately as `WW-bridge-rescanner-attach` and
+      surfaces a clear typed error from the RPC until it lands.
+      See `docs/operator/admin.md` §"Bridge admin".
 - [x] **DONE** (2026-05-03): `governance-broadcast-onready` —
       `cmd/bsvm/main.go`'s `OnReady` callback is no longer log-only.
       Freeze + unfreeze proposals at threshold now build a real BSV

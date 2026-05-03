@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -33,6 +34,11 @@ type LogStreamer struct {
 	subscribers  map[int64]chan<- LogRecord
 	subID        int64
 	defaultLevel slog.Level
+	// levelVar is the dynamic minimum-level filter shared with the
+	// inner slog.Handler. Setting it via SetLevel takes effect on the
+	// next slog record without rebuilding the handler chain — this is
+	// what backs admin_setConfig("log_level", ...).
+	levelVar *slog.LevelVar
 }
 
 // NewLogStreamer constructs a LogStreamer layered on top of `inner`.
@@ -53,6 +59,44 @@ func NewLogStreamer(inner slog.Handler, capacity int) *LogStreamer {
 		buffer:      make([]LogRecord, 0, capacity),
 		subscribers: make(map[int64]chan<- LogRecord),
 	}
+}
+
+// AttachLevelVar binds a *slog.LevelVar to the streamer so SetLevel
+// can mutate it at runtime. The same LevelVar must have been passed
+// into the inner handler's HandlerOptions.Level for the filter change
+// to actually take effect on console / JSON output. Idempotent — call
+// once during setupLogging.
+func (s *LogStreamer) AttachLevelVar(lv *slog.LevelVar) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.levelVar = lv
+}
+
+// SetLevel updates the dynamic log level. Returns an error when no
+// LevelVar was attached (i.e. the streamer is running standalone with
+// no inner handler under a LevelVar). Safe to call concurrently with
+// Handle / Subscribe.
+func (s *LogStreamer) SetLevel(level slog.Level) error {
+	s.mu.Lock()
+	lv := s.levelVar
+	s.mu.Unlock()
+	if lv == nil {
+		return fmt.Errorf("log level not attached to a slog.LevelVar")
+	}
+	lv.Set(level)
+	return nil
+}
+
+// CurrentLevel returns the current dynamic log level. Returns
+// slog.LevelInfo + false when no LevelVar was attached.
+func (s *LogStreamer) CurrentLevel() (slog.Level, bool) {
+	s.mu.Lock()
+	lv := s.levelVar
+	s.mu.Unlock()
+	if lv == nil {
+		return slog.LevelInfo, false
+	}
+	return lv.Level(), true
 }
 
 // Enabled matches the inner handler so filter behaviour stays

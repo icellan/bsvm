@@ -24,19 +24,96 @@ proving modes — see `cmd/bsvm/main.go` and `pkg/rpc/auth/`).
 | Method | What it does |
 |---|---|
 | `admin_peerList` | Snapshot of the libp2p peer set. |
-| `admin_getConfig` | Returns the live runtime config (`overlay.RuntimeConfigView`). |
+| `admin_getConfig` | Returns the live runtime config (`overlay.RuntimeConfigView`) plus the `liveReloadWhitelist` so the explorer UI knows which keys can be applied without restart. |
+| `admin_setConfig` | Accepts a single `[key, value]` pair. Whitelisted keys are applied at runtime AND persisted to `<datadir>/admin_overrides.json`. Non-whitelisted keys are rejected with a structured "restart required" error. See "Live-reload whitelist" below. |
 | `admin_pauseProving` / `admin_resumeProving` | Flip the batcher. New txs are rejected while paused. |
 | `admin_forceFlushBatch` | Flush the current pending batch immediately. |
+| `admin_bridgeHealth` | Returns the live BridgeUTXO snapshot, deposit horizon, pending-deposit count, and shard ID. When `[bridge].bridge_script_hex` is empty surfaces `monitorAttached=false` with operator guidance. |
+| `admin_rescanDeposits` | Re-scans BSV blocks from `fromHeight`. Requires both the bridge monitor AND the cmd-side rescanner callback to be wired. Until the rescanner lands the call returns an error referencing tracking ID `WW-bridge-rescanner-attach`. |
 | `admin_createGovernanceProposal` | Create + gossip a freeze/unfreeze/upgrade proposal (see below). |
 | `admin_listGovernanceProposals` | Local view of the proposal queue. |
 | `admin_signGovernanceProposal` | Verify a governance signature against an existing proposal. |
 
-### Stubs / placeholders (TODO)
+### Live-reload whitelist (`admin_setConfig`)
 
-| Method | Status |
-|---|---|
-| `admin_setConfig` | Always errors with "live reload not yet implemented". Tracked as `admin-setConfig-live-reload`. |
-| `admin_bridgeHealth` / `admin_rescanDeposits` | Return zero-state stubs until the bridge monitor is attached to the overlay node. Tracked as `admin-bridge-monitor-rpc`. |
+Spec 15 §"Configuration" describes the explorer UI showing a "Restart
+Required" hint per field. The reloader implements the inverse: a tiny
+whitelist of keys that explicitly DO support live reload. Anything
+outside the whitelist returns a structured error of the form:
+
+```
+admin_setConfig: key "X" requires restart (not in live-reload whitelist; whitelisted keys: [...])
+```
+
+Whitelisted keys today:
+
+| Key | Type | Notes |
+|---|---|---|
+| `log_level` | string | One of `debug`, `info`, `warn`, `error`. Mutates the shared `*slog.LevelVar` so the next slog record sees the new filter immediately. |
+
+Each successful apply is mirrored to `<datadir>/admin_overrides.json`
+so the change survives a restart. On boot, `cmd/bsvm/main.go` reads
+the sidecar and re-applies each entry through the same applier path
+— invalid overrides log a WARN and are skipped rather than blocking
+boot. To revert a runtime change, delete the entry from
+`admin_overrides.json` (or the entire file) and restart the daemon.
+
+Adding a key requires (a) defining + wiring an applier in
+`pkg/rpc/admin_live_reload.go`, (b) unit-testing the applier against
+valid + invalid inputs, (c) verifying the persisted override is
+re-applied on the next boot. Keys that change subsystem identity
+(chain ID, governance keys, SP1 verifying key, bridge configuration)
+MUST stay outside the whitelist — those are genesis-level invariants.
+
+### Bridge admin (`admin_bridgeHealth`, `admin_rescanDeposits`)
+
+Both RPCs delegate to `pkg/bridge.BridgeMonitor`. The monitor is
+constructed in `cmd/bsvm/main.go` via `BuildBridgeMonitor` and wired
+into the admin API via `rpcServer.AdminAPI().SetBridgeMonitor(...)`
+immediately after construction.
+
+`admin_bridgeHealth` response shape:
+
+```jsonc
+{
+  "monitorAttached": true,
+  "rescannerWired":  false,            // true once cmd-side wires SetBridgeRescanner
+  "subCovenants": [
+    {
+      "bsvTxid":          "abc...",     // hex
+      "vout":             0,
+      "balance":          8700000000,   // satoshis
+      "lastClaimedNonce": 41,           // ^uint64(0) → "no claim yet"
+      "status":           "active"
+    }
+  ],
+  "mismatch":         false,            // l2 supply check belongs to the indexer
+  "totalLocked":      "8700000000",
+  "totalSupply":      "8700000000",
+  "lastScanned":      800123,           // BridgeMonitor.DepositHorizon()
+  "pendingDeposits":  3,
+  "localShardId":     1234,
+  "rescanPending":    false
+}
+```
+
+When no bridge is configured (`[bridge].bridge_script_hex` empty) the
+response surfaces `monitorAttached=false` and includes a `note`
+field directing the operator at this runbook. The shape is otherwise
+the same so the explorer UI doesn't need to special-case "no bridge".
+
+`admin_rescanDeposits` accepts `[fromHeight]` and returns
+`{success, fromHeight, scheduled}`. The rescanner callback itself is
+**still TODO** — it requires touching `cmd/bsvm/bridge_blockscan_wiring.go`
+to expose a "rewind resume cursor + replay" entry point. Until that
+ships the call returns:
+
+```
+admin_rescanDeposits: bridge rescanner not wired (cmd-side wire missing; tracked as WW-bridge-rescanner-attach)
+```
+
+This is intentional: shipping a half-wired rescanner that silently
+no-ops would be worse than a clear "not yet" error.
 
 ## Multisig governance proposals
 

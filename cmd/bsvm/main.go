@@ -731,6 +731,35 @@ func cmdRun(ctx *cli.Context) error {
 	// (spec 15 A9) see structured log records as they happen.
 	rpcServer.SetLogStreamer(logStreamer)
 
+	// Wire the admin_setConfig live-reload registry. Initial whitelist:
+	// log_level only — additional keys land as the underlying
+	// subsystems gain runtime setters (tracked under
+	// admin-setConfig-live-reload). Persistence: <datadir>/admin_overrides.json.
+	// The daemon's bootstrap path can pre-apply overrides before the
+	// first slog record by reading this file on the next boot (see
+	// docs/operator/admin.md).
+	liveReloader := rpc.NewLiveReloader(filepath.Join(nodeCfg.DataDir, "admin_overrides.json"))
+	liveReloader.RegisterLogLevel(logStreamer)
+	if overrides, oerr := rpc.LoadAdminOverrides(filepath.Join(nodeCfg.DataDir, "admin_overrides.json")); oerr != nil {
+		slog.Warn("admin overrides: failed to load existing sidecar (proceeding with TOML-only config)", "error", oerr)
+	} else if len(overrides) > 0 {
+		// Re-apply each override so a runtime change made on the
+		// previous boot survives this restart. We reuse the live-
+		// reloader's applier path — invalid overrides log a WARN and
+		// are skipped rather than blocking boot.
+		for k, v := range overrides {
+			raw, mErr := json.Marshal(v)
+			if mErr != nil {
+				slog.Warn("admin overrides: skip key with non-encodable value", "key", k, "error", mErr)
+				continue
+			}
+			if _, aerr := liveReloader.Apply(k, raw); aerr != nil {
+				slog.Warn("admin overrides: skip invalid key", "key", k, "value", v, "error", aerr)
+			}
+		}
+	}
+	rpcServer.AdminAPI().SetLiveReloader(liveReloader)
+
 	// Spec 15 admin surface. Dev-bypass is enabled only when the
 	// shard is running in mock/execute mode AND an explicit secret
 	// is configured (BSVM_ADMIN_DEV_SECRET). This keeps the admin
@@ -949,6 +978,13 @@ func cmdRun(ctx *cli.Context) error {
 			"local_shard_id", uint32(chainID),
 		)
 	}
+	// Expose the bridge monitor to the admin RPC namespace so
+	// admin_bridgeHealth returns live (txid, balance, lastClaimedNonce,
+	// pendingDeposits, depositHorizon) instead of the historical zero
+	// stub. Always called — when the monitor is nil the admin RPC
+	// surfaces monitorAttached=false with operator guidance instead of
+	// crashing. See pkg/rpc/admin_bridge.go.
+	rpcServer.AdminAPI().SetBridgeMonitor(bridgeMonitor)
 	WireBEEFEndpoints(beefWireOpts{
 		Cfg:              nodeCfg.BEEF,
 		DB:               boot.DB,
@@ -1220,6 +1256,12 @@ func cmdVersion(ctx *cli.Context) error {
 // setupLogging configures the slog default logger based on the given level
 // and format strings. It returns the installed LogStreamer so callers can
 // wire it to the WebSocket admin log subscription (spec 15 A9).
+//
+// The level is held in a *slog.LevelVar that is shared between the
+// inner handler's filter and the LogStreamer. admin_setConfig
+// ("log_level", ...) mutates the same LevelVar so changes take effect
+// immediately on the next slog record without rebuilding the handler
+// chain.
 func setupLogging(level, format string) *rpc.LogStreamer {
 	var lvl slog.Level
 	switch level {
@@ -1233,7 +1275,9 @@ func setupLogging(level, format string) *rpc.LogStreamer {
 		lvl = slog.LevelInfo
 	}
 
-	opts := &slog.HandlerOptions{Level: lvl}
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(lvl)
+	opts := &slog.HandlerOptions{Level: levelVar}
 
 	var inner slog.Handler
 	if format == "json" {
@@ -1243,6 +1287,7 @@ func setupLogging(level, format string) *rpc.LogStreamer {
 	}
 
 	streamer := rpc.NewLogStreamer(inner, 4096)
+	streamer.AttachLevelVar(levelVar)
 	slog.SetDefault(slog.New(streamer))
 	return streamer
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/icellan/bsvm/pkg/bridge"
 	"github.com/icellan/bsvm/pkg/governance"
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/rpc/auth"
@@ -37,6 +38,20 @@ type AdminAPI struct {
 	// config. admin_createGovernanceProposal writes it into the new
 	// proposal so signers know how many signatures are required.
 	governanceThreshold int
+
+	// liveReloader backs admin_setConfig. When nil the handler
+	// returns the legacy "restart required" error for every key —
+	// matches the pre-whitelist behaviour for tests / single-node
+	// boots that don't set it. Wired by SetLiveReloader.
+	liveReloader *LiveReloader
+
+	// bridgeMonitor + bridgeRescan back admin_bridgeHealth /
+	// admin_rescanDeposits. Both are nil-tolerant: the handlers
+	// surface a structured "monitor not attached" error if a daemon
+	// boots without a bridge configured. Wired by SetBridgeMonitor /
+	// SetBridgeRescanner.
+	bridgeMonitor *bridge.BridgeMonitor
+	bridgeRescan  BridgeRescanFn
 }
 
 // SetGovernanceWorkflow installs the governance workflow that
@@ -45,6 +60,23 @@ type AdminAPI struct {
 func (a *AdminAPI) SetGovernanceWorkflow(w *governance.Workflow, threshold int) {
 	a.governance = w
 	a.governanceThreshold = threshold
+}
+
+// SetLiveReloader installs the live-reload registry that backs
+// admin_setConfig. When nil, the handler falls back to the legacy
+// "restart required" error for every key — matches the pre-
+// whitelist behaviour. The cmd/bsvm boot path constructs the
+// reloader, registers per-key appliers, and calls this once before
+// rpcServer.Start().
+func (a *AdminAPI) SetLiveReloader(r *LiveReloader) {
+	a.liveReloader = r
+}
+
+// LiveReloader returns the installed reloader, or nil when none has
+// been configured. Exposed so the explorer UI's "Restart Required"
+// hint can fetch the current whitelist via admin_getConfig.
+func (a *AdminAPI) LiveReloader() *LiveReloader {
+	return a.liveReloader
 }
 
 // overlayAdminAccessor is the minimum slice of OverlayNode that the
@@ -79,18 +111,43 @@ func (a *AdminAPI) PeerList() []overlay.RPCPeerSummary {
 
 // --- admin_getConfig / admin_setConfig --------------------------------
 
-// GetConfig implements admin_getConfig. Returns the live RuntimeConfigView.
-func (a *AdminAPI) GetConfig() overlay.RuntimeConfigView {
-	return a.overlay.RuntimeConfig()
+// GetConfig implements admin_getConfig. Returns the live runtime
+// snapshot plus the live-reload whitelist so the explorer UI knows
+// which keys can be applied without a restart and which require one
+// (spec 15 §"Configuration"'s "Restart Required" hint).
+func (a *AdminAPI) GetConfig() map[string]interface{} {
+	view := a.overlay.RuntimeConfig()
+	whitelist := []string{}
+	if a.liveReloader != nil {
+		whitelist = a.liveReloader.Whitelist()
+	}
+	return map[string]interface{}{
+		"chainId":             view.ChainID,
+		"minGasPriceWei":      view.MinGasPriceWei,
+		"maxBatchSize":        view.MaxBatchSize,
+		"maxBatchFlushMs":     view.MaxBatchFlushMs,
+		"maxSpeculativeDepth": view.MaxSpeculativeDepth,
+		"proveMode":           view.ProveMode,
+		"restartRequired":     view.RestartRequired,
+		"liveReloadWhitelist": whitelist,
+	}
 }
 
-// SetConfig implements admin_setConfig. Until live-reload lands for
-// individual settings, this handler accepts the request but always
-// returns an error indicating a restart is required. The explorer UI
-// relies on the `restartRequired` field of GetConfig() to guide the
-// operator.
+// SetConfig implements admin_setConfig. Whitelisted keys
+// (LiveReloader.Whitelist()) are routed through the per-key applier
+// and persisted to the override sidecar so the change survives a
+// restart. Non-whitelisted keys return a structured error listing
+// the whitelisted set, matching spec 15 §"Configuration"'s "Restart
+// Required" UX.
+//
+// When no LiveReloader has been wired the handler falls back to the
+// legacy "restart required" error for every key — the surface stays
+// consistent so callers who haven't migrated keep working.
 func (a *AdminAPI) SetConfig(key string, value json.RawMessage) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("admin_setConfig: live reload not yet implemented (restart required to change %q)", key)
+	if a.liveReloader == nil {
+		return nil, fmt.Errorf("admin_setConfig: live-reload registry not configured (restart required to change %q)", key)
+	}
+	return a.liveReloader.Apply(key, value)
 }
 
 // --- admin_pauseProving / admin_resumeProving / admin_forceFlushBatch --
@@ -220,23 +277,27 @@ func proposalAsMap(p *governance.Proposal) map[string]interface{} {
 	}
 }
 
-// BridgeHealth is a spec 15 stub. A real implementation calls into
-// pkg/bridge once the monitor is attached to the overlay node.
+// BridgeHealth implements admin_bridgeHealth. Reads from the
+// BridgeMonitor handle wired by SetBridgeMonitor; when no monitor is
+// attached (no [bridge].bridge_script_hex configured) the response
+// surfaces monitorAttached=false and a guidance note for the operator.
+//
+// See pkg/rpc/admin_bridge.go for the implementation and
+// docs/operator/admin.md for the response shape.
 func (a *AdminAPI) BridgeHealth() map[string]interface{} {
-	return map[string]interface{}{
-		"subCovenants":  []map[string]interface{}{},
-		"mismatch":      false,
-		"totalLocked":   "0",
-		"totalSupply":   "0",
-		"lastScanned":   0,
-		"rescanPending": false,
-		"note":          "bridge monitor not yet attached to overlay — returning zero state",
-	}
+	return a.bridgeHealthInternal()
 }
 
-// RescanDeposits is a spec 15 stub.
+// RescanDeposits implements admin_rescanDeposits. Forwards to the
+// BridgeRescanFn callback registered by the daemon — pkg/rpc cannot
+// drive the chaintracks-backed scanner directly because doing so
+// would pull a chaintracks dep into this package. Returns a typed
+// error (referencing tracking ID WW-bridge-rescanner-attach) when
+// the rescan callback isn't wired.
+//
+// See pkg/rpc/admin_bridge.go for the implementation.
 func (a *AdminAPI) RescanDeposits(fromHeight uint64) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("admin_rescanDeposits: bridge monitor not yet attached to overlay")
+	return a.rescanDepositsInternal(fromHeight)
 }
 
 // --- HTTP handler -----------------------------------------------------
