@@ -66,6 +66,21 @@ func TestHostBridgeUpgradeProof_RealStarkVerifies(t *testing.T) {
 	stdinJSON := fmt.Sprintf(`{
 		"mode": "upgrade-proof",
 		"pre_state_root": "%s",
+		"accounts": [],
+		"transactions": [],
+		"block_context": {
+			"number": 0,
+			"timestamp": 0,
+			"coinbase": "",
+			"gas_limit": 0,
+			"base_fee": 0,
+			"prev_randao": ""
+		},
+		"inbox_root_before": "",
+		"inbox_root_after": "",
+		"inbox_queue": [],
+		"inbox_drain_count": 0,
+		"inbox_must_drain_all": false,
 		"new_covenant_script_hex": "%s",
 		"block_number": %d,
 		"chain_id": %d,
@@ -215,6 +230,21 @@ func TestHostBridgeUpgradeProof_SyntheticFallback(t *testing.T) {
 	stdinJSON := fmt.Sprintf(`{
 		"mode": "upgrade-proof",
 		"pre_state_root": "%s",
+		"accounts": [],
+		"transactions": [],
+		"block_context": {
+			"number": 0,
+			"timestamp": 0,
+			"coinbase": "",
+			"gas_limit": 0,
+			"base_fee": 0,
+			"prev_randao": ""
+		},
+		"inbox_root_before": "",
+		"inbox_root_after": "",
+		"inbox_queue": [],
+		"inbox_drain_count": 0,
+		"inbox_must_drain_all": false,
 		"new_covenant_script_hex": "%s",
 		"block_number": %d,
 		"chain_id": %d,

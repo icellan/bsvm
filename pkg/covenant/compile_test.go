@@ -366,13 +366,8 @@ func TestCompileFRIRollup_DifferentParams(t *testing.T) {
 
 // TestCompileFRIRollup_WithVerifyingKey verifies that CompileFRIRollup
 // records the VK hash on the compiled covenant metadata. The hash is
-// NOT embedded as a baked-in constant in the Mode 1 locking script —
-// the trust-minimized FRI bridge does not consult the VK on-chain, so
-// the Rúnar compiler constant-folds the readonly property out. When
-// Gate 0a Full lands the locking script will consult SP1VerifyingKeyHash
-// inside `advanceState` (Merkle-root check against transcoded FRI
-// commitments) and this test should be re-tightened to re-assert the
-// baked-in-script invariant.
+// consumed by the Mode 1 FRI covenant through the runar.VerifySP1FRI
+// intrinsic, which binds the proof transcript to the pinned key hash.
 func TestCompileFRIRollup_WithVerifyingKey(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping compilation test in short mode")

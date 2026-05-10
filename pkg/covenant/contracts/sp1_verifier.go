@@ -4,20 +4,19 @@ import runar "github.com/icellan/runar/packages/runar-go"
 
 // SP1 v6.0.2 proof verification subroutines for the BSVM rollup covenant.
 //
-// This file defines the KoalaBear field arithmetic, Ext4 arithmetic, and
-// Poseidon2 hash operations that the future on-chain FRI verifier (Gate
-// 0a Full, see spec 12 / 13) will consume. The current Mode 1 covenant
-// (rollup_fri.runar.go) does NOT consult any of these helpers — Mode 1
-// is the trust-minimized FRI bridge, not the on-chain verifier.
+// This file defines standalone KoalaBear field arithmetic, Ext4
+// arithmetic, and Poseidon2 hash operations used by tests and retained
+// as reference building blocks. The production Mode 1 covenant now
+// calls runar.VerifySP1FRI directly from rollup_fri.runar.go, so these
+// helpers are not assembled into the generated AdvanceState body.
 //
-// The helpers are retained in-tree as building blocks ready for the
-// Gate 0a Full implementation. If that path is abandoned or replaced
-// with a different PCS, this file can be deleted without affecting the
-// compiled covenants.
+// If Mode 1's intrinsic path is replaced with an explicit in-script PCS
+// implementation, these helpers are the local starting point. Otherwise
+// they can be deleted without affecting the compiled covenants.
 //
 // Verification paths currently implemented:
 //
-//   - Mode 1 (FRI bridge, VerifyFRI): no on-chain proof check.
+//   - Mode 1 (FRI, VerifyFRI): runar.VerifySP1FRI intrinsic.
 //   - Mode 2 (Groth16):   BN254 pairing of a ~256-byte wrapped proof.
 //   - Mode 3 (Groth16-WA): witness-assisted Groth16 via compile-time
 //     inlined verifier preamble.
@@ -269,16 +268,14 @@ func Poseidon2Compress(left, right [Poseidon2DigestSize]runar.Bigint) [Poseidon2
 }
 
 // ---------------------------------------------------------------------------
-// FRI Verification primitives (reserved for Gate 0a Full)
+// FRI Verification primitives
 // ---------------------------------------------------------------------------
 //
-// These helpers implement the FRI query / folding / Merkle primitives
-// that a full on-chain FRI verifier (Gate 0a Full) will compose into a
-// production Mode 1 AdvanceState body. They are currently unused by the
-// compiled covenant — Mode 1 is the trust-minimized FRI bridge. Naming
-// retains "Basefold" where callers from future revisions may expect it;
-// it is a misnomer (SP1 uses FRI, not Basefold), and these identifiers
-// may be renamed when the full verifier is wired up.
+// These helpers implement FRI query / folding / Merkle primitives kept
+// as local reference code. Naming retains "Basefold" where older callers
+// expect it; it is a misnomer (SP1 uses FRI, not Basefold), and these
+// identifiers may be renamed if the intrinsic path is replaced with an
+// explicit helper-composed verifier.
 
 // BasefoldFoldingCheck verifies one FRI folding layer's equation.
 // Given evaluations at positions q and q+half, the folding challenge alpha,

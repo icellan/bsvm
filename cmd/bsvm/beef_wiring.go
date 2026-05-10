@@ -213,6 +213,12 @@ type beefWireOpts struct {
 	RaceDetector *overlay.RaceDetector
 }
 
+type beefRuntime struct {
+	Endpoints        *rpc.BEEFEndpoints
+	Store            beef.Store
+	CovenantConsumer func(*beef.Envelope)
+}
+
 // WireBEEFEndpoints constructs the spec-17 BEEF endpoint surface and
 // attaches it to the RPC server. Call BEFORE rpcServer.Start().
 //
@@ -257,6 +263,18 @@ type beefWireOpts struct {
 // Returns nil when cfg.Enabled is false — callers can ignore the
 // returned endpoints in that case.
 func WireBEEFEndpoints(opts beefWireOpts, rpcServer *rpc.RPCServer) *rpc.BEEFEndpoints {
+	rt := BuildBEEFRuntime(opts, rpcServer)
+	if rt == nil {
+		return nil
+	}
+	return rt.Endpoints
+}
+
+// BuildBEEFRuntime constructs the same endpoint surface as
+// WireBEEFEndpoints and additionally returns the store + covenant
+// consumer so follower catch-up can replay peer-fetched BEEFs through
+// the exact same cmd-side receiver path as HTTP POST gossip.
+func BuildBEEFRuntime(opts beefWireOpts, rpcServer *rpc.RPCServer) *beefRuntime {
 	if !opts.Cfg.Enabled {
 		slog.Info("beef endpoints disabled by config; /bsvm/* surface unmounted")
 		return nil
@@ -310,7 +328,11 @@ func WireBEEFEndpoints(opts beefWireOpts, rpcServer *rpc.RPCServer) *rpc.BEEFEnd
 		"max_depth", opts.Cfg.MaxDepth,
 		"max_width", opts.Cfg.MaxWidth,
 	)
-	return endpoints
+	return &beefRuntime{
+		Endpoints:        endpoints,
+		Store:            store,
+		CovenantConsumer: covenantConsumer,
+	}
 }
 
 // makeBridgeConsumer returns the consumer callback the BEEF endpoint

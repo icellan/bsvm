@@ -4,10 +4,10 @@ import runar "github.com/icellan/runar/packages/runar-go"
 
 // DevKeyRollupContract is the devnet-only rollup covenant used by spec 16
 // "mock" and "execute" proving modes. Its on-chain invariants are
-// structurally identical to FRIRollupContract (the trust-minimized FRI
-// bridge) — state continuity, block increment, chain-ID binding, batch
-// data hash binding, OP_RETURN data-availability output — with one
-// additional requirement: AdvanceState carries a governance-key signature.
+// structurally identical to FRIRollupContract's state and data
+// availability checks -- state continuity, block increment, chain-ID
+// binding, batch data hash binding, OP_RETURN data-availability output --
+// but replaces on-chain FRI verification with a governance-key signature.
 //
 // # Purpose
 //
@@ -58,7 +58,7 @@ type DevKeyRollupContract struct {
 	Frozen      runar.Bigint     // 0=active, 1=frozen by governance
 
 	// ---- Readonly ----
-	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey); reserved for future FRI verifier wiring
+	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey); retained for FRI layout parity
 	ChainId             runar.Bigint     `runar:"readonly"` // shard chain ID
 
 	// ---- Readonly: governance ----

@@ -112,7 +112,7 @@ type deployReceipt struct {
 //	--datadir          shared volume path (default /shared/cluster)
 //	--bsv-rpc          BSV node URL (or env BSVM_BSV_RPC)
 //	--bsv-network      regtest|testnet|mainnet (default regtest)
-//	--prove-mode       execute|prove (maps to fri/groth16-wa)
+//	--prove-mode       execute|prove (maps to fri)
 //	--chain-id         EVM chain id (default 31337)
 //	--prefund-accounts hardhat|none
 func cmdInitCluster(ctx *cli.Context) error {
@@ -198,17 +198,15 @@ func cmdInitCluster(ctx *cli.Context) error {
 	govConfig.Keys = [][]byte{pub}
 	govKeys := []string{hex.EncodeToString(pub)}
 
-	// 4. Determine verification mode from prove mode.
+	// 4. Determine verification mode from prove mode. Both execute
+	// and prove use the FRI covenant; prove-mode=prove differs at
+	// runtime by requiring a non-synthetic SP1 proof before broadcast.
 	var verifyMode covenant.VerificationMode
 	var verifyModeStr string
 	switch proveMode {
-	case "execute":
+	case "execute", "prove":
 		verifyMode = covenant.VerifyFRI
 		verifyModeStr = "fri"
-	case "prove":
-		// Mode 3 (Groth16-WA) requires a VK path — out of scope for the
-		// cluster-bootstrap, which targets execute (FRI) devnet runs.
-		return fmt.Errorf("init-cluster: prove-mode %q not yet supported (only execute/FRI)", proveMode)
 	default:
 		return fmt.Errorf("init-cluster: invalid prove-mode %q (want execute or prove)", proveMode)
 	}

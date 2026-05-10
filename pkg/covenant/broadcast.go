@@ -101,12 +101,11 @@ type AdvanceProof interface {
 	ContractCallArgs(req BroadcastRequest) ([]interface{}, error)
 }
 
-// FRIProof carries the proof data for ProofModeFRI (Mode 1, trust-
-// minimized FRI bridge). Its ContractCallArgs method produces the 5-arg
-// slice expected by contracts.FRIRollupContract.AdvanceState. There are
-// no FRI-specific arguments because Mode 1 does not verify the proof
-// on-chain; the Blob field is passed through for off-chain verification
-// and future-upgrade ABI stability.
+// FRIProof carries the proof data for ProofModeFRI (Mode 1, on-chain
+// SP1 FRI verification). Its ContractCallArgs method produces the
+// 5-arg slice expected by contracts.FRIRollupContract.AdvanceState;
+// the proof blob and public values are verified on-chain against the
+// covenant's pinned SP1VerifyingKeyHash.
 type FRIProof struct {
 	// SP1 envelope.
 	Values []byte

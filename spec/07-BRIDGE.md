@@ -65,6 +65,21 @@ The bridge covenant is compiled by Rúnar (spec 10, `contracts/bridge.go`).
 
 Message type `0x03` = deposit.
 
+**BEEF deposit ingestion (primary path)**: Wallets and relayers SHOULD
+submit a BRC-62/BEEF envelope for the deposit transaction to the shard's
+Spec 17 endpoint (`POST /bsvm/bridge/deposit`). A shard node verifies the
+BEEF ancestry, input scripts, and BUMP/header binding against chaintracks
+before the deposit is eligible for L2 credit. The block-scanning monitor
+below remains a fallback/reconciliation path for deployments that also
+configure WoC or a BSV-node backup, but consensus-critical deposit
+ordering still follows the deposit horizon rules in this spec.
+
+Fresh followers recover confirmed covenant advances through
+`GET /bsvm/beef/covenant-chain?from=<txid>&limit=<n>` (Spec 17). That
+catch-up stream is for the state covenant chain, not for bridge deposits,
+but it keeps deposit horizons and withdrawal roots replayable from BSV
+data alone.
+
 ### Step 2: Bridge monitor detects deposit
 
 ```go

@@ -349,6 +349,10 @@ func (s *LevelStore) collect(intent byte) ([]*Envelope, error) {
 		if err != nil {
 			continue
 		}
+		key := iter.Key()
+		if len(key) == len(levelKeyPrefix)+32 {
+			copy(env.TargetTxID[:], key[len(levelKeyPrefix):])
+		}
 		if intent != 0 && env.Header.Intent != intent {
 			continue
 		}

@@ -2,12 +2,10 @@
 // envelope used by BSVM nodes to exchange BSV transactions plus their
 // SPV-verifiable ancestry. See spec/17-CHAINTRACKS-BEEF-ARC.md.
 //
-// This package is scaffold-quality: it ships the 17-byte gossip envelope
-// codec, a BEEF transaction parser sufficient for the bridge / inbox /
-// governance use cases, and an in-memory + LevelDB-backed BEEFStore.
-// Full BRC-62 ancestry-graph reconstruction and BUMP verification against
-// chaintracks headers is a follow-up wave; this package gives the rest
-// of the codebase a stable surface to call into.
+// This package ships the 17-byte gossip envelope codec, the BEEF
+// transaction parser used by the bridge / inbox / governance consumers,
+// the in-memory + LevelDB-backed BEEFStore, and the BRC-62 verifier that
+// binds BUMP data to chaintracks headers.
 package beef
 
 import (

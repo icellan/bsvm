@@ -58,7 +58,7 @@ func main() {
 					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "path to data directory"},
 					&cli.Int64Flag{Name: "chain-id", Value: 0, Usage: "shard chain ID (default: 31337 when --prove-mode is set)"},
 					&cli.Uint64Flag{Name: "gas-limit", Value: 0, Usage: "genesis block gas limit (default: 30000000)"},
-					&cli.StringFlag{Name: "governance", Value: "", Usage: "governance mode: none, single_key, or multisig (default: single_key when --prove-mode is mock|execute)"},
+					&cli.StringFlag{Name: "governance", Value: "", Usage: "governance mode: none, single_key, or multisig (default: single_key when --prove-mode is mock|execute|prove)"},
 					&cli.StringFlag{Name: "verification", Value: "", Usage: "verification mode: groth16, groth16-wa, fri, or devkey (auto-selected by --prove-mode if both unset)"},
 					&cli.StringFlag{Name: "prove-mode", Value: "", Usage: "spec-16 devnet proof mode: mock, execute, or prove (selects covenant + chain defaults)"},
 					&cli.StringFlag{Name: "prefund-accounts", Value: "none", Usage: "prefund well-known test accounts: none or hardhat"},
@@ -74,7 +74,7 @@ func main() {
 					&cli.StringFlag{Name: "datadir", Value: "/shared/cluster", Usage: "shared directory for the cluster shard config"},
 					&cli.StringFlag{Name: "bsv-rpc", Usage: "BSV JSON-RPC endpoint (user:pass@host:port). Defaults to $BSVM_BSV_RPC"},
 					&cli.StringFlag{Name: "bsv-network", Value: "regtest", Usage: "BSV network: regtest|testnet|mainnet"},
-					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "cluster proof mode: execute (FRI) or prove (groth16-wa)"},
+					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "cluster proof mode: execute or prove (FRI covenant)"},
 					&cli.Int64Flag{Name: "chain-id", Value: 31337, Usage: "EVM chain id"},
 					&cli.StringFlag{Name: "prefund-accounts", Value: "hardhat", Usage: "genesis prefund: hardhat|none"},
 				},
@@ -87,13 +87,15 @@ func main() {
 					&cli.StringFlag{Name: "datadir", Value: "./data", Usage: "data directory to write genesis.txid + covenant.anf.json into"},
 					&cli.StringFlag{Name: "bsv-rpc", Usage: "BSV JSON-RPC endpoint (user:pass@host:port). Defaults to $BSVM_BSV_RPC"},
 					&cli.StringFlag{Name: "bsv-network", Value: "regtest", Usage: "BSV network: regtest|testnet|mainnet"},
-					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "proof mode: execute (FRI), prove (Groth16-WA), or mock (devkey)"},
+					&cli.StringFlag{Name: "prove-mode", Value: "execute", Usage: "proof mode: execute/prove (FRI) or mock (devkey)"},
 					&cli.StringFlag{Name: "verification", Usage: "verification mode override: fri|groth16|groth16-wa|devkey"},
 					&cli.StringFlag{Name: "governance", Value: "single_key", Usage: "governance mode: none|single_key|multisig"},
 					&cli.Int64Flag{Name: "chain-id", Value: 31337, Usage: "EVM chain id"},
 					&cli.Uint64Flag{Name: "gas-limit", Value: 0, Usage: "genesis block gas limit (default 30_000_000)"},
 					&cli.StringFlag{Name: "prefund-accounts", Value: "hardhat", Usage: "genesis prefund: hardhat|none"},
 					&cli.StringFlag{Name: "alloc-file", Usage: "optional JSON file with extra alloc entries (address → balance)"},
+					&cli.StringFlag{Name: "sp1-vk", EnvVars: []string{"BSVM_SP1_VK"}, Usage: "hex-encoded SP1 verifying key material"},
+					&cli.StringFlag{Name: "sp1-vk-file", EnvVars: []string{"BSVM_SP1_VK_FILE"}, Usage: "file containing raw SP1 verifying key bytes or a hex-encoded key"},
 				},
 				Action: cmdDeployShard,
 			},
@@ -165,7 +167,7 @@ func main() {
 //
 // Spec 16 devnet: passing --prove-mode mock|execute|prove auto-selects
 // verification mode, chain ID default (31337), governance mode
-// (single_key for mock/execute), and the devnet governance key so
+// (single_key for mock/execute/prove), and the devnet governance key so
 // developers can spin up a complete shard with a single flag.
 func cmdInit(ctx *cli.Context) error {
 	dataDir := ctx.String("datadir")
@@ -179,8 +181,8 @@ func cmdInit(ctx *cli.Context) error {
 
 	// Apply --prove-mode defaults before validation. Spec 16 mapping:
 	//   mock    → devkey covenant, single_key governance, chain 31337
-	//   execute → devkey covenant, single_key governance, chain 31337
-	//   prove   → groth16-wa covenant (mainnet-eligible), chain 31337
+	//   execute → FRI covenant, single_key governance, chain 31337
+	//   prove   → FRI covenant with real-proof enforcement, chain 31337
 	switch proveMode {
 	case "":
 		// No prove-mode — use explicit flags.
@@ -213,7 +215,7 @@ func cmdInit(ctx *cli.Context) error {
 		}
 	case "prove":
 		if verification == "" {
-			verification = "groth16-wa"
+			verification = "fri"
 		}
 		if governanceMode == "" {
 			governanceMode = "single_key"
@@ -622,6 +624,7 @@ func cmdRun(ctx *cli.Context) error {
 	// 5. Create overlay node.
 	overlayCfg := nodeCfg.ToOverlayConfig(chainID)
 	overlayCfg.ProveMode = proveMode
+	overlayCfg.RequireRealProof = proveMode == "prove"
 	overlayNode, err := overlay.NewOverlayNodeWithObservability(
 		overlayCfg,
 		boot.ChainDB,
@@ -992,7 +995,7 @@ func cmdRun(ctx *cli.Context) error {
 	// surfaces monitorAttached=false with operator guidance instead of
 	// crashing. See pkg/rpc/admin_bridge.go.
 	rpcServer.AdminAPI().SetBridgeMonitor(bridgeMonitor)
-	WireBEEFEndpoints(beefWireOpts{
+	beefRuntime := BuildBEEFRuntime(beefWireOpts{
 		Cfg:              nodeCfg.BEEF,
 		DB:               boot.DB,
 		ShardID:          uint64(chainID),
@@ -1019,6 +1022,7 @@ func cmdRun(ctx *cli.Context) error {
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	startBEEFCovenantCatchUp(bgCtx, beefRuntime, nodeCfg.BEEF, uint64(chainID), slog.Default())
 
 	// 8.1 Bridge block-scan fallback. Rides on the chaintracks WS
 	// stream for new-tip + reorg notifications and uses the BSV-node

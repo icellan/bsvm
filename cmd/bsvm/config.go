@@ -162,6 +162,18 @@ type BEEFSection struct {
 	// the verifier uses to skip re-execution of common ancestors.
 	// Default 4096; ≤0 disables caching.
 	ValidatedCacheSize int `toml:"validated_cache_size"`
+	// CatchUpPeers are HTTP base URLs for peer JSON-RPC listeners that
+	// expose GET /bsvm/beef/covenant-chain. When non-empty, a follower
+	// periodically pulls confirmed covenant-advance BEEFs from these
+	// peers and replays them through the local covenant consumer.
+	CatchUpPeers []string `toml:"catch_up_peers"`
+	// CatchUpInterval is the polling cadence for the covenant-chain
+	// catch-up loop. Empty defaults to 30s.
+	CatchUpInterval string `toml:"catch_up_interval"`
+	// CatchUpLimit caps envelopes requested from a peer per HTTP call.
+	// Empty/zero defaults to 100; values above 500 are clamped to the
+	// server-side maximum.
+	CatchUpLimit int `toml:"catch_up_limit"`
 }
 
 // IndexerSection configures the per-address transaction indexer.
@@ -716,6 +728,8 @@ func DefaultNodeConfig() *NodeConfig {
 			MaxWidth:                       10000,
 			AnchorDepth:                    6,
 			ValidatedCacheSize:             4096,
+			CatchUpInterval:                "30s",
+			CatchUpLimit:                   100,
 		},
 		EVM: EVMSection{
 			// Cancun is the active fork in v1 — both the Go EVM

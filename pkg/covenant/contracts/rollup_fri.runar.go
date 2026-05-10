@@ -3,8 +3,7 @@ package contracts
 import runar "github.com/icellan/runar/packages/runar-go"
 
 // FRIRollupContract is Mode 1 of the BSVM rollup covenant: the on-chain
-// SP1 FRI / STARK verifier (Gate 0a Full landed; previously the
-// trust-minimized FRI bridge).
+// SP1 FRI / STARK verifier.
 //
 // # Security model
 //
@@ -41,7 +40,7 @@ import runar "github.com/icellan/runar/packages/runar-go"
 //
 // # Readonly properties baked into the locking script
 //
-//   - SP1VerifyingKeyHash: keccak256(SP1 verifying key). Bound at
+//   - SP1VerifyingKeyHash: sha256(SP1 verifying key). Bound at
 //     compile time and consumed by VerifySP1FRI on every advance so a
 //     malicious unlocking script cannot supply it.
 //   - ChainId:             shard chain ID for cross-shard replay prevention
@@ -56,7 +55,7 @@ type FRIRollupContract struct {
 	AdvancesSinceInbox runar.Bigint     // forced-inclusion counter (spec 10)
 
 	// ---- Readonly ----
-	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey); reserved for future FRI verifier
+	SP1VerifyingKeyHash runar.ByteString `runar:"readonly"` // sha256(SP1 vkey); checked by runar.VerifySP1FRI
 	ChainId             runar.Bigint     `runar:"readonly"` // shard chain ID
 
 	// ---- Readonly: governance ----

@@ -6,7 +6,7 @@ import (
 )
 
 // F07 — spec-12 OP_RETURN data-output coverage for Mode 1
-// (trust-minimized FRI bridge).
+// (on-chain SP1 FRI verification).
 //
 // Mode 1 now emits batchData in a BSVM\x02 OP_RETURN output alongside
 // the state continuation. Rúnar's auto-injected continuation hash check

@@ -135,33 +135,20 @@ Already marked superseded by spec 11. 5-line redirect. No drift.
 
 ---
 
-## spec/07-BRIDGE.md — drifted (minor)
+## spec/07-BRIDGE.md — current
 
 `pkg/bridge/` has `monitor.go`, `deposit.go`, `withdrawal.go`,
 `withdrawer.go`, `deposit_tree.go`, `replay_test.go`, `retract_test.go`,
 `predeploy.go`, `ordering.go`. Bulk of bridge model in lines 1–100
 matches.
 
-Drift items (overlapping with spec 17 BEEF integration that landed
-this session):
+Update 2026-05-10: the prior BEEF-deposit callout gap is closed.
+Spec 07 now identifies `POST /bsvm/bridge/deposit` as the primary
+BEEF ingestion path and points fresh followers at Spec 17's
+`GET /bsvm/beef/covenant-chain` state-covenant catch-up endpoint.
 
-1. **Spec 07 (lines 70–95) describes `BridgeMonitor` constructed from
-   a `BSVClient`** — the legacy direct-RPC interface. After
-   `docs/decisions/beef-graph-validation.md` (W6-4), the BEEF
-   ingestion path now front-runs `bridgeMonitor.PersistDeposit` via
-   the spec-17 verifier (`pkg/beef/verify.go`). The legacy `BSVClient`
-   interface in `pkg/bridge/monitor.go:25-42` still exists and still
-   works, but spec 07 doesn't mention the BEEF path now lifted from
-   fail-closed. Minor — code is correct; spec needs a one-paragraph
-   update pointing at spec 17 and `pkg/beef/`.
-2. **Spec line 41** says "1 satoshi = 10^10 L2 wei" — code matches
-   (`pkg/bridge/deposit.go` deposit-credit conversion). Confirmed.
-3. **Spec is 1500 lines** and the bulk of it is still accurate. Just
-   needs a "see spec 17" callout and a pointer to W6-4's verifier.
-
-Recommendation: append a "BEEF deposit ingestion" subsection to spec
-07 referencing spec 17 §"BEEF: The Wire Format". Spec 07 is otherwise
-mainnet-relevant and current.
+The legacy `BSVClient` monitor remains documented as the fallback /
+reconciliation path. No mainnet-blocking drift.
 
 ---
 
@@ -188,7 +175,7 @@ No mainnet-blocking drift.
 
 ---
 
-## spec/09-IMPLEMENTATION-ORDER.md — drifted (major)
+## spec/09-IMPLEMENTATION-ORDER.md — drifted (minor)
 
 The dependency graph (lines 4–48) and milestone breakdown (lines 52+)
 are still accurate at the architectural level. The Gate 0a /
@@ -202,20 +189,12 @@ Drift items:
    guardrail has been lifted." Code at
    `pkg/covenant/genesis.go:84-89` confirms this — the guardrail is
    indeed lifted. Spec and code agree here.
-3. **However**, the doc-comment on `GenesisConfig.Mainnet` at
-   `pkg/covenant/genesis.go:31-36` STILL reads "rejects Verification
-   == VerifyFRI (Mode 1 has no on-chain proof check and is not
-   mainnet-eligible until Gate 0a Full lands)". The actual code body
-   no longer rejects Mode 1 — the comment is a stale half-update.
-   This is **doc drift inside the codebase, not the spec**. Minor in
-   scope, but I'm flagging it here because it's adjacent to spec 09's
-   Gate 0a story.
-4. **Spec line 643 talks about `tests/sp1/...` deliverables** — these
+3. **Spec line 643 talks about `tests/sp1/...` deliverables** — these
    are at `prover/host-bridge/`, `prover/guest/`, and the proof blobs
    are referenced from `pkg/proofmode/`. Path drift only.
 
-Recommendation: fix the comment at `pkg/covenant/genesis.go:31-36`
-during the next non-spec sweep. Spec 09 itself is current.
+Spec 09 itself is current at the milestone/status level; remaining
+drift is path wording only.
 
 ---
 
@@ -279,112 +258,42 @@ No mainnet-blocking drift.
 
 ---
 
-## spec/12-STATE-TRANSITION-PROOFS.md — drifted (MAJOR)
+## spec/12-STATE-TRANSITION-PROOFS.md — current
 
-This is the biggest drift in the codebase.
+Update 2026-05-10: the prior audit entry for spec 12 is obsolete. The
+spec now describes Mode 1 `VerifyFRI` as the on-chain SP1 FRI verifier
+path and treats Gate 0a Full as landed.
 
-**Spec lines 12–24 (Verification modes table)** state:
+Reality matches the current spec:
 
-> Mode 1 `VerifyFRI` (trust-minimized FRI bridge): On-chain check =
-> "**None.** Covenant binds state roots, batch hash, chain id via
-> public-value slots and emits the batch OP_RETURN. The SP1 FRI proof
-> is NOT verified on-chain. Off-chain nodes verify and trigger
-> governance freeze on an invalid advance."
->
-> Status: "**Testnet / experimental.** Mainnet-blocked by
-> `PrepareGenesis` guardrail."
+- `pkg/covenant/contracts/rollup_fri.runar.go` calls
+  `runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash)`
+  on every state advance.
+- `pkg/covenant/genesis.go` permits `VerifyFRI` as mainnet-eligible
+  under VK pinning and rejects only devkey mode on mainnet.
+- `cmd/bsvm deploy-shard --prove-mode=prove` now resolves to the FRI
+  covenant path; Groth16/Groth16-WA stay explicit future verification
+  modes until a real per-batch Groth16 wrapper is wired.
 
-**Spec lines 26–42 (Mode 1 security model)** state:
-
-> Mode 1 is the **trust-minimized FRI bridge**. The covenant does NOT
-> verify the SP1 FRI proof. A malicious prover can advance the state
-> with an invalid proof; the only recourse is governance freeze.
-> ...
-> Mode 1 is NOT mainnet-eligible. `PrepareGenesis` rejects
-> `Mainnet=true && Verification=VerifyFRI` with a clear error. The
-> guardrail is lifted when Gate 0a Full lands with a real on-chain
-> FRI verifier.
-
-**Spec lines 44–51 (Future: Gate 0a Full)** state:
-
-> A full on-chain FRI verifier ... is tracked as Gate 0a Full ... When
-> it lands, Mode 1 upgrades from a bridge to a fully self-verifying
-> rollup. ... **No work is scheduled against Gate 0a Full at the time
-> of writing.**
-
-**Reality (commit 6bf7751, plus CLAUDE.md, plus spec 09 lines 81–90):**
-
-- Gate 0a Full **has landed**.
-- `pkg/covenant/contracts/rollup_fri.runar.go:121` calls
-  `runar.Assert(runar.VerifySP1FRI(proofBlob, publicValues, c.SP1VerifyingKeyHash))`
-  on every `AdvanceState` invocation. Lines 307, 366, 421 carry the
-  same call for the freeze/unfreeze/upgrade paths.
-- `pkg/covenant/genesis.go:84-89` says Mode 1 is mainnet-eligible
-  ("Mode 1 (VerifyFRI) is mainnet-eligible. Gate 0a Full has landed").
-- `runar.VerifySP1FRI` is exported from
-  `/Users/siggioskarsson/gitcheckout/runar/packages/runar-go/runar.go:325`
-  (sibling repo, confirmed alive).
-
-**Severity: MAJOR.** Anyone reading spec 12 today will get the
-opposite of the truth: they will believe Mode 1 is testnet-only and
-bridge-style, when in reality it is the on-chain SP1 STARK verifier
-with the largest locking script (~849 KB) of the three modes.
-
-**Remediation**: Spec 12 §"Verification modes", §"Mode 1 security
-model", §"Future: Gate 0a Full" all need rewrite. Mode 1 should be
-described as the on-chain SP1 FRI verifier (mainnet-eligible under VK
-pinning), and the "Future" section should be retired or repurposed.
-
-This is the highest-priority spec fix in the audit.
+No mainnet-blocking drift.
 
 ---
 
-## spec/13-RUNAR-REQUIREMENTS.md — drifted (MAJOR)
+## spec/13-RUNAR-REQUIREMENTS.md — current
 
-Same drift class as spec 12, propagating from the same source.
+Update 2026-05-10: the prior audit entry for spec 13 is obsolete. The
+spec now documents the live Rúnar FRI intrinsic and its signature.
 
-**Spec lines 36–44 (Mode 1 description)** state:
+Reality matches the current spec:
 
-> **Mode 1 `VerifyFRI`** — trust-minimized FRI bridge. `advanceState`
-> takes 5 args ... and performs **NO on-chain FRI verification**.
-> ... **Not mainnet-eligible.**
+- Mode 1 is documented as an on-chain SP1 FRI verifier, not a
+  trust-minimized bridge.
+- The live intrinsic is `runar.VerifySP1FRI(proofBlob, publicValues,
+  sp1VKeyHash) bool`.
+- Inbox, no-Keccak-in-script, and primitive sizing sections remain
+  aligned with the implementation.
 
-**Spec lines 174–186 (SP1 FRI Verifier section)** state:
-
-> **Status**: **Gate 0a Full — future work, not scheduled.** This
-> section describes the design target for the on-chain FRI verifier.
-> The compiled Mode 1 rollup covenant today (`rollup_fri.runar.go`)
-> does NOT verify the FRI proof on-chain; it is the trust-minimized
-> FRI bridge described in spec 12 ...
-
-**Reality**: Gate 0a Full landed. `runar.VerifySP1FRI` is the Rúnar
-intrinsic that performs the full SP1 v6.0.2 STARK verifier
-(KoalaBear + Poseidon2 + colinearity + Fiat-Shamir) inline and
-compiles to Bitcoin Script.
-
-**Severity: MAJOR.** Same reason as spec 12.
-
-**Other drift in spec 13 (minor):**
-
-1. **Lines 165–169 inbox covenant** — describes hash-chain default,
-   matches `pkg/covenant/contracts/inbox.runar.go`. Current.
-2. **Lines 245–256 measured primitive script sizes** — these are the
-   Gate 0a primitive measurements; current.
-3. **Lines 415–420 "no Keccak in Script"** — current.
-4. **Lines 678–712 Rúnar DSL Subroutine Reference** — large table.
-   Most entries match the live Rúnar surface (cross-checked
-   `runar.Assert`, `runar.Cat`, `runar.SHA256`, `runar.Hash256`,
-   `runar.Substr`, `runar.MerkleRootSha256`, etc. — all present in
-   the sibling repo). One missing intrinsic from the table:
-   **`m.Verify(vk, proof)`** is described as "Runs FRI verification
-   of SP1 proof" — in code this is exposed as **`runar.VerifySP1FRI`**
-   (not `m.Verify`). Minor naming drift; the spec table needs the
-   real symbol name.
-
-**Remediation**: Spec 13 §"State Covenant" §Mode 1 description and
-§"4. SP1 FRI Verifier" need rewrite. Subroutine reference table
-needs `m.Verify` → `runar.VerifySP1FRI` and the signature pin
-(`(proofBlob, publicValues, sp1VKeyHash) bool`).
+No mainnet-blocking drift.
 
 ---
 
@@ -431,7 +340,7 @@ No mainnet-blocking drift.
 
 ---
 
-## spec/17-CHAINTRACKS-BEEF-ARC.md — drifted (minor)
+## spec/17-CHAINTRACKS-BEEF-ARC.md — current
 
 `pkg/chaintracks/`, `pkg/arc/`, `pkg/beef/`, `pkg/whatsonchain/`,
 `pkg/bsvclient/` — all subsystems present. Recent decision docs
@@ -439,20 +348,14 @@ No mainnet-blocking drift.
 `W6-7-runar-broadcast-status.md`) confirm the BEEF/ARC/quorum
 framework is largely landed.
 
-Drift items:
+Update 2026-05-10: the prior "collapsed `BSVClient`" wording has been
+softened. Spec 17 now describes the new stack as a thinner
+`BSVNetworkClient` facade while allowing the legacy direct-RPC
+interfaces to coexist until they are retired.
 
-1. **Spec lines 51–58** says the `BSVClient` interface is "collapsed
-   into a thinner `BSVNetworkClient`". Reality: the legacy
-   `BSVClient` interface still exists in `pkg/bridge/monitor.go:25`
-   and `pkg/overlay/dsmonitor.go:24`. The new BEEF/ARC stack has
-   been added alongside, not in place of. This is "additive, not
-   replacement". Spec 17 over-promises a hard migration that didn't
-   happen — the two surfaces coexist. Minor doc drift; no functional
-   bug.
-2. **`runar_broadcast.go` triage** (see
-   `docs/decisions/W6-7-runar-broadcast-status.md`) — confirmed not
-   legacy, used by `cmd/bsvm/bsv_wiring.go`. Spec 17 doesn't mention
-   it explicitly; OK.
+`runar_broadcast.go` triage (see
+`docs/decisions/W6-7-runar-broadcast-status.md`) remains confirmed not
+legacy; it is used by `cmd/bsvm/bsv_wiring.go`.
 3. **Header-oracle quorum** — `pkg/chaintracks/multi_client.go`
    matches the spec-17 + W6-2 design (see
    `docs/decisions/header-oracle-quorum.md`).
@@ -472,33 +375,21 @@ No mainnet-blocking drift.
 | 04   | current (stub) | — | no |
 | 05   | drifted | minor | no |
 | 06   | current (stub) | — | no |
-| 07   | drifted | minor | no (BEEF callout deferred) |
+| 07   | current | — | no |
 | 08   | drifted | minor | no |
-| 09   | drifted | minor (+ adjacent code-comment drift) | no |
+| 09   | drifted | minor | no |
 | 10   | drifted | minor | no |
 | 11   | drifted | minor | no |
-| **12** | **drifted** | **MAJOR** | **YES — auditors will be misled** |
-| **13** | **drifted** | **MAJOR** | **YES — same Mode 1 mis-statement** |
+| 12   | current | — | no |
+| 13   | current | — | no |
 | 15   | drifted | minor | no |
 | 16   | drifted | minor | no |
-| 17   | drifted | minor | no |
+| 17   | current | — | no |
 
 ## Recommended fix order
 
-1. **Spec 12 + spec 13** (Mode 1 mainnet eligibility + Gate 0a Full
-   status). Single coordinated rewrite; both specs reference each
-   other. **Highest priority.**
-2. `pkg/covenant/genesis.go:31-36` doc comment — small in-code fix,
-   stale half-update.
-3. Spec 07 BEEF-deposit callout pointing at spec 17 + W6-4.
-4. Spec 13 subroutine reference table: `m.Verify` →
-   `runar.VerifySP1FRI`.
-5. Spec 17 "Migration from spec 11's BSVClient" — soften the
-   "collapsed" wording to "additive" until the legacy
-   `BSVClient` interfaces are actually retired.
-6. Cosmetic / minor drift across specs 01, 03, 05, 08, 09, 10, 11,
+1. Cosmetic / minor drift across specs 01, 03, 05, 08, 09, 10, 11,
    15, 16 — bundle into a single sweep when convenient.
 
-No spec was found to be irreparably stale. The two majors are
-isolated to the Mode 1 / Gate 0a Full story and are mechanically
-fixable.
+No spec was found to be irreparably stale, and the previous Mode 1 /
+Gate 0a Full major drift has been resolved in the current spec set.

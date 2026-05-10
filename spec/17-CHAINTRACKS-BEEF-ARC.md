@@ -50,8 +50,8 @@ backup disabled.
 
 This spec supersedes the `BSVClient` interface sketched in specs 10
 and 11 (direct JSON-RPC to a BSV node, subscribe-to-blocks,
-subscribe-to-DS). That interface is collapsed into a thinner
-`BSVNetworkClient` built from `ARCClient`, `ChaintracksClient`,
+subscribe-to-DS). That interface evolves into a thinner
+`BSVNetworkClient` facade built from `ARCClient`, `ChaintracksClient`,
 `WhatsOnChainClient`, and the BEEF/wallet facilities of
 `go-wallet-toolbox`. See **"Migration from spec 11's BSVClient"** at
 the end of this document for the field-by-field mapping.
@@ -1384,7 +1384,7 @@ pattern is replaced (push model, BEEF gossip, etc.).
 | `GetUTXOs(address)`               | `Wallet.ListOutputs()` (for fee wallet) / `WoC.AddressUnspent`   |
 | `GetUTXO(txid, vout)`             | **removed** — not used on hot path in BEEF model                 |
 | `IsUTXOSpent(txid, vout)`         | Implicit in `Wallet.ListOutputs` reconciliation                  |
-| `GetSpendingTx(txid, vout)`       | **removed** — covenant chain is walked via `BEEFStore` only      |
+| `GetSpendingTx(txid, vout)`       | **removed** — covenant chain is walked via `BEEFStore` + catch-up|
 | `GetBlockByHeight(h)`             | **removed** — nodes don't need block bodies                      |
 | `GetBlockHeader(h)`               | `ChaintracksClient.HeaderByHeight(h)`                            |
 | `GetChainTip()`                   | `ChaintracksClient.Tip()`                                        |

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/beef"
@@ -293,12 +294,16 @@ func (b *BEEFEndpoints) handle(
 		Header:     hdr,
 		Beef:       beefBody,
 		TargetTxID: target.TxID,
+		ReceivedAt: time.Now().UTC(),
 	}
 	if hdr.Intent == beef.IntentCovenantAdvanceConfirmed ||
 		hdr.Intent == beef.IntentBridgeDeposit ||
 		hdr.Intent == beef.IntentFeeWalletFunding ||
 		hdr.Intent == beef.IntentGovernanceAction {
 		env.Confirmed = target.HasBUMP
+		if target.HasBUMP && int(target.BUMPRef) < len(parsed.BUMPs) {
+			env.BlockHeight = parsed.BUMPs[target.BUMPRef].BlockHeight
+		}
 	}
 	if err := b.cfg.Store.Put(env); err != nil {
 		b.recordReject(hdr.Intent, "store-error")

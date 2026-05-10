@@ -66,6 +66,13 @@ func (api *BsvAPI) BridgeStatus() map[string]interface{} {
 		"totalLockedWei":      totalLockedWei,
 		"totalSupplyWei":      totalLockedWei, // 1:1 peg
 		"subCovenantCount":    EncodeUint64(uint64(subCovenants)),
+		// Spec-15 field names. Keep the explicit *Wei aliases above
+		// for existing explorer builds that already consume them.
+		"totalLocked":              totalLockedWei,
+		"totalSupply":              totalLockedWei,
+		"rateLimitPeriod":          EncodeUint64(0),
+		"currentPeriodWithdrawals": "0",
+		"maxPerPeriod":             "0",
 	}
 }
 
@@ -88,12 +95,18 @@ func (api *BsvAPI) GetDeposits(fromBlock, toBlock uint64) []map[string]interface
 		}
 		out = append(out, map[string]interface{}{
 			"bsvTxId":        bsvTxIDHex(d.BSVTxID),
+			"bsvTxid":        bsvTxIDHex(d.BSVTxID),
 			"vout":           EncodeUint64(uint64(d.Vout)),
 			"bsvBlockHeight": EncodeUint64(d.BSVBlockHeight),
 			"l2Address":      d.L2Address.Hex(),
 			"satoshiAmount":  EncodeUint64(d.SatoshiAmount),
 			"l2WeiAmount":    l2Wei,
 			"confirmed":      d.Confirmed,
+			// Spec-15 aliases.
+			"amount":           l2Wei,
+			"bsvConfirmations": EncodeUint64(0),
+			"credited":         d.Confirmed,
+			"l2BlockNumber":    EncodeUint64(0),
 		})
 	}
 	return out
@@ -110,13 +123,15 @@ func (api *BsvAPI) GetWithdrawals(fromNonce, toNonce uint64) []map[string]interf
 	out := make([]map[string]interface{}, 0, len(ws))
 	for _, w := range ws {
 		out = append(out, map[string]interface{}{
-			"nonce":        EncodeUint64(w.Nonce),
-			"amountWei":    w.AmountWei,
-			"bsvAddress":   w.BsvAddress,
-			"l2TxHash":     w.L2TxHash,
-			"claimed":      w.Claimed,
-			"claimBsvTxid": w.ClaimBsvTxid,
-			"csvRemaining": EncodeUint64(w.CsvRemaining),
+			"nonce":              EncodeUint64(w.Nonce),
+			"amountWei":          w.AmountWei,
+			"amount":             w.AmountWei,
+			"bsvAddress":         w.BsvAddress,
+			"l2TxHash":           w.L2TxHash,
+			"claimed":            w.Claimed,
+			"claimBsvTxid":       w.ClaimBsvTxid,
+			"csvRemaining":       EncodeUint64(w.CsvRemaining),
+			"csvBlocksRemaining": EncodeUint64(w.CsvRemaining),
 		})
 	}
 	return out

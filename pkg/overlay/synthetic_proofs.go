@@ -15,14 +15,11 @@ import (
 	"github.com/icellan/runar/packages/runar-go/bn254witness"
 )
 
-// syntheticFRIProof returns a FRIProof populated with the deterministic
-// mock values used by the hermetic test suite. Real prover binaries
-// replace these with values extracted from the SP1 proof envelope.
-//
-// Mode 1 (FRIRollupContract) does not verify the SP1 FRI proof on-chain,
-// so no KoalaBear field elements or Merkle authentication paths are
-// required — the 5-arg advanceState call just forwards the proof blob
-// for off-chain verification.
+// syntheticFRIProof returns a FRIProof from the prover output bytes.
+// Mock runs still produce deterministic fixture bytes for hermetic
+// tests; prove-mode runtime rejects those fixtures before broadcast.
+// Real prover binaries populate blob with the SP1 FRI proof envelope,
+// which FRIRollupContract verifies on-chain via runar.VerifySP1FRI.
 //
 // The publicValues field is REBUILT in the rollup contract's expected
 // layout rather than re-using the prover's PublicValues.Encode() blob:

@@ -2,8 +2,107 @@ package rpc
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/icellan/bsvm/pkg/bridge"
+	"github.com/icellan/bsvm/pkg/types"
 )
+
+type bridgeSnapshotProviderStub struct {
+	totalLockedSats uint64
+	subCovenants    int
+	deposits        []*bridge.Deposit
+	withdrawals     []WithdrawalSummary
+}
+
+func (s *bridgeSnapshotProviderStub) TotalLockedSatoshis() uint64 {
+	return s.totalLockedSats
+}
+
+func (s *bridgeSnapshotProviderStub) SubCovenantCount() int {
+	return s.subCovenants
+}
+
+func (s *bridgeSnapshotProviderStub) Deposits(_, _ uint64) []*bridge.Deposit {
+	return s.deposits
+}
+
+func (s *bridgeSnapshotProviderStub) Withdrawals(_, _ uint64) []WithdrawalSummary {
+	return s.withdrawals
+}
+
+func TestBsvAPI_Spec15BridgeAliases(t *testing.T) {
+	txid := strings.Repeat("12", 32)
+	l2Addr := types.HexToAddress("0x1111111111111111111111111111111111111111")
+	deposit := bridge.NewDepositWithVout(types.BSVHashFromHex(txid), 2, 123, l2Addr, 50_000)
+	deposit.Confirmed = true
+
+	api := &BsvAPI{}
+	api.SetBridgeProvider(&bridgeSnapshotProviderStub{
+		totalLockedSats: 87_000,
+		subCovenants:    3,
+		deposits:        []*bridge.Deposit{deposit},
+		withdrawals: []WithdrawalSummary{{
+			Nonce:        7,
+			AmountWei:    "420000000000000",
+			BsvAddress:   "76a914001122334455667788990011223344556677889988ac",
+			L2TxHash:     "0xabc",
+			Claimed:      true,
+			ClaimBsvTxid: strings.Repeat("34", 32),
+			CsvRemaining: 12,
+		}},
+	})
+
+	status := api.BridgeStatus()
+	if got, want := status["totalLocked"], "870000000000000"; got != want {
+		t.Errorf("totalLocked = %v, want %v", got, want)
+	}
+	if got := status["totalLockedWei"]; got != status["totalLocked"] {
+		t.Errorf("totalLockedWei = %v, want alias totalLocked %v", got, status["totalLocked"])
+	}
+	if got, want := status["totalSupply"], "870000000000000"; got != want {
+		t.Errorf("totalSupply = %v, want %v", got, want)
+	}
+	for _, key := range []string{"rateLimitPeriod", "currentPeriodWithdrawals", "maxPerPeriod"} {
+		if _, ok := status[key]; !ok {
+			t.Errorf("BridgeStatus missing spec-15 alias %q", key)
+		}
+	}
+
+	deposits := api.GetDeposits(0, 0)
+	if len(deposits) != 1 {
+		t.Fatalf("GetDeposits len = %d, want 1", len(deposits))
+	}
+	gotDep := deposits[0]
+	if gotDep["bsvTxId"] != txid || gotDep["bsvTxid"] != txid {
+		t.Errorf("deposit txid aliases = %v/%v, want %s", gotDep["bsvTxId"], gotDep["bsvTxid"], txid)
+	}
+	if gotDep["amount"] != gotDep["l2WeiAmount"] {
+		t.Errorf("deposit amount alias = %v, want l2WeiAmount %v", gotDep["amount"], gotDep["l2WeiAmount"])
+	}
+	if gotDep["credited"] != true {
+		t.Errorf("deposit credited = %v, want true", gotDep["credited"])
+	}
+	for _, key := range []string{"bsvConfirmations", "l2BlockNumber"} {
+		if _, ok := gotDep[key]; !ok {
+			t.Errorf("deposit missing spec-15 alias %q", key)
+		}
+	}
+
+	withdrawals := api.GetWithdrawals(0, 0)
+	if len(withdrawals) != 1 {
+		t.Fatalf("GetWithdrawals len = %d, want 1", len(withdrawals))
+	}
+	gotWithdrawal := withdrawals[0]
+	if gotWithdrawal["amount"] != gotWithdrawal["amountWei"] {
+		t.Errorf("withdrawal amount alias = %v, want amountWei %v", gotWithdrawal["amount"], gotWithdrawal["amountWei"])
+	}
+	if gotWithdrawal["csvBlocksRemaining"] != gotWithdrawal["csvRemaining"] {
+		t.Errorf("csvBlocksRemaining = %v, want csvRemaining %v",
+			gotWithdrawal["csvBlocksRemaining"], gotWithdrawal["csvRemaining"])
+	}
+}
 
 // mockWithdrawalStore implements WithdrawalStore for testing.
 type mockWithdrawalStore struct {

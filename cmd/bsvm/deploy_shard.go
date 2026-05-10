@@ -68,13 +68,18 @@ const deployShardGenesisTxFile = "genesis.tx"
 // fee_wallet.wif so operators can tell them apart at a glance.
 const deployShardBootstrapWalletFile = "bootstrap_wallet.wif"
 
+var deployShardDefaultSP1VKFiles = []string{
+	"prover/host-evm/artifacts/vk.bin",
+	"prover/host/artifacts/vk.bin",
+}
+
 // cmdDeployShard implements the `bsvm deploy-shard` subcommand.
 // Flags (mirror init-cluster so existing wrappers keep working):
 //
 //	--datadir          where to write genesis.txid / covenant.anf.json
 //	--bsv-rpc          BSV JSON-RPC endpoint (or BSVM_BSV_RPC)
 //	--bsv-network      regtest|testnet|mainnet (default regtest)
-//	--prove-mode       execute|prove (execute → FRI, prove → g16-wa)
+//	--prove-mode       execute|prove (execute/prove → FRI; mock → devkey)
 //	--verification     fri|groth16|groth16-wa|devkey (override)
 //	--governance       none|single_key|multisig (default single_key)
 //	--chain-id         EVM chain id (default 31337)
@@ -202,15 +207,17 @@ func cmdDeployShard(ctx *cli.Context) error {
 	slog.Info("deploy-shard: genesis state root computed",
 		"stateRoot", genesisHeader.StateRoot.Hex())
 
-	// SP1 VK: zeros for FRI / DevKey (neither consults it on-chain).
-	// Mainnet-eligible modes (Groth16, Groth16-WA) aren't routed here
-	// in this phase — see phase 3c gaps. resolveVerificationMode
-	// rejects them above for now.
-	sp1VK := make([]byte, 32)
+	sp1VK, sp1VKSource, err := resolveDeploySP1VK(ctx, verifyMode)
+	if err != nil {
+		return fmt.Errorf("deploy-shard: %w", err)
+	}
+	slog.Info("deploy-shard: SP1 VK material loaded",
+		"source", sp1VKSource,
+		"bytes", len(sp1VK))
 
 	// Compile the covenant. Go through covenant.PrepareGenesis so
-	// every mainnet guardrail (Mode 1 FRI rejection, VK pinning)
-	// stays enforced; the deploy-shard command never bypasses them.
+	// every mainnet guardrail stays enforced; the deploy-shard command
+	// never bypasses them.
 	genesisResult, err := covenant.PrepareGenesis(&covenant.GenesisConfig{
 		ChainID:          uint64(chainID),
 		SP1VerifyingKey:  sp1VK,
@@ -343,15 +350,13 @@ func cmdDeployShard(ctx *cli.Context) error {
 
 // resolveVerificationMode picks the covenant verification mode from
 // the --prove-mode and --verification flags. Explicit --verification
-// always wins; otherwise prove-mode maps execute→fri, prove→g16-wa.
+// always wins; otherwise prove-mode maps execute/prove→fri and mock→devkey.
 func resolveVerificationMode(proveMode, verification string) (covenant.VerificationMode, string, error) {
 	v := verification
 	if v == "" {
 		switch proveMode {
-		case "execute", "":
+		case "execute", "prove", "":
 			v = "fri"
-		case "prove":
-			return 0, "", fmt.Errorf("prove-mode=prove (Groth16-WA) not yet wired in deploy-shard; use --verification=fri for now")
 		case "mock":
 			v = "devkey"
 		default:
@@ -366,22 +371,108 @@ func resolveVerificationMode(proveMode, verification string) (covenant.Verificat
 	case "groth16":
 		return 0, "", fmt.Errorf("--verification=groth16 not yet wired in deploy-shard (requires VK fixture)")
 	case "groth16-wa":
-		// Mode 3 (Groth16-WA) is mainnet-eligible but unreachable from
-		// the mock / execute prover paths: the rollup covenant's
-		// publicInput[1] == reducePublicValuesToScalarWA(publicValues)
-		// binding requires a fresh SP1 Groth16 proof per batch, and
-		// the only fixtures shipping with this repo (tests/sp1/,
-		// pkg/overlay/testdata/) are the fixed Gate 0b sample whose
-		// public inputs cannot satisfy the binding for a per-batch
-		// publicValues blob. Deploy-shard therefore refuses Mode 3
-		// until a real SP1 prover is wired (GPU, minutes per proof).
-		// Use --verification=fri for the trust-minimized devnet path.
 		return 0, "", fmt.Errorf("--verification=groth16-wa requires a real SP1 prover that produces a fresh " +
 			"Groth16 proof per batch; the mock prover reuses the Gate 0b fixture whose publicInputs cannot " +
 			"bind to per-batch publicValues. Use --verification=fri for devnet until a GPU-backed prover is wired")
 	default:
 		return 0, "", fmt.Errorf("invalid --verification %q", v)
 	}
+}
+
+func resolveDeploySP1VK(ctx *cli.Context, mode covenant.VerificationMode) ([]byte, string, error) {
+	if raw := strings.TrimSpace(ctx.String("sp1-vk")); raw != "" {
+		vk, err := decodeDeploySP1VKHex(raw)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode --sp1-vk: %w", err)
+		}
+		return vk, "--sp1-vk", nil
+	}
+	if path := strings.TrimSpace(ctx.String("sp1-vk-file")); path != "" {
+		vk, err := readDeploySP1VKFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read --sp1-vk-file %s: %w", path, err)
+		}
+		return vk, path, nil
+	}
+	if path := firstExistingDeploySP1VKFile(); path != "" {
+		vk, err := readDeploySP1VKFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read default SP1 VK file %s: %w", path, err)
+		}
+		return vk, path, nil
+	}
+	if mode == covenant.VerifyDevKey {
+		return make([]byte, 32), "devkey-placeholder", nil
+	}
+	return nil, "", fmt.Errorf("SP1 VK material is required for %s deploys; pass --sp1-vk, --sp1-vk-file, BSVM_SP1_VK, or BSVM_SP1_VK_FILE", mode)
+}
+
+func firstExistingDeploySP1VKFile() string {
+	for _, path := range deployShardDefaultSP1VKFiles {
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func readDeploySP1VKFile(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty SP1 VK file")
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if isHexVKString(line) {
+			return decodeDeploySP1VKHex(line)
+		}
+		break
+	}
+	return raw, nil
+}
+
+func decodeDeploySP1VKHex(raw string) ([]byte, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	if s == "" {
+		return nil, fmt.Errorf("empty SP1 VK")
+	}
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("hex string has odd length")
+	}
+	out, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty SP1 VK")
+	}
+	return out, nil
+}
+
+func isHexVKString(raw string) bool {
+	s := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(raw), "0x"), "0X")
+	if s == "" || len(s)%2 != 0 {
+		return false
+	}
+	for _, c := range []byte(s) {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // resolveGovernanceConfig returns the governance config for the given
