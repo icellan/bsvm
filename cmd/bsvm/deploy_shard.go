@@ -279,12 +279,15 @@ func cmdDeployShard(ctx *cli.Context) error {
 		return fmt.Errorf("deploy-shard: recompile covenant artifact: %w", err)
 	}
 	stateRootHex := strings.TrimPrefix(genesisHeader.StateRoot.Hex(), "0x")
-	contract := runar.NewRunarContract(sdkArtifact, []interface{}{
+	runtimeArgs := []interface{}{
 		stateRootHex,
 		int64(0), // blockNumber
 		int64(0), // frozen
-		int64(0), // advancesSinceInbox (spec 10 forced-inclusion counter)
-	})
+	}
+	if len(sdkArtifact.ABI.Constructor.Params) > len(runtimeArgs) {
+		runtimeArgs = append(runtimeArgs, int64(0)) // advancesSinceInbox (FRI forced-inclusion counter)
+	}
+	contract := runar.NewRunarContract(sdkArtifact, runtimeArgs)
 	lockingScriptHex := contract.GetLockingScript()
 
 	// Deploy tx: vout 0 = covenant, vout 1 = OP_RETURN manifest,

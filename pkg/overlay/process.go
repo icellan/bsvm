@@ -242,7 +242,7 @@ func (n *OverlayNode) ProcessBatch(txs []*types.Transaction) (*ProcessResult, er
 	}
 	timestamp := parentHeader.Timestamp + interval
 
-	return n.processBatchInternal(n.config.Coinbase, timestamp, txs, inboxWitness)
+	return n.processBatchInternal(n.config.Coinbase, timestamp, txs, inboxWitness, true)
 }
 
 // producerInboxWitness carries the inbox-drain witness from
@@ -317,8 +317,11 @@ func (n *OverlayNode) ReplayBatch(batch *block.BatchData) (*ProcessResult, error
 			batch.Timestamp, parentHeader.Timestamp)
 	}
 
-	// Replay path never drains the inbox — pass a zero-value witness.
-	return n.processBatchInternal(batch.Coinbase, batch.Timestamp, txs, producerInboxWitness{})
+	// Replay path never drains the inbox and never schedules local
+	// settlement proving. The producer's covenant-chain proof is learned
+	// through BEEF catch-up; followers should not spend CPU proving blocks
+	// they only received from peers.
+	return n.processBatchInternal(batch.Coinbase, batch.Timestamp, txs, producerInboxWitness{}, false)
 }
 
 // processBatchInternal is the shared execution core for ProcessBatch
@@ -327,11 +330,14 @@ func (n *OverlayNode) ReplayBatch(batch *block.BatchData) (*ProcessResult, error
 // caller is responsible for picking producer-path or replay-path values.
 // The inboxWitness is populated only by ProcessBatch when a forced-
 // inclusion drain happened; ReplayBatch passes a zero-value witness.
+// When settle is false, the block is committed locally without submitting
+// work to the prover or broadcasting a covenant advance.
 func (n *OverlayNode) processBatchInternal(
 	coinbase types.Address,
 	timestamp uint64,
 	txs []*types.Transaction,
 	inboxWitness producerInboxWitness,
+	settle bool,
 ) (*ProcessResult, error) {
 	// 1. Get parent header from ChainDB.
 	parentHeader := n.chainDB.ReadHeaderByNumber(n.executionTip)
@@ -528,18 +534,6 @@ func (n *OverlayNode) processBatchInternal(
 		proveInput.StateExport = exportBytes
 	}
 
-	// 6. Submit to prover (synchronous for mock/local modes).
-	var proveOutput *prover.ProveOutput
-	if n.parallelProver != nil {
-		ctx := context.Background()
-		output, proveErr := n.parallelProver.ProveAndWait(ctx, proveInput)
-		if proveErr != nil {
-			slog.Warn("proving failed", "block", l2Block.NumberU64(), "error", proveErr)
-		} else {
-			proveOutput = output
-		}
-	}
-
 	// Build the canonical batch encoding now so it can be passed to both
 	// the broadcast client and the TxCache entry. DepositHorizon comes
 	// from the inbox monitor if one is configured.
@@ -564,6 +558,21 @@ func (n *OverlayNode) processBatchInternal(
 		}
 	}
 
+	asyncSettlement := settle && n.shouldSettleAsync()
+
+	// 6. Submit to prover. Execute mode settles in the background so
+	// long SP1 emulator runs do not block JSON-RPC reads or tx intake.
+	var proveOutput *prover.ProveOutput
+	if settle && n.parallelProver != nil && !asyncSettlement {
+		ctx := context.Background()
+		output, proveErr := n.parallelProver.ProveAndWait(ctx, proveInput)
+		if proveErr != nil {
+			slog.Warn("proving failed", "block", l2Block.NumberU64(), "error", proveErr)
+		} else {
+			proveOutput = output
+		}
+	}
+
 	// Reject synthetic/mock proofs when the node is configured for
 	// production. A mock proof carries the "MOCK_SP1_PROOF" marker and
 	// must NEVER be wrapped into a covenant advance in a real deployment.
@@ -575,11 +584,11 @@ func (n *OverlayNode) processBatchInternal(
 	// Failure here is non-fatal: the block still commits locally and the
 	// race detector / next advance will reconcile.
 	var broadcastResult *covenant.BroadcastResult
-	if proveOutput != nil && n.covenantMgr != nil && n.covenantMgr.BroadcastClient() != nil {
+	if !asyncSettlement && proveOutput != nil && n.covenantMgr != nil && n.covenantMgr.BroadcastClient() != nil {
 		newCovState := n.covenantMgr.CurrentState()
 		newCovState.BlockNumber = l2Block.NumberU64()
 		newCovState.StateRoot = postStateRoot
-		advanceProof, apErr := BuildAdvanceProofForOutput(proveOutput, encodedBatch)
+		advanceProof, apErr := n.buildAdvanceProofForOutput(proveOutput, encodedBatch)
 		if apErr != nil {
 			slog.Warn("advance proof construction failed", "block", l2Block.NumberU64(), "error", apErr)
 		} else {
@@ -670,6 +679,10 @@ func (n *OverlayNode) processBatchInternal(
 	}
 	n.txCache.Append(cacheEntry)
 
+	if asyncSettlement && n.parallelProver != nil {
+		n.startAsyncSettlement(l2Block.NumberU64(), postStateRoot, proveInput, encodedBatch)
+	}
+
 	// Emit event for subscribers.
 	if n.eventFeed != nil {
 		n.eventFeed.Send(NewHeadEvent{Block: l2Block})
@@ -708,6 +721,141 @@ func (n *OverlayNode) processBatchInternal(
 		ProveOutput: proveOutput,
 		BatchData:   encodedBatch,
 	}, nil
+}
+
+func (n *OverlayNode) shouldSettleAsync() bool {
+	switch n.config.ProveMode {
+	case "execute", "prove":
+		return true
+	default:
+		return false
+	}
+}
+
+func (n *OverlayNode) startAsyncSettlement(
+	blockNum uint64,
+	postStateRoot types.Hash,
+	proveInput *prover.ProveInput,
+	encodedBatch []byte,
+) {
+	go n.settleBlockAsync(blockNum, postStateRoot, proveInput, encodedBatch)
+}
+
+func (n *OverlayNode) settleBlockAsync(
+	blockNum uint64,
+	postStateRoot types.Hash,
+	proveInput *prover.ProveInput,
+	encodedBatch []byte,
+) {
+	n.settlementMu.Lock()
+	defer n.settlementMu.Unlock()
+
+	if n.parallelProver == nil {
+		return
+	}
+
+	output, proveErr := n.parallelProver.ProveAndWait(context.Background(), proveInput)
+	if proveErr != nil {
+		slog.Warn("async proving failed", "block", blockNum, "error", proveErr)
+		return
+	}
+
+	if !n.txCache.SetProveOutput(blockNum, output) {
+		slog.Warn("async proof completed for uncached block", "block", blockNum)
+	}
+	n.markBlockProven(blockNum)
+	n.broadcastProvedBlock(blockNum, postStateRoot, output, encodedBatch)
+}
+
+func (n *OverlayNode) markBlockProven(blockNum uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if blockNum <= n.provenTip {
+		return
+	}
+	if blockNum != n.provenTip+1 {
+		slog.Warn("proof completed out of order", "block", blockNum, "provenTip", n.provenTip)
+		return
+	}
+	n.provenTip = blockNum
+}
+
+func (n *OverlayNode) broadcastProvedBlock(
+	blockNum uint64,
+	postStateRoot types.Hash,
+	proveOutput *prover.ProveOutput,
+	encodedBatch []byte,
+) {
+	if proveOutput == nil || n.covenantMgr == nil || n.covenantMgr.BroadcastClient() == nil {
+		return
+	}
+
+	curState := n.covenantMgr.CurrentState()
+	if curState.BlockNumber+1 != blockNum {
+		slog.Warn("async covenant broadcast skipped: predecessor not settled",
+			"block", blockNum,
+			"covenantBlock", curState.BlockNumber,
+		)
+		return
+	}
+
+	newCovState := curState
+	newCovState.BlockNumber = blockNum
+	newCovState.StateRoot = postStateRoot
+
+	advanceProof, apErr := n.buildAdvanceProofForOutput(proveOutput, encodedBatch)
+	if apErr != nil {
+		slog.Warn("advance proof construction failed", "block", blockNum, "error", apErr)
+		return
+	}
+
+	result, bcErr := n.covenantMgr.BroadcastAdvance(
+		context.Background(),
+		newCovState,
+		advanceProof,
+	)
+	if bcErr != nil {
+		slog.Warn("covenant broadcast failed", "block", blockNum, "error", bcErr)
+		return
+	}
+
+	if n.counters != nil {
+		n.counters.OverlayBatchesAdvancedTotal.Inc()
+	}
+	if !n.txCache.SetBroadcastResult(blockNum, result.TxID, result.BroadcastAt) {
+		slog.Warn("async broadcast completed for uncached block",
+			"block", blockNum,
+			"bsvTx", result.TxID.BSVString(),
+		)
+	}
+
+	if w := n.ConfirmationWatcherRef(); w != nil {
+		w.Track(blockNum, result.TxID)
+	}
+
+	anchor := &block.AnchorRecord{
+		L2BlockNum: blockNum,
+		BSVTxID:    result.TxID,
+		Confirmed:  false,
+	}
+	if anchorErr := n.chainDB.WriteAnchorRecord(anchor); anchorErr != nil {
+		slog.Warn("anchor record persist failed",
+			"block", blockNum,
+			"bsvTx", result.TxID.BSVString(),
+			"error", anchorErr,
+		)
+	}
+}
+
+func (n *OverlayNode) buildAdvanceProofForOutput(
+	out *prover.ProveOutput,
+	encodedBatch []byte,
+) (covenant.AdvanceProof, error) {
+	if n.covenantMgr != nil && n.covenantMgr.VerificationMode() == covenant.VerifyDevKey {
+		return BuildDevKeyAdvanceProofForOutput(out, encodedBatch)
+	}
+	return BuildAdvanceProofForOutput(out, encodedBatch)
 }
 
 // NewHeadEvent is emitted when a new L2 block is processed.

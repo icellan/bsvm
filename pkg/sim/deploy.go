@@ -106,12 +106,13 @@ func deployAndWait(ctx context.Context, pool *UserPool, _ any, code []byte) (typ
 		err   error
 	)
 	for attempt := 0; attempt < 20; attempt++ {
-		if faucet.nonce == 0 || faucet.dirty.Load() {
+		if !faucet.nonceLoaded || faucet.dirty.Load() {
 			n, nerr := c.Nonce(ctx, faucet.Address)
 			if nerr != nil {
 				return types.Address{}, fmt.Errorf("faucet nonce: %w", nerr)
 			}
 			faucet.nonce = n
+			faucet.nonceLoaded = true
 			faucet.dirty.Store(false)
 		}
 		nonce = faucet.nonce

@@ -367,6 +367,24 @@ func BuildAdvanceProofForOutput(
 	}
 }
 
+// BuildDevKeyAdvanceProofForOutput returns the spec-16 devnet advance shape.
+// It reuses the FRI public-values layout but targets DevKeyRollupContract,
+// whose first argument is an auto-signed governance-key Sig.
+func BuildDevKeyAdvanceProofForOutput(
+	out *prover.ProveOutput,
+	batch []byte,
+) (covenant.AdvanceProof, error) {
+	if out == nil {
+		return nil, fmt.Errorf("nil prove output")
+	}
+	base := syntheticFRIProof(out.PublicValues, batch, out.Proof)
+	return &covenant.DevKeyProof{
+		Values: base.Values,
+		Batch:  base.Batch,
+		Blob:   base.Blob,
+	}, nil
+}
+
 type unknownProofModeError prover.ProofMode
 
 func (e unknownProofModeError) Error() string {

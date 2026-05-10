@@ -25,12 +25,28 @@ RUN sed -i 's|=> \.\./runar/compilers/go|=> /runar/compilers/go|' go.mod && \
 RUN go mod download
 RUN CGO_ENABLED=1 go build -o /src/bsvm ./cmd/bsvm
 
+# Rust host bridge stage. The bridge embeds the pinned SP1 guest ELF from
+# prover/guest/elf at build time, so the runtime image only needs this binary
+# plus a placeholder ELF path for the Go-side config validation contract.
+FROM rust:alpine AS host-bridge-builder
+
+RUN apk add --no-cache build-base git protobuf-dev
+
+WORKDIR /src/bsv-evm
+COPY bsv-evm/prover/host-bridge/ /src/bsv-evm/prover/host-bridge/
+COPY bsv-evm/prover/guest/elf/ /src/bsv-evm/prover/guest/elf/
+
+WORKDIR /src/bsv-evm/prover/host-bridge
+RUN cargo build --release --locked
+
 # Runtime stage
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates iproute2
 
 COPY --from=builder /src/bsvm /usr/local/bin/bsvm
+COPY --from=host-bridge-builder /src/bsv-evm/prover/host-bridge/target/release/bsvm-host-bridge /usr/local/bin/bsvm-host-bridge
+COPY bsv-evm/prover/guest/elf/bsvm-guest /opt/bsvm/guest_evm.elf
 
 # Covenant source files needed by `bsvm init` for contract compilation.
 # The binary's fallback path is pkg/covenant/contracts/ relative to CWD.

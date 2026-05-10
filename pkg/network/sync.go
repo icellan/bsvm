@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -20,6 +21,7 @@ type SyncManager struct {
 	overlay *overlay.OverlayNode
 	gossip  *GossipManager
 	peers   *PeerManager
+	syncMu  sync.Mutex
 }
 
 // NewSyncManager creates a new SyncManager connected to the given overlay
@@ -36,6 +38,15 @@ func NewSyncManager(ovl *overlay.OverlayNode, gossip *GossipManager, peers *Peer
 // a higher chain tip. It requests batch data for each missing block in
 // sequence from the peer.
 func (s *SyncManager) SyncWithPeer(ctx context.Context, peerID peer.ID) error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	peerInfo := s.peers.GetPeer(peerID)
 	if peerInfo == nil {
 		return fmt.Errorf("unknown peer: %s", peerID)

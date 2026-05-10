@@ -43,6 +43,12 @@ const (
 	// advanceState method. Smallest on-chain footprint (~688 KB vs
 	// ~6 MB for Groth16) — recommended production target.
 	Groth16WA ProofMode = 2
+
+	// DevKey is the spec-16 devnet verification path used by mock and
+	// execute modes. It shares the FRI public-values and data-availability
+	// layout, but replaces on-chain STARK verification with an operator
+	// governance-key signature.
+	DevKey ProofMode = 3
 )
 
 // String returns a human-readable name for the proof mode.
@@ -54,6 +60,8 @@ func (m ProofMode) String() string {
 		return "groth16"
 	case Groth16WA:
 		return "groth16-wa"
+	case DevKey:
+		return "devkey"
 	default:
 		return "unknown"
 	}
@@ -66,6 +74,7 @@ var proofModeAliases = map[string]ProofMode{
 	"fri":             FRI,
 	"groth16":         Groth16,
 	"groth16-wa":      Groth16WA,
+	"devkey":          DevKey,
 	"groth16-generic": Groth16,   // legacy alias for Groth16
 	"groth16-witness": Groth16WA, // legacy alias for Groth16WA
 }

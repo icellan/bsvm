@@ -25,18 +25,20 @@ import (
 )
 
 type flags struct {
-	nodes     string
-	users     int
-	tps       int
-	headless  bool
-	deploy    bool
-	duration  time.Duration
-	workloads string
+	nodes      string
+	writeNodes string
+	users      int
+	tps        int
+	headless   bool
+	deploy     bool
+	duration   time.Duration
+	workloads  string
 }
 
 func main() {
 	var f flags
 	flag.StringVar(&f.nodes, "nodes", "http://localhost:8545,http://localhost:8546,http://localhost:8547", "comma-separated RPC URLs")
+	flag.StringVar(&f.writeNodes, "write-nodes", "", "comma-separated RPC URLs used for transaction submission (default: --nodes)")
 	flag.IntVar(&f.users, "users", 9, "initial user pool size (excluding the faucet)")
 	flag.IntVar(&f.tps, "tps", 5, "default rate per active workload (tx/s)")
 	flag.BoolVar(&f.headless, "headless", false, "print periodic stats instead of running the TUI")
@@ -61,15 +63,22 @@ func main() {
 	}()
 
 	mc := rpc.NewMultiClient(urls)
+	writeMC := mc
+	if writeURLs := splitTrim(f.writeNodes, ","); len(writeURLs) > 0 {
+		writeMC = rpc.NewMultiClient(writeURLs)
+	}
 	chainID, heights, err := dialSummary(ctx, mc)
 	if err != nil {
 		die(err.Error())
 	}
 	fmt.Printf("chain=%d heights=[%s] nodes=%d\n", chainID, strings.Join(heights, ","), mc.Len())
 
-	pool, err := sim.NewUserPool(chainID, mc)
+	pool, err := sim.NewUserPoolWithWriters(chainID, mc, writeMC)
 	if err != nil {
 		die(fmt.Sprintf("pool: %v", err))
+	}
+	if err := resizeUserPool(ctx, pool, f.users); err != nil {
+		die(fmt.Sprintf("users: %v", err))
 	}
 	reg := sim.NewRegistry()
 	eng := sim.NewEngine(pool, reg, chainID)
@@ -133,6 +142,26 @@ func runTUI(ctx context.Context, eng *sim.Engine) {
 	if _, err := prog.Run(); err != nil {
 		die(fmt.Sprintf("tui: %v", err))
 	}
+}
+
+func resizeUserPool(ctx context.Context, pool *sim.UserPool, want int) error {
+	if want < 1 {
+		return fmt.Errorf("--users must be at least 1")
+	}
+	for pool.Count() > want {
+		users := pool.Users()
+		if len(users) == 0 {
+			break
+		}
+		pool.RemoveUser(users[len(users)-1].ID)
+	}
+	for pool.Count() < want {
+		fund := new(uint256.Int).Lsh(uint256.NewInt(1), 80)
+		if _, err := pool.AddUser(ctx, fund); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runHeadless(ctx context.Context, eng *sim.Engine, duration time.Duration) {

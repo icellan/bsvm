@@ -80,7 +80,8 @@ type OverlayNode struct {
 	// construction.
 	counters *metrics.Counters
 
-	mu sync.Mutex
+	mu           sync.Mutex
+	settlementMu sync.Mutex
 }
 
 // NewOverlayNode creates a new overlay node with the given components.
@@ -297,8 +298,13 @@ func (n *OverlayNode) FinalizedTip() uint64 {
 // receives 1-5 confirmations.
 func (n *OverlayNode) SetConfirmedTip(blockNum uint64) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.confirmedTip = blockNum
+	cache := n.txCache
+	n.mu.Unlock()
+
+	if cache != nil {
+		cache.Confirm(blockNum)
+	}
 }
 
 // SetFinalizedTip updates the finalized tip. Called when a BSV transaction
@@ -344,12 +350,16 @@ func (n *OverlayNode) ValidateTransaction(tx *types.Transaction) error {
 		return fmt.Errorf("invalid signature: %w", err)
 	}
 
-	// Check nonce.
 	n.mu.Lock()
+	if n.followerMode {
+		n.mu.Unlock()
+		return fmt.Errorf("node is in follower mode, not accepting local transactions")
+	}
 	stateNonce := n.stateDB.GetNonce(from)
 	balance := n.stateDB.GetBalance(from)
 	n.mu.Unlock()
 
+	// Check nonce.
 	if tx.Nonce() != stateNonce {
 		if tx.Nonce() < stateNonce {
 			return fmt.Errorf("nonce too low: have %d, expected %d", tx.Nonce(), stateNonce)

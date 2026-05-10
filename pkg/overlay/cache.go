@@ -104,14 +104,12 @@ func (c *TxCache) Confirm(upToBlock uint64) {
 
 	// Update confirmed tip.
 	confirmed := c.chain[idx]
+	for i := 0; i <= idx; i++ {
+		c.chain[i].Confirmed = true
+	}
 	c.confirmedTip = ConfirmedState{
 		StateRoot:  confirmed.StateRoot,
 		L2BlockNum: confirmed.L2BlockNum,
-	}
-
-	// Remove confirmed entries from the lookup map.
-	for i := 0; i <= idx; i++ {
-		delete(c.byL2Block, c.chain[i].L2BlockNum)
 	}
 
 	// Trim the chain.
@@ -148,11 +146,40 @@ func (c *TxCache) ConfirmedTip() ConfirmedState {
 }
 
 // GetByL2Block returns the cached entry for the given L2 block number,
-// or nil if not found in the unconfirmed chain.
+// including confirmed entries retained for BSV txid/status lookups.
 func (c *TxCache) GetByL2Block(blockNum uint64) *CachedTx {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.byL2Block[blockNum]
+}
+
+// SetProveOutput records the prover output for an already cached L2 block.
+// It returns false when the block is no longer in the unconfirmed cache.
+func (c *TxCache) SetProveOutput(blockNum uint64, output *prover.ProveOutput) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry := c.byL2Block[blockNum]
+	if entry == nil {
+		return false
+	}
+	entry.ProveOutput = output
+	return true
+}
+
+// SetBroadcastResult records the BSV covenant transaction for an already
+// cached L2 block. It returns false when the block is no longer cached.
+func (c *TxCache) SetBroadcastResult(blockNum uint64, txid types.Hash, at time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry := c.byL2Block[blockNum]
+	if entry == nil {
+		return false
+	}
+	entry.BroadcastTxID = txid
+	entry.BroadcastAt = at
+	return true
 }
 
 // Truncate removes all entries from the unconfirmed chain that have an
@@ -173,9 +200,12 @@ func (c *TxCache) Truncate(afterBlock uint64) {
 		return
 	}
 
-	// Remove truncated entries from lookup.
-	for i := idx; i < len(c.chain); i++ {
-		delete(c.byL2Block, c.chain[i].L2BlockNum)
+	// Remove truncated entries from lookup, including any retained
+	// confirmed-history entries above the rollback point.
+	for blockNum := range c.byL2Block {
+		if blockNum > afterBlock {
+			delete(c.byL2Block, blockNum)
+		}
 	}
 
 	c.chain = c.chain[:idx]

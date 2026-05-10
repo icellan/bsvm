@@ -2,6 +2,9 @@ package sim
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -24,6 +27,7 @@ func TestBorrowMonotonicNonce(t *testing.T) {
 		t.Fatal("expected seeded users")
 	}
 	target := users[0].ID
+	users[0].nonceLoaded = true
 
 	const n = 100
 	var wg sync.WaitGroup
@@ -68,6 +72,7 @@ func TestReleaseRollbackOnNotConsumed(t *testing.T) {
 		t.Fatalf("NewUserPool: %v", err)
 	}
 	target := pool.Users()[0].ID
+	pool.Users()[0].nonceLoaded = true
 	ctx := context.Background()
 
 	_, a, release, err := pool.Borrow(ctx, target)
@@ -82,5 +87,45 @@ func TestReleaseRollbackOnNotConsumed(t *testing.T) {
 	defer release2(true)
 	if a != b {
 		t.Fatalf("expected nonce rollback to return same nonce, got %d then %d", a, b)
+	}
+}
+
+func TestBorrowLoadsNonceOnFirstUse(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			ID     int64  `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Method != "eth_getTransactionCount" {
+			t.Errorf("method = %q, want eth_getTransactionCount", req.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"result":  "0x2a",
+			"id":      req.ID,
+		})
+	}))
+	defer srv.Close()
+
+	pool, err := NewUserPool(31337, rpc.NewMultiClient([]string{srv.URL}))
+	if err != nil {
+		t.Fatalf("NewUserPool: %v", err)
+	}
+	target := pool.Users()[0].ID
+
+	_, nonce, release, err := pool.Borrow(context.Background(), target)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer release(true)
+	if nonce != 42 {
+		t.Fatalf("nonce = %d, want 42", nonce)
 	}
 }

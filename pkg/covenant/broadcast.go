@@ -25,6 +25,7 @@ const (
 	ProofModeFRI       = proofmode.FRI
 	ProofModeGroth16   = proofmode.Groth16
 	ProofModeGroth16WA = proofmode.Groth16WA
+	ProofModeDevKey    = proofmode.DevKey
 )
 
 // BroadcastClient broadcasts covenant advance transactions to the BSV
@@ -138,6 +139,46 @@ func (p *FRIProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error)
 	batchDataHex := hex.EncodeToString(p.Batch)
 	proofBlobHex := hex.EncodeToString(p.Blob)
 	return []interface{}{
+		newStateRootHex,
+		int64(req.NewState.BlockNumber),
+		publicValuesHex,
+		batchDataHex,
+		proofBlobHex,
+	}, nil
+}
+
+// DevKeyProof carries the proof data for the spec-16 devnet covenant.
+// It is intentionally FRI-shaped for public values and data availability,
+// but prepends a nil Sig placeholder so the Rúnar SDK signs AdvanceState
+// with the connected governance/dev key.
+type DevKeyProof struct {
+	Values []byte
+	Batch  []byte
+	Blob   []byte
+}
+
+func (p *DevKeyProof) Mode() ProofMode { return ProofModeDevKey }
+
+func (p *DevKeyProof) BatchData() []byte { return p.Batch }
+
+func (p *DevKeyProof) PublicValues() []byte { return p.Values }
+
+func (p *DevKeyProof) ProofBlob() []byte { return p.Blob }
+
+// ContractCallArgs returns the argument slice for
+// DevKeyRollupContract.AdvanceState in the order:
+//
+//	sig, newStateRoot, newBlockNumber, publicValues, batchData, proofBlob.
+func (p *DevKeyProof) ContractCallArgs(req BroadcastRequest) ([]interface{}, error) {
+	if p == nil {
+		return nil, errors.New("nil devkey proof")
+	}
+	newStateRootHex := hex.EncodeToString(req.NewState.StateRoot[:])
+	publicValuesHex := hex.EncodeToString(p.Values)
+	batchDataHex := hex.EncodeToString(p.Batch)
+	proofBlobHex := hex.EncodeToString(p.Blob)
+	return []interface{}{
+		nil,
 		newStateRootHex,
 		int64(req.NewState.BlockNumber),
 		publicValuesHex,

@@ -3,7 +3,7 @@
 // JSON-RPC provider, Rúnar signer, deployed-contract binding,
 // RunarBroadcastClient) and attaches it to the overlay's covenant
 // manager so ProcessBatch actually submits advance transactions to BSV
-// when the shard runs in prove-mode execute or prove.
+// when the shard runs in devnet mock, execute, or prove mode.
 package main
 
 import (
@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	sdkhash "github.com/bsv-blockchain/go-sdk/primitives/hash"
 	"github.com/icellan/bsvm/internal/db"
 	"github.com/icellan/bsvm/pkg/arc"
 	"github.com/icellan/bsvm/pkg/bsv"
@@ -26,7 +28,6 @@ import (
 	"github.com/icellan/bsvm/pkg/overlay"
 	"github.com/icellan/bsvm/pkg/shard"
 
-	sdkhash "github.com/bsv-blockchain/go-sdk/primitives/hash"
 	gocompiler "github.com/icellan/runar/compilers/go/compiler"
 	runar "github.com/icellan/runar/packages/runar-go"
 )
@@ -110,16 +111,38 @@ type bsvBroadcastResult struct {
 // address, and provider so downstream wiring (the bridge.Withdrawer
 // loop in particular) can re-use them without re-deriving the key.
 func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResult, error) {
+	rollupInputs, err := rollupSourceInputsFromOpts(opts)
+	if err != nil {
+		return nil, fmt.Errorf("rollup source inputs: %w", err)
+	}
+	bsvNet := opts.NodeCfg.BSV.Network
+	if bsvNet == "" {
+		bsvNet = "regtest"
+	}
+
 	// 1. Persist/load the fee-wallet key.
 	feeKey, err := LoadOrCreateFeeWalletKey(opts.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("fee-wallet key: %w", err)
 	}
-	feeAddr, err := FeeWalletBSVAddress(feeKey, opts.NodeCfg.BSV.Network)
+	broadcastKey := feeKey
+	broadcastKeyHex := hex.EncodeToString(feeKey.Serialize())
+	broadcastSignerRole := "fee-wallet"
+	if rollupInputs.Verification == covenant.VerifyDevKey {
+		govKeyHex := shard.DevnetGovernancePrivateKey()
+		govKey, govErr := ec.PrivateKeyFromHex(govKeyHex)
+		if govErr != nil {
+			return nil, fmt.Errorf("devkey broadcast signer: %w", govErr)
+		}
+		broadcastKey = govKey
+		broadcastKeyHex = govKeyHex
+		broadcastSignerRole = "devnet-governance"
+	}
+	feeAddr, err := FeeWalletBSVAddress(broadcastKey, bsvNet)
 	if err != nil {
 		return nil, fmt.Errorf("fee-wallet address: %w", err)
 	}
-	slog.Info("fee-wallet key loaded", "address", feeAddr)
+	slog.Info("fee-wallet key loaded", "address", feeAddr, "signer_role", broadcastSignerRole)
 
 	// 2. FeeWallet backed by the shared LevelDB.
 	feeWallet := overlay.NewFeeWallet(opts.DB)
@@ -132,7 +155,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 	// address is the standard P2PKH derived from feeKey via go-sdk;
 	// we hash160 the compressed pubkey and wrap with the canonical
 	// OP_DUP OP_HASH160 <pkh20> OP_EQUALVERIFY OP_CHECKSIG envelope.
-	pubKeyBytes := feeKey.PubKey().Compressed()
+	pubKeyBytes := broadcastKey.PubKey().Compressed()
 	pkh := bsvHash160(pubKeyBytes)
 	feeWallet.SetExpectedScriptPubKey(bsv.BuildP2PKH(pkh))
 	slog.Info("fee-wallet initialized",
@@ -144,10 +167,6 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 
 	// 4. BSV JSON-RPC provider. Re-use the caller's provider if one
 	// was supplied (Phase 8 path), otherwise build a fresh one.
-	bsvNet := opts.NodeCfg.BSV.Network
-	if bsvNet == "" {
-		bsvNet = "regtest"
-	}
 	provider := opts.Provider
 	if provider == nil {
 		p, provErr := BuildBSVProvider(opts.NodeCfg.BSV)
@@ -196,8 +215,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 	// ExternalSigner so PrepareCall's GetUtxos(address) queries the
 	// REGTEST address we imported — LocalSigner.GetAddress() hardcodes
 	// mainnet, which would cause listunspent to reject the address.
-	feeKeyHex := hex.EncodeToString(feeKey.Serialize())
-	localSigner, err := runar.NewLocalSigner(feeKeyHex)
+	localSigner, err := runar.NewLocalSigner(broadcastKeyHex)
 	if err != nil {
 		return nil, fmt.Errorf("runar signer: %w", err)
 	}
@@ -242,6 +260,10 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 	// 7. RunarBroadcastClient. The RPC provider satisfies both
 	// runar.Provider and covenant.ConfirmationSource, so a single
 	// instance drives both broadcast and confirmation tracking.
+	broadcastProofMode := covenant.ProofModeFRI
+	if rollupInputs.Verification == covenant.VerifyDevKey {
+		broadcastProofMode = covenant.ProofModeDevKey
+	}
 	broadcastClient, err := covenant.NewRunarBroadcastClient(covenant.RunarBroadcastClientOpts{
 		Contract:      contract,
 		Provider:      provider,
@@ -252,7 +274,7 @@ func wireBSVBroadcast(ctx context.Context, opts bsvWireOpts) (*bsvBroadcastResul
 		// it via the GetBlockHeader method we added in bsv_provider.go.
 		BlockHeaders: provider,
 		ChainID:      opts.ChainID,
-		Mode:         covenant.ProofModeFRI,
+		Mode:         broadcastProofMode,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("broadcast client: %w", err)
@@ -375,7 +397,12 @@ func selectRollupSourceInputs(in rollupSourceInputs) (string, map[string]interfa
 		}
 		return path, args, nil
 	case covenant.VerifyDevKey:
-		return "", nil, fmt.Errorf("devkey covenant has no broadcast path; use execute/prove (FRI) for BSV settlement")
+		path := findContractPath("rollup_devkey.runar.go")
+		args, err := covenant.BuildFRIConstructorArgsExported(in.SP1VK, uint64(in.ChainID), in.Governance)
+		if err != nil {
+			return "", nil, err
+		}
+		return path, args, nil
 	case covenant.VerifyGroth16WA:
 		// Groth16-WA requires a per-batch SP1 Groth16 proof whose
 		// publicInput[1] equals reducePublicValuesToScalarWA(publicValues)

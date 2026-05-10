@@ -132,12 +132,15 @@ func verifyCovenantCodeMatches(mode covenant.VerificationMode, deployedScriptHex
 	// GetLockingScript appends state AFTER the code separator, so
 	// the code portion is independent of the stateRoot value.
 	dummyStateRoot := "00000000000000000000000000000000000000000000000000000000000000ff"
-	contract := runar.NewRunarContract(artifact, []interface{}{
+	runtimeArgs := []interface{}{
 		dummyStateRoot,
 		int64(0), // blockNumber
 		int64(0), // frozen
-		int64(0), // advancesSinceInbox (spec 10)
-	})
+	}
+	if len(artifact.ABI.Constructor.Params) > len(runtimeArgs) {
+		runtimeArgs = append(runtimeArgs, int64(0)) // advancesSinceInbox (spec 10)
+	}
+	contract := runar.NewRunarContract(artifact, runtimeArgs)
 	expectedFull := contract.GetLockingScript()
 	expectedCode := stripStatefulSuffix(expectedFull)
 	deployedCode := stripStatefulSuffix(deployedScriptHex)

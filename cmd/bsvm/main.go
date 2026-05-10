@@ -187,8 +187,7 @@ func cmdInit(ctx *cli.Context) error {
 	case "":
 		// No prove-mode — use explicit flags.
 	case "mock":
-		// Mock: devkey covenant, no broadcast — for fast unit-style dev
-		// where BSV network access isn't wanted.
+		// Mock: devkey covenant, BSV covenant advances, no STARK proof.
 		if verification == "" {
 			verification = "devkey"
 		}
@@ -199,10 +198,7 @@ func cmdInit(ctx *cli.Context) error {
 			chainID = 31337
 		}
 	case "execute":
-		// Execute: FRI covenant, broadcasts to BSV. The FRI contract has
-		// no advance-time signature check, so all 3 devnet nodes can race
-		// to submit advances and BSV decides the winner — which is what
-		// the spec-16 multi-prover demo requires. Governance still
+		// Execute: FRI covenant, broadcasts to BSV. Governance still
 		// defaults to single_key so the freeze backstop works.
 		if verification == "" {
 			verification = "fri"
@@ -647,26 +643,29 @@ func cmdRun(ctx *cli.Context) error {
 		}
 	}
 
-	// 5.9: BSV covenant broadcast wiring. Only when the operator wants
-	// real BSV settlement (prove modes execute/prove) AND a BSV RPC
-	// endpoint is configured AND this node isn't explicitly configured
-	// as a follower. Followers skip the entire BSV-broadcast stack —
+	// 5.9: BSV covenant broadcast wiring. Enabled for every spec-16
+	// devnet proving preset (mock/execute/prove) when a BSV RPC
+	// endpoint is configured and this node isn't explicitly configured
+	// as a follower. Mock mode still advances the DevKey covenant on
+	// BSV; only SP1 proof verification is simplified. Followers skip the
+	// entire BSV-broadcast stack —
 	// no fee wallet, no RPC provider usage, no covenant broadcast
 	// client, no fee-wallet reconciler — so the only BSV access we
-	// require is the prover node's. Mock mode (no BSV settlement) and
-	// bare-metal runs without BSV.NodeURL fall through to the existing
+	// require is the prover node's. Bare-metal runs without BSV.NodeURL
+	// fall through to the existing
 	// no-broadcast path where receipts are purely speculative.
 	role := NodeRoleFromEnv()
 	if role == "follower" {
 		slog.Info("node role=follower — skipping BSV broadcast wiring; syncing via P2P only")
+		overlayNode.EnterFollowerMode()
 	}
 	// broadcastWiring captures the fee-signer + provider once
 	// wireBSVBroadcast has run so the bridge.Withdrawer wiring below
 	// can reuse them without re-deriving the fee-wallet key. Stays
-	// nil on follower / mock-mode paths; WireWithdrawer logs a clear
+	// nil on follower / no-BSV-RPC paths; WireWithdrawer logs a clear
 	// WARN and skips when nil.
 	var broadcastWiring *bsvBroadcastResult
-	if role != "follower" && (proveMode == "execute" || proveMode == "prove") && len(nodeCfg.BSV.EffectiveNodeURLs()) > 0 {
+	if shouldWireBSVBroadcast(role, proveMode, nodeCfg.BSV.EffectiveNodeURLs()) {
 		res, err := wireBSVBroadcast(ctx.Context, bsvWireOpts{
 			NodeCfg:     nodeCfg,
 			ShardCfg:    boot.LegacyShardConfig,
@@ -1224,6 +1223,18 @@ func cmdRun(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+func shouldWireBSVBroadcast(role, proveMode string, bsvNodeURLs []string) bool {
+	if role == "follower" || len(bsvNodeURLs) == 0 {
+		return false
+	}
+	switch proveMode {
+	case "mock", "execute", "prove":
+		return true
+	default:
+		return false
+	}
 }
 
 // cmdRecover handles the "bsvm recover" subcommand. It reconstructs the

@@ -131,8 +131,70 @@ func ApplyEnvOverrides(cfg *NodeConfig) error {
 		cfg.Bridge.BSVConfirmations = n
 		cfg.BSV.Confirmations = n
 	}
+	if v := os.Getenv("BSVM_PROVE_MODE"); v != "" {
+		mode, err := normalizeProveMode(v)
+		if err != nil {
+			return err
+		}
+		applyProverModePreset(cfg, mode)
+	}
+	if v := os.Getenv("BSVM_PROVER_MODE"); v != "" {
+		cfg.Prover.Mode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("BSVM_PROOF_MODE"); v != "" {
+		cfg.Prover.ProofMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("BSVM_SP1_PROOF_MODE"); v != "" {
+		cfg.Prover.SP1ProofMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("BSVM_HOST_BRIDGE_BINARY"); v != "" {
+		cfg.Prover.HostBridgeBinary = v
+	}
+	if v := os.Getenv("BSVM_GUEST_ELF_PATH"); v != "" {
+		cfg.Prover.GuestELFPath = v
+	}
+	if err := cfg.Prover.Validate(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func normalizeProveMode(v string) (string, error) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "mock", "execute", "prove":
+		return v, nil
+	default:
+		return "", fmt.Errorf("BSVM_PROVE_MODE %q: expected mock, execute, or prove", v)
+	}
+}
+
+func applyProverModePreset(cfg *NodeConfig, mode string) {
+	cfg.Prover.ProofMode = "fri"
+	switch mode {
+	case "mock":
+		cfg.Prover.Mode = "mock"
+	case "execute":
+		cfg.Prover.Mode = "execute"
+		cfg.Prover.SP1ProofMode = "execute"
+		applyDefaultSP1ArtifactPaths(cfg)
+	case "prove":
+		cfg.Prover.Mode = "local"
+		if strings.TrimSpace(cfg.Prover.SP1ProofMode) == "" || cfg.Prover.SP1ProofMode == "execute" {
+			cfg.Prover.SP1ProofMode = "compressed"
+		}
+		applyDefaultSP1ArtifactPaths(cfg)
+	}
+}
+
+func applyDefaultSP1ArtifactPaths(cfg *NodeConfig) {
+	if strings.TrimSpace(cfg.Prover.HostBridgeBinary) == "" {
+		cfg.Prover.HostBridgeBinary = "/usr/local/bin/bsvm-host-bridge"
+	}
+	if strings.TrimSpace(cfg.Prover.GuestELFPath) == "" {
+		cfg.Prover.GuestELFPath = "/opt/bsvm/guest_evm.elf"
+	}
 }
 
 // ProveModeFromEnv returns the spec-16 proving mode set via
@@ -143,12 +205,7 @@ func ProveModeFromEnv() (string, error) {
 	if v == "" {
 		return "", nil
 	}
-	switch v {
-	case "mock", "execute", "prove":
-		return v, nil
-	default:
-		return "", fmt.Errorf("BSVM_PROVE_MODE %q: expected mock, execute, or prove", v)
-	}
+	return normalizeProveMode(v)
 }
 
 // NodeRoleFromEnv returns BSVM_ROLE (prover or follower) for spec 16

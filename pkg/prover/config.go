@@ -53,6 +53,7 @@ const (
 	ProofModeFRI       = proofmode.FRI
 	ProofModeGroth16   = proofmode.Groth16
 	ProofModeGroth16WA = proofmode.Groth16WA
+	ProofModeDevKey    = proofmode.DevKey
 )
 
 // Config holds the SP1 prover configuration.

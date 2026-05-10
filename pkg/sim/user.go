@@ -28,9 +28,10 @@ type User struct {
 	Address types.Address
 	Key     *ecdsa.PrivateKey
 
-	mu    sync.Mutex
-	nonce uint64
-	dirty atomic.Bool
+	mu          sync.Mutex
+	nonce       uint64
+	nonceLoaded bool
+	dirty       atomic.Bool
 }
 
 // MarkDirty flags the user's nonce for reconciliation on the next borrow.
@@ -41,6 +42,7 @@ func (u *User) MarkDirty() { u.dirty.Store(true) }
 type UserPool struct {
 	chainID *big.Int
 	mc      *rpc.MultiClient
+	writeMC *rpc.MultiClient
 	faucet  *User
 	signer  types.Signer
 
@@ -53,6 +55,16 @@ type UserPool struct {
 // NewUserPool seeds the pool from the Hardhat default accounts, reserving
 // account #0 as the faucet (also the dev-key governance signer).
 func NewUserPool(chainID uint64, mc *rpc.MultiClient) (*UserPool, error) {
+	return NewUserPoolWithWriters(chainID, mc, mc)
+}
+
+// NewUserPoolWithWriters builds a pool that reads/monitors through mc but
+// submits signed transactions through writeMC. This lets follower nodes stay
+// in the read set without accidentally becoming producers.
+func NewUserPoolWithWriters(chainID uint64, mc *rpc.MultiClient, writeMC *rpc.MultiClient) (*UserPool, error) {
+	if writeMC == nil {
+		writeMC = mc
+	}
 	accts := shard.HardhatDefaultAccounts()
 	if len(accts) < 2 {
 		return nil, errors.New("hardhat accounts missing")
@@ -64,6 +76,7 @@ func NewUserPool(chainID uint64, mc *rpc.MultiClient) (*UserPool, error) {
 	p := &UserPool{
 		chainID: new(big.Int).SetUint64(chainID),
 		mc:      mc,
+		writeMC: writeMC,
 		signer:  types.LatestSignerForChainID(new(big.Int).SetUint64(chainID)),
 		users:   make(map[string]*User),
 	}
@@ -126,21 +139,23 @@ func (p *UserPool) Get(id string) *User {
 // Borrow locks the user and returns their next nonce. The caller must
 // always invoke release() — typically with defer. Passing consumed=false
 // in release rolls the nonce back (use if the tx was never submitted).
-// The user's nonce is reconciled from the node if dirty.
+// The user's nonce is reconciled from the node on first use and whenever
+// a prior submission left it dirty.
 func (p *UserPool) Borrow(ctx context.Context, id string) (*User, uint64, func(consumed bool), error) {
 	u := p.Get(id)
 	if u == nil {
 		return nil, 0, nil, fmt.Errorf("no user %q", id)
 	}
 	u.mu.Lock()
-	if u.dirty.Load() {
-		c := p.mc.ForWrite(u.ID)
+	if !u.nonceLoaded || u.dirty.Load() {
+		c := p.writeMC.ForWrite(u.ID)
 		n, err := c.Nonce(ctx, u.Address)
 		if err != nil {
 			u.mu.Unlock()
 			return nil, 0, nil, fmt.Errorf("reconcile nonce %s: %w", u.Address.Hex(), err)
 		}
 		u.nonce = n
+		u.nonceLoaded = true
 		u.dirty.Store(false)
 	}
 	assigned := u.nonce
@@ -211,13 +226,14 @@ func (p *UserPool) FaucetSend(ctx context.Context, to types.Address, amount *uin
 	p.faucet.mu.Lock()
 	defer p.faucet.mu.Unlock()
 
-	c := p.mc.ForWrite(p.faucet.ID)
-	if p.faucet.nonce == 0 || p.faucet.dirty.Load() {
+	c := p.writeMC.ForWrite(p.faucet.ID)
+	if !p.faucet.nonceLoaded || p.faucet.dirty.Load() {
 		n, err := c.Nonce(ctx, p.faucet.Address)
 		if err != nil {
 			return types.Hash{}, fmt.Errorf("faucet nonce: %w", err)
 		}
 		p.faucet.nonce = n
+		p.faucet.nonceLoaded = true
 		p.faucet.dirty.Store(false)
 	}
 	nonce := p.faucet.nonce
@@ -241,11 +257,11 @@ func (p *UserPool) FaucetSend(ctx context.Context, to types.Address, amount *uin
 	hash, err := c.SendRawTx(ctx, raw)
 	if err != nil {
 		p.faucet.dirty.Store(true)
-		p.mc.RecordResult(c, err)
+		p.writeMC.RecordResult(c, err)
 		return types.Hash{}, fmt.Errorf("faucet send: %w", err)
 	}
 	p.faucet.nonce++
-	p.mc.RecordResult(c, nil)
+	p.writeMC.RecordResult(c, nil)
 	return hash, nil
 }
 
@@ -254,7 +270,7 @@ func (p *UserPool) FaucetSend(ctx context.Context, to types.Address, amount *uin
 // faucet writes away from a lagging mempool (which mistakenly sees the
 // faucet's nonce as 0 and fills its speculative depth cap).
 func (p *UserPool) faucetClient(ctx context.Context) *rpc.Client {
-	clients := p.mc.All()
+	clients := p.writeMC.All()
 	heights := make([]uint64, len(clients))
 	for i, c := range clients {
 		h, err := c.BlockNumber(ctx)
@@ -262,7 +278,7 @@ func (p *UserPool) faucetClient(ctx context.Context) *rpc.Client {
 			heights[i] = h
 		}
 	}
-	return p.mc.Highest(heights)
+	return p.writeMC.Highest(heights)
 }
 
 func (p *UserPool) faucetTx(ctx context.Context, to *types.Address, value *uint256.Int, data []byte, gas uint64) (types.Hash, error) {
@@ -270,12 +286,13 @@ func (p *UserPool) faucetTx(ctx context.Context, to *types.Address, value *uint2
 	defer p.faucet.mu.Unlock()
 
 	c := p.faucetClient(ctx)
-	if p.faucet.nonce == 0 || p.faucet.dirty.Load() {
+	if !p.faucet.nonceLoaded || p.faucet.dirty.Load() {
 		n, err := c.Nonce(ctx, p.faucet.Address)
 		if err != nil {
 			return types.Hash{}, fmt.Errorf("faucet nonce: %w", err)
 		}
 		p.faucet.nonce = n
+		p.faucet.nonceLoaded = true
 		p.faucet.dirty.Store(false)
 	}
 	nonce := p.faucet.nonce
@@ -300,11 +317,11 @@ func (p *UserPool) faucetTx(ctx context.Context, to *types.Address, value *uint2
 	hash, err := c.SendRawTx(ctx, raw)
 	if err != nil {
 		p.faucet.dirty.Store(true)
-		p.mc.RecordResult(c, err)
+		p.writeMC.RecordResult(c, err)
 		return types.Hash{}, fmt.Errorf("faucet tx: %w", err)
 	}
 	p.faucet.nonce++
-	p.mc.RecordResult(c, nil)
+	p.writeMC.RecordResult(c, nil)
 	return hash, nil
 }
 
@@ -312,7 +329,7 @@ func (p *UserPool) faucetTx(ctx context.Context, to *types.Address, value *uint2
 // nonce and submits to the user's sticky node. On submission failure,
 // the user is marked dirty so the next Borrow refetches nonce.
 func (p *UserPool) SignAndSubmit(ctx context.Context, user *User, txData types.TxData) (types.Hash, error) {
-	c := p.mc.ForWrite(user.ID)
+	c := p.writeMC.ForWrite(user.ID)
 	tx, err := types.SignNewTx(user.Key, p.signer, txData)
 	if err != nil {
 		return types.Hash{}, fmt.Errorf("sign: %w", err)
@@ -324,10 +341,10 @@ func (p *UserPool) SignAndSubmit(ctx context.Context, user *User, txData types.T
 	hash, err := c.SendRawTx(ctx, raw)
 	if err != nil {
 		user.dirty.Store(true)
-		p.mc.RecordResult(c, err)
+		p.writeMC.RecordResult(c, err)
 		return types.Hash{}, err
 	}
-	p.mc.RecordResult(c, nil)
+	p.writeMC.RecordResult(c, nil)
 	return hash, nil
 }
 

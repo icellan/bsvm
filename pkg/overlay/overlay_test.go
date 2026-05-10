@@ -515,6 +515,11 @@ func TestTxCache(t *testing.T) {
 	if cache.Len() != 1 {
 		t.Errorf("expected len 1, got %d", cache.Len())
 	}
+	if entry := cache.GetByL2Block(2); entry == nil {
+		t.Error("expected confirmed block 2 to remain available for BSV txid lookup")
+	} else if !entry.Confirmed {
+		t.Error("expected block 2 cache entry to be marked confirmed")
+	}
 
 	// Confirmed tip should be block 2.
 	confirmed := cache.ConfirmedTip()
@@ -562,6 +567,9 @@ func TestTxCacheSpeculativeDepth(t *testing.T) {
 	if depth := cache.SpeculativeDepth(); depth != 3 {
 		t.Errorf("expected speculative depth 3, got %d", depth)
 	}
+	if entry := cache.GetByL2Block(2); entry == nil {
+		t.Error("expected confirmed block 2 to remain available for lookup")
+	}
 
 	// Mark block 3 as confirmed explicitly.
 	entry := cache.GetByL2Block(3)
@@ -570,6 +578,14 @@ func TestTxCacheSpeculativeDepth(t *testing.T) {
 	}
 	if depth := cache.SpeculativeDepth(); depth != 2 {
 		t.Errorf("expected speculative depth 2, got %d", depth)
+	}
+
+	cache.Confirm(5)
+	if depth := cache.SpeculativeDepth(); depth != 0 {
+		t.Errorf("expected speculative depth 0 after confirming tip, got %d", depth)
+	}
+	if entry := cache.GetByL2Block(5); entry == nil {
+		t.Error("expected confirmed tip block to remain available for lookup")
 	}
 }
 

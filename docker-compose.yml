@@ -30,6 +30,7 @@ networks:
 
 x-bsvm-common: &bsvm-common
   image: bsvm:devnet
+  init: true
   restart: unless-stopped
   networks:
     - bsvm-devnet
@@ -148,6 +149,7 @@ services:
     networks:
       - bsvm-devnet
     environment:
+      BSVM_PROVE_MODE: ${BSVM_PROVE_MODE:-execute}
       BSVM_BSV_RPC: "http://devuser:devpass@bsv-regtest:18332"
       BSVM_BSV_NETWORK: "regtest"
       BSVM_LOG_LEVEL: info
